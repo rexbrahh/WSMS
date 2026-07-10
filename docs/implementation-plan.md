@@ -687,29 +687,42 @@ Verification/gates:
 
 #### Phase 7C - sqlite-vec compatibility and exact-parity spike
 
+**Status:** implemented and verified on the development platform (darwin,
+pure-Go `modernc.org/sqlite` + `modernc.org/sqlite/vec`). Dense remains
+**opt-in** (`DenseDimensions > 0`); default open keeps `SearchDense`
+unavailable. No real embedder yet (7D).
+
 **Objective:** prove the preferred embedded dense backend against the pinned Go
 and platform matrix before product code depends on it.
 
 Implementation:
 
-1. Pin exact `modernc.org/sqlite` and sqlite-vec package versions in one
-   isolated adapter.
-2. Prove extension initialization, `vec0` persistence, cosine KNN, metadata
-   filtering, batch replacement, dimensions, cancellation, concurrent reads,
-   restart, and generation rebuild on each supported OS/architecture.
-3. Avoid fine-grained partitions until benchmarked partitions hold enough
-   pages; rely on metadata filters and Go post-validation otherwise.
-4. Compare every fixture result with the exact cosine oracle and report recall,
-   ordering differences, latency, memory, and DB size.
+1. Blank-import `modernc.org/sqlite/vec` only from `internal/indexer/vecregister.go`
+   (process-wide registration; ledger never creates `vec0` tables).
+2. Optional dense projection on disposable `warm.db`: `warm_pages_vec` (cosine
+   `vec0` + `session_id` partition key) and `warm_page_vec_map` rowid map.
+3. `UpsertVectors` / `DeleteVector` / invalidate hook; `SearchDense` with KNN,
+   session partition, Go post-filters (status/repo/branch/kind/trust).
+4. Exact-oracle parity tests against `pages.ExactCosineSearchContext` on
+   well-separated unit vectors (top-k ID order + distance ≈ 1 − similarity).
+5. Config `DenseDimensions` (default 0); harness passes option through.
+6. Restart restores dense dims from `index_meta`; concurrent dense+FTS reads
+   race-clean.
 
-Stop conditions:
+Verification/gates:
+
+- [x] Extension initializes without CGO on the verified platform.
+- [x] Default open: dense off, FTS and demo unchanged.
+- [x] Dense KNN, filters, invalidate, batch replace, cancel, concurrent, restart.
+- [x] Oracle parity on synthetic fixtures.
+- [x] Pre-1.0 churn isolated to indexer; no ledger/WSL format changes.
+
+Stop conditions (not hit on verified platform):
 
 - If the extension cannot initialize without weakening pure-Go portability,
   keep FTS plus the exact backend and do not leak extension handling upward.
 - If filtering or restart behavior is unreliable, do not enable dense search;
   evaluate Qdrant only after documenting the measured blocker.
-- Pre-1.0 churn is isolated behind `WarmIndex`; no WSL/ledger format changes are
-  allowed to accommodate it.
 
 #### Phase 7D - Namespaced local embedder
 

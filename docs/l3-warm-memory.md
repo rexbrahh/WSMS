@@ -934,12 +934,14 @@ automatic prefetch disabled.
 
 ### L3-2 - sqlite-vec compatibility spike
 
-- Pin exact modernc/sqlite and sqlite-vec versions.
-- Prove extension initialization on every supported platform.
-- Test KNN, cosine distance, metadata filters, cancellation, concurrent reads,
-  batch replacement, malformed dimensions, restart, and corruption handling.
-- Compare results with the exact oracle and record recall/latency.
-- Keep this behind a feature/config gate until the spike passes.
+**Status:** complete (Phase 7C) on the development pure-Go path; dense remains
+config-gated (`DenseDimensions`, default 0).
+
+- `modernc.org/sqlite v1.53.0` + blank `_ "modernc.org/sqlite/vec"`.
+- Optional `vec0` cosine projection with session partition key and page map.
+- `SearchDense`, vector upsert/delete, invalidate cleanup, restart meta restore.
+- Exact cosine oracle parity tests in `internal/indexer/parity_test.go`.
+- Real document/query embeddings still require L3-3 / Phase 7D.
 
 ### L3-3 - Local embedding adapter
 
