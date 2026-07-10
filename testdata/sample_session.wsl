@@ -1,0 +1,24 @@
+@task T42 phase=debugging priority=hot
+goal: fix(stream_cancel_hang)
+branch: solver-stream-cancel
+dirty: src/runtime/stream.go, src/solver/cancel.rs
+
+@constraint C7 hard source=user
+text: "do not rewrite transport layer"
+scope: task
+
+@failure F18
+cmd: `go test ./runtime -run TestCancelStream`
+exit: 1
+err: "stream goroutine still blocked"
+file_hint: src/runtime/stream.go:118-176
+raw: artifact:sha256:deadbeef
+
+@avoid A4 reason=failed_attempt
+text: "previous goroutine cleanup patch"
+ref: F18
+
+@next
+action: inspect
+target: src/runtime/stream.go:118-176
+question: "is cancellation propagated before stream recv blocks?"
