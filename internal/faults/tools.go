@@ -19,17 +19,31 @@ type Request struct {
 
 // Tools exposes harness-facing fault helpers.
 type Tools struct {
-	Resolver *Resolver
+	resolver  *Resolver
+	resolveFn func(context.Context, Request) (string, error)
+}
+
+// NewTools creates helpers that route through the scheduler's serialized
+// fault boundary. resolver remains the fallback for low-level package tests.
+func NewTools(resolver *Resolver, resolve func(context.Context, Request) (string, error)) *Tools {
+	return &Tools{resolver: resolver, resolveFn: resolve}
+}
+
+func (t *Tools) resolve(ctx context.Context, request Request) (string, error) {
+	if t.resolveFn != nil {
+		return t.resolveFn(ctx, request)
+	}
+	return t.resolver.Resolve(ctx, request)
 }
 
 // ReadPage loads a page by id.
 func (t *Tools) ReadPage(ctx context.Context, pageID string, budget int) (string, error) {
-	return t.Resolver.Resolve(ctx, Request{Kind: "page", ID: pageID, Budget: budget})
+	return t.resolve(ctx, Request{Kind: "page", ID: pageID, Budget: budget})
 }
 
 // ReadRawLog loads raw event/artifact text by event or failure id.
 func (t *Tools) ReadRawLog(ctx context.Context, id string, budget int) (string, error) {
-	return t.Resolver.Resolve(ctx, Request{Kind: "raw_log", ID: id, Budget: budget})
+	return t.resolve(ctx, Request{Kind: "raw_log", ID: id, Budget: budget})
 }
 
 // ReadFileSlice reads a 1-indexed inclusive line range from path.

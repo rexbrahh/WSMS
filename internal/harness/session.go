@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"wsms/internal/artifacts"
+	"wsms/internal/coherence"
 	"wsms/internal/config"
 	"wsms/internal/faults"
 	"wsms/internal/ledger"
@@ -32,6 +33,7 @@ var (
 type TaskStart struct {
 	Goal     string
 	TaskID   string
+	Repo     string
 	Phase    string
 	Priority types.Priority
 	Branch   string
@@ -57,6 +59,61 @@ type DecisionInput struct {
 	AvoidRef  string
 }
 
+// BranchChange is a compare-current transition to the post-scope carried in
+// the durable event envelope. Commit fields are optional but must be paired.
+type BranchChange struct {
+	Repo       string
+	FromBranch string
+	ToBranch   string
+	FromCommit string
+	ToCommit   string
+}
+
+// CommitChange moves the active branch from one exact commit to another.
+type CommitChange struct {
+	Repo       string
+	Branch     string
+	FromCommit string
+	ToCommit   string
+}
+
+// FileRename records a scope-coherence rename. ContentDigest is optional, but
+// when supplied it is a lowercase SHA-256 digest.
+type FileRename struct {
+	Repo          string
+	Branch        string
+	FromPath      string
+	ToPath        string
+	ContentDigest string
+}
+
+// FileSnapshot is the strict Phase 7A-ready path/content evidence contract;
+// legacy file_read events remain untouched for replay compatibility.
+type FileSnapshot struct {
+	Repo          string
+	Branch        string
+	Commit        string
+	Path          string
+	ContentDigest string
+}
+
+// MemoryInvalidation terminally revokes one existing logical target.
+type MemoryInvalidation struct {
+	Kind   ledger.MemoryTargetKind
+	Target string
+	Reason ledger.InvalidationReason
+}
+
+// MemoryRevalidation compare-and-swaps one stale (never invalidated) target
+// back to active using preexisting eligible evidence.
+type MemoryRevalidation struct {
+	Kind                  ledger.MemoryTargetKind
+	Target                string
+	EvidenceRef           string
+	ExpectedStaleRevision uint64
+	SourceDigest          string
+}
+
 // Session is the composition root for a WSMS session.
 type Session struct {
 	appendMu    sync.Mutex
@@ -68,6 +125,7 @@ type Session struct {
 	Ledger      *ledger.AppendOnlyLedger
 	Artifacts   *artifacts.Store
 	State       *wsl.WorkingState
+	Coherence   *coherence.State
 	Hierarchy   *memory.Hierarchy
 	Dispatcher  *observers.Dispatcher
 	Scheduler   *scheduler.Scheduler
@@ -98,24 +156,27 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	}
 	st := wsl.NewWorkingState()
 	h := memory.NewHierarchy()
+	coherent := coherence.NewState()
 	ids := observers.NewSeqIDGen()
-	disp := observers.Default(ids)
+	disp := observers.Default(ids, st)
 	res := &faults.Resolver{
 		State:     st,
 		Hierarchy: h,
 		Ledger:    led,
 		Artifacts: arts,
+		Coherence: coherent,
 	}
-	sched := scheduler.New(cfg, st, h, disp, res)
+	sched := scheduler.New(cfg, st, h, disp, res, coherent)
 	s := &Session{
 		Cfg:        cfg,
 		Ledger:     led,
 		Artifacts:  arts,
 		State:      st,
+		Coherence:  coherent,
 		Hierarchy:  h,
 		Dispatcher: disp,
 		Scheduler:  sched,
-		Tools:      &faults.Tools{Resolver: res},
+		Tools:      faults.NewTools(res, sched.PageFault),
 	}
 	if err := s.replay(context.Background()); err != nil {
 		return nil, errors.Join(err, s.Close())
@@ -168,6 +229,11 @@ func (s *Session) Append(ctx context.Context, ev ledger.Event) (ledger.Event, er
 	}
 	if err := ledger.ValidateEvent(ev); err != nil {
 		return ledger.Event{}, fmt.Errorf("validate event before append: %w", err)
+	}
+	preview := ev
+	preview.ID = "E-PREAPPEND"
+	if _, err := s.Coherence.Prepare(preview); err != nil {
+		return ledger.Event{}, fmt.Errorf("validate coherence before append: %w", err)
 	}
 
 	// Offload large string fields
@@ -259,6 +325,7 @@ func (s *Session) StartTask(ctx context.Context, task TaskStart) error {
 	_, err := s.Append(ctx, ledger.Event{
 		Type:   ledger.EventTaskStarted,
 		TaskID: task.TaskID,
+		Repo:   task.Repo,
 		Branch: task.Branch,
 		Commit: task.Commit,
 		Payload: map[string]any{
@@ -299,6 +366,78 @@ func (s *Session) RecordDecision(ctx context.Context, decision DecisionInput) er
 			"avoid_ref":  decision.AvoidRef,
 		},
 	})
+	return err
+}
+
+// ChangeBranch appends a validated post-scope branch transition.
+func (s *Session) ChangeBranch(ctx context.Context, change BranchChange) error {
+	payload := map[string]any{"from_branch": change.FromBranch}
+	if change.FromCommit != "" || change.ToCommit != "" {
+		payload["from_commit"] = change.FromCommit
+	}
+	_, err := s.Append(ctx, ledger.Event{
+		Type: ledger.EventBranchChange, Repo: change.Repo,
+		Branch: change.ToBranch, Commit: change.ToCommit, Payload: payload,
+	})
+	return err
+}
+
+// ChangeCommit appends a validated post-scope commit transition.
+func (s *Session) ChangeCommit(ctx context.Context, change CommitChange) error {
+	_, err := s.Append(ctx, ledger.Event{
+		Type: ledger.EventCommitChange, Repo: change.Repo, Branch: change.Branch,
+		Commit: change.ToCommit, Payload: map[string]any{"from_commit": change.FromCommit},
+	})
+	return err
+}
+
+// RenameFile appends a durable rename coherence event.
+func (s *Session) RenameFile(ctx context.Context, rename FileRename) error {
+	payload := map[string]any{"from_path": rename.FromPath, "to_path": rename.ToPath}
+	if rename.ContentDigest != "" {
+		payload["content_digest"] = rename.ContentDigest
+	}
+	_, err := s.Append(ctx, ledger.Event{
+		Type: ledger.EventFileRenamed, Repo: rename.Repo, Branch: rename.Branch, Payload: payload,
+	})
+	return err
+}
+
+// RecordFileSnapshot appends strict repository-relative file evidence.
+func (s *Session) RecordFileSnapshot(ctx context.Context, snapshot FileSnapshot) error {
+	_, err := s.Append(ctx, ledger.Event{
+		Type: ledger.EventFileSnapshot, Repo: snapshot.Repo, Branch: snapshot.Branch, Commit: snapshot.Commit,
+		Payload: map[string]any{"path": snapshot.Path, "content_digest": snapshot.ContentDigest},
+	})
+	return err
+}
+
+// InvalidateMemory terminally invalidates one existing session-local target.
+func (s *Session) InvalidateMemory(ctx context.Context, invalidation MemoryInvalidation) error {
+	_, err := s.Append(ctx, ledger.Event{
+		Type: ledger.EventMemoryInvalidated,
+		Payload: map[string]any{
+			"target_kind": string(invalidation.Kind),
+			"target":      invalidation.Target,
+			"reason":      string(invalidation.Reason),
+		},
+	})
+	return err
+}
+
+// RevalidateMemory restores a stale target when its stale revision and evidence
+// still match the durable current state.
+func (s *Session) RevalidateMemory(ctx context.Context, revalidation MemoryRevalidation) error {
+	payload := map[string]any{
+		"target_kind":             string(revalidation.Kind),
+		"target":                  revalidation.Target,
+		"evidence_ref":            revalidation.EvidenceRef,
+		"expected_stale_revision": revalidation.ExpectedStaleRevision,
+	}
+	if revalidation.SourceDigest != "" {
+		payload["source_digest"] = revalidation.SourceDigest
+	}
+	_, err := s.Append(ctx, ledger.Event{Type: ledger.EventMemoryRevalidated, Payload: payload})
 	return err
 }
 

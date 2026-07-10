@@ -14,7 +14,11 @@ type Dispatcher struct {
 }
 
 // Default builds the scaffold observer set.
-func Default(ids IDAllocator) *Dispatcher {
+func Default(ids IDAllocator, states ...*wsl.WorkingState) *Dispatcher {
+	var state *wsl.WorkingState
+	if len(states) > 0 {
+		state = states[0]
+	}
 	return &Dispatcher{
 		Allocator: ids,
 		Observers: []Observer{
@@ -22,7 +26,7 @@ func Default(ids IDAllocator) *Dispatcher {
 			&Constraints{IDs: ids},
 			&ToolDigest{IDs: ids},
 			&Decisions{IDs: ids},
-			&Staleness{},
+			&Staleness{IDs: ids, State: state},
 		},
 	}
 }

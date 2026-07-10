@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"wsms/internal/artifacts"
+	"wsms/internal/coherence"
 	wsmserrors "wsms/internal/errors"
 	"wsms/internal/ledger"
 	"wsms/internal/memory"
@@ -24,6 +25,9 @@ var (
 	// ErrMissingRawEvidence reports an existing failure whose backing evidence
 	// cannot be resolved because it has neither raw content nor provenance.
 	ErrMissingRawEvidence = errors.New("failure has no raw evidence or provenance")
+	// ErrRawEvidenceRevoked reports a policy/security invalidation that also
+	// withdraws diagnostic byte access, not merely residency eligibility.
+	ErrRawEvidenceRevoked = errors.New("raw evidence access revoked")
 )
 
 // Resolver resolves fault requests against hierarchy, WSL, ledger, and artifacts.
@@ -32,6 +36,7 @@ type Resolver struct {
 	Hierarchy *memory.Hierarchy
 	Ledger    *ledger.AppendOnlyLedger
 	Artifacts *artifacts.Store
+	Coherence *coherence.State
 }
 
 // Resolve handles a page fault request.
@@ -58,14 +63,24 @@ func (r *Resolver) resolvePage(ctx context.Context, id string, budget int) (stri
 	if id == "" {
 		return PageMiss, nil
 	}
+	// Authoritative coherence is checked before every cache and WSL lookup.
+	// A stale L2 hit must never win and fallback must never resurrect it.
+	if r.Coherence != nil && !r.Coherence.RecordEligible(id) {
+		return PageMiss, nil
+	}
 	if r.Hierarchy != nil {
 		if p, ok := r.Hierarchy.GetPage(id); ok {
-			r.Hierarchy.RecordAccess(id)
-			body := p.Body
-			if body == "" {
-				body = p.Summary
+			if !p.Stale && !p.Invalidated {
+				r.Hierarchy.RecordAccess(id)
+				body := p.Body
+				if body == "" {
+					body = p.Summary
+				}
+				return trimBudget(body, budget), nil
 			}
-			return trimBudget(body, budget), nil
+			// An eligible logical address with an old resident generation is a
+			// cache miss, not an authority miss. Fall through to WSL/L4 and
+			// rematerialize instead of refreshing stale body metadata in place.
 		}
 	}
 	if r.State == nil {
@@ -75,7 +90,18 @@ func (r *Resolver) resolvePage(ctx context.Context, id string, budget int) (stri
 		// materialize into L2 when a hierarchy is configured
 		body := renderer.RenderFailureDetail(f)
 		if r.Hierarchy != nil {
-			r.Hierarchy.PutL2(&memory.Page{ID: id, Summary: f.Err, Body: body})
+			page := &memory.Page{ID: id, Summary: f.Err, Refs: []string{id}, Body: body}
+			if r.Coherence != nil {
+				if binding, ok := r.Coherence.BindingFor(ledger.TargetRecord, id); ok {
+					page.Scope = binding.Scope
+					page.Branch = binding.Branch
+					page.Commit = binding.Commit
+					page.Paths = append([]string(nil), binding.Paths...)
+					page.SourceDigest = binding.SourceDigest
+					page.ScopeEpoch = binding.Generation()
+				}
+			}
+			r.Hierarchy.PutL2(page)
 			r.Hierarchy.RecordAccess(id)
 		}
 		return trimBudget(body, budget), nil
@@ -88,6 +114,9 @@ func (r *Resolver) resolvePage(ctx context.Context, id string, budget int) (stri
 }
 
 func (r *Resolver) resolveRaw(ctx context.Context, id string, budget int) (string, error) {
+	if r.Coherence != nil && !r.Coherence.RawAllowed(id) {
+		return "", fmt.Errorf("resolve raw log %s: %w", id, ErrRawEvidenceRevoked)
+	}
 	if r.State != nil {
 		if f := r.State.FailureByID(id); f != nil {
 			if f.Raw == "" {
