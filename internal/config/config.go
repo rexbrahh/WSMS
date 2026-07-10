@@ -1,7 +1,11 @@
 // Package config holds runtime budgets and paths for a WSMS session.
 package config
 
-import "time"
+import (
+	"time"
+
+	"wsms/internal/embedder"
+)
 
 // Config is the scaffold configuration for a session runtime.
 type Config struct {
@@ -22,8 +26,17 @@ type Config struct {
 
 	// DenseDimensions enables the optional sqlite-vec projection on the warm
 	// index when > 0. Zero (default) keeps dense search unavailable; FTS still
-	// works. Real embeddings arrive in Phase 7D.
+	// works. When Embedder is set and DenseDimensions is zero, OpenSession uses
+	// the embedder namespace dimensions.
 	DenseDimensions int
+
+	// Embedder is an optional Phase 7D document/query embedder. It is never in
+	// the durable append truth path; failures degrade dense search to FTS-only.
+	Embedder embedder.Embedder
+
+	// EmbeddingBatchSize bounds document vectors written after a page-table
+	// commit. Zero uses the embedder package default.
+	EmbeddingBatchSize int
 }
 
 // Default returns scaffold defaults.
