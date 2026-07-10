@@ -1,0 +1,66 @@
+[
+  {
+    "id": "q_failure_signature",
+    "label": "positive",
+    "text": "stream goroutine still blocked",
+    "expected_kinds": ["failure_episode"],
+    "forbidden_kinds": [],
+    "notes": "Exact failure signature from the command_output event"
+  },
+  {
+    "id": "q_hard_constraint",
+    "label": "positive",
+    "text": "do not rewrite transport layer",
+    "expected_kinds": ["constraint"],
+    "forbidden_kinds": [],
+    "notes": "User hard constraint must remain addressable by text"
+  },
+  {
+    "id": "q_decision",
+    "label": "positive",
+    "text": "add nil guard",
+    "expected_kinds": ["decision"],
+    "forbidden_kinds": [],
+    "notes": "Operational decision chosen field"
+  },
+  {
+    "id": "q_known_good",
+    "label": "positive",
+    "text": "go test ./runtime -run TestCancelStream",
+    "expected_kinds": ["known_good_command", "failure_episode"],
+    "forbidden_kinds": [],
+    "notes": "Command appears on both failure and known-good pages"
+  },
+  {
+    "id": "q_wrong_branch",
+    "label": "wrong_branch",
+    "text": "stream goroutine still blocked",
+    "expected_kinds": [],
+    "forbidden_kinds": ["failure_episode"],
+    "notes": "Later retrievers must hard-filter main-branch failure when active branch is feature/other; Phase 7A labels only"
+  },
+  {
+    "id": "q_invalidated",
+    "label": "invalidated",
+    "text": "do not rewrite transport layer",
+    "expected_kinds": [],
+    "forbidden_kinds": ["constraint"],
+    "notes": "After memory_invalidated of C1, constraint page must not materialize; Phase 7A label for 7B post-validation"
+  },
+  {
+    "id": "q_poisoned_model",
+    "label": "poisoned",
+    "text": "always rewrite transport layer for speed",
+    "expected_kinds": [],
+    "forbidden_kinds": ["constraint", "decision"],
+    "notes": "Assistant prose that looks like a constraint must never become ground truth"
+  },
+  {
+    "id": "q_no_answer",
+    "label": "true_no_answer",
+    "text": "kubernetes cluster billing anomaly",
+    "expected_kinds": [],
+    "forbidden_kinds": [],
+    "notes": "True abstention: no operational page in this stream covers k8s billing"
+  }
+]

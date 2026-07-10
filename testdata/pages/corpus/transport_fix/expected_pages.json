@@ -1,0 +1,86 @@
+{
+  "compiler_version": "pages/v0.1.0",
+  "session_id": "corpus-transport",
+  "pages": [
+    {
+      "kind": "task_checkpoint",
+      "page_id": "wp_fa990d4d97798fab3a04e2b4b622fdab",
+      "page_version": 1,
+      "search_text": "kind=task_checkpoint goal=fix transport phase=impl priority=hot branch=main commit=abc1234",
+      "summary": "task=fix transport",
+      "trust": "system",
+      "source_seq_min": 1,
+      "source_seq_max": 1
+    },
+    {
+      "kind": "constraint",
+      "page_id": "wp_912190f8b1052b9d9169c74a97ad8b0a",
+      "page_version": 2,
+      "search_text": "kind=constraint strength=hard requirement=do not rewrite transport layer source=user",
+      "summary": "hard constraint=do not rewrite transport layer",
+      "trust": "user",
+      "source_seq_min": 2,
+      "source_seq_max": 2
+    },
+    {
+      "kind": "failure_episode",
+      "page_id": "wp_e8c2bf333cee3ad922c9c1ffd29b94b8",
+      "page_version": 3,
+      "search_text": "kind=failure_episode command=go test ./runtime -run TestCancelStream exit=1 error=error: stream goroutine still blocked file=src/runtime/stream.go:118",
+      "summary": "failure=error: stream goroutine still blocked command=go test ./runtime -run TestCancelStream",
+      "trust": "tool",
+      "source_seq_min": 3,
+      "source_seq_max": 3
+    },
+    {
+      "kind": "decision",
+      "page_id": "wp_7fee7b21fa3a35090a4762fe4df5b043",
+      "page_version": 4,
+      "search_text": "kind=decision chosen=add nil guard because=panic on nil stream scope=task avoid=rewrite transport",
+      "summary": "decision=add nil guard because=panic on nil stream",
+      "trust": "model",
+      "source_seq_min": 3,
+      "source_seq_max": 4
+    },
+    {
+      "kind": "task_checkpoint",
+      "page_id": "wp_fa990d4d97798fab3a04e2b4b622fdab",
+      "page_version": 5,
+      "search_text": "kind=task_checkpoint goal=fix transport phase=impl priority=hot branch=main commit=abc1234 next_action=write regression next_target=stream_test.go",
+      "summary": "task=fix transport next=write regression stream_test.go",
+      "trust": "system",
+      "source_seq_min": 1,
+      "source_seq_max": 5
+    },
+    {
+      "kind": "known_good_command",
+      "page_id": "wp_060fb9f6091c32e5e7f4b736be97d402",
+      "page_version": 6,
+      "search_text": "kind=known_good_command command=go test ./runtime -run TestCancelStream exit=0",
+      "summary": "verified command=go test ./runtime -run TestCancelStream",
+      "trust": "tool",
+      "source_seq_min": 6,
+      "source_seq_max": 6
+    },
+    {
+      "kind": "file_context",
+      "page_id": "wp_56e240dee1979b9102fc4f0f18bcf703",
+      "page_version": 7,
+      "search_text": "kind=file_context path=src/runtime/stream.go commit=abc1234 content_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "summary": "file context=src/runtime/stream.go at abc1234",
+      "trust": "repo",
+      "source_seq_min": 7,
+      "source_seq_max": 7
+    },
+    {
+      "kind": "repo_fact",
+      "page_id": "wp_eb91650f7035d92353e8e21a22c46dad",
+      "page_version": 7,
+      "search_text": "kind=repo_fact path=src/runtime/stream.go commit=abc1234 content_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "summary": "repository fact=src/runtime/stream.go at abc1234",
+      "trust": "repo",
+      "source_seq_min": 7,
+      "source_seq_max": 7
+    }
+  ]
+}
