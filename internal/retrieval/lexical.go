@@ -23,9 +23,17 @@ type LexicalRetriever struct {
 
 // Result is a successful lexical retrieval.
 type Result struct {
-	Candidates  []indexer.Candidate
-	Explanation string
-	Degraded    []string // e.g. dense unavailable
+	Candidates   []indexer.Candidate
+	Materialized []MaterializedPage
+	Explanation  string
+	Degraded     []string // e.g. dense unavailable
+}
+
+// MaterializedPage is bounded exact evidence admitted only after the indexed
+// candidate passes current L4/coherence validation.
+type MaterializedPage struct {
+	PageID   pages.PageID
+	Evidence []string
 }
 
 // ResolveSemantic runs hard filters → FTS → post-filters → abstention.
@@ -62,6 +70,7 @@ func (r *LexicalRetriever) ResolveSemantic(ctx context.Context, intent QueryInte
 		RepoID:     intent.RepoID,
 		TaskID:     intent.TaskID,
 		Branch:     intent.Branch,
+		Commit:     intent.Commit,
 		Kinds:      intent.AllowedKinds,
 		Trust:      intent.RequiredTrust,
 		Text:       intent.searchText(),
