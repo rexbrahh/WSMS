@@ -19,11 +19,15 @@ func (idx *Index) Apply(ctx context.Context, mutations []pages.PageMutation) err
 
 // ApplyWithWatermark applies mutations and optionally advances a session watermark.
 func (idx *Index) ApplyWithWatermark(ctx context.Context, mutations []pages.PageMutation, sessionID string, sourceSeq, pageVersion int64) error {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return err
 	}
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	defer release()
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.db == nil {
 		return ErrClosed
 	}
@@ -32,6 +36,18 @@ func (idx *Index) ApplyWithWatermark(ctx context.Context, mutations []pages.Page
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if sessionID != "" && sourceSeq > 0 {
+		var current int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT last_source_seq FROM index_watermarks WHERE session_id = ?`, sessionID,
+		).Scan(&current)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if sourceSeq > current+1 {
+			return fmt.Errorf("%w: session %s current=%d attempted=%d", ErrWatermarkGap, sessionID, current, sourceSeq)
+		}
+	}
 
 	for _, mut := range mutations {
 		if err := contextErr(ctx); err != nil {
@@ -63,14 +79,19 @@ func (idx *Index) ApplyWithWatermark(ctx context.Context, mutations []pages.Page
 
 // Watermark returns the last applied source sequence for sessionID.
 func (idx *Index) Watermark(ctx context.Context, sessionID string) (sourceSeq, pageVersion int64, err error) {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return 0, 0, err
 	}
+	defer release()
 	if sessionID == "" {
 		return 0, 0, fmt.Errorf("session id is required")
 	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
+	if idx.db == nil {
+		return 0, 0, ErrClosed
+	}
 	err = idx.db.QueryRowContext(ctx,
 		`SELECT last_source_seq, last_page_version FROM index_watermarks WHERE session_id = ?`,
 		sessionID,
@@ -81,25 +102,14 @@ func (idx *Index) Watermark(ctx context.Context, sessionID string) (sourceSeq, p
 	return sourceSeq, pageVersion, err
 }
 
-// SetWatermark records catch-up progress for sessionID.
+// SetWatermark records one contiguous catch-up step for sessionID. It shares
+// the same gap check as mutation application so callers cannot declare missing
+// L4 events indexed by jumping this commit pointer.
 func (idx *Index) SetWatermark(ctx context.Context, sessionID string, sourceSeq, pageVersion int64) error {
-	if err := idx.guard(ctx); err != nil {
-		return err
-	}
 	if sessionID == "" || sourceSeq <= 0 {
 		return fmt.Errorf("session id and positive source seq are required")
 	}
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	tx, err := idx.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := setWatermarkTx(ctx, tx, sessionID, sourceSeq, pageVersion); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return idx.ApplyWithWatermark(ctx, nil, sessionID, sourceSeq, pageVersion)
 }
 
 func setWatermarkTx(ctx context.Context, tx *sql.Tx, sessionID string, sourceSeq, pageVersion int64) error {
@@ -130,6 +140,9 @@ func upsertPage(ctx context.Context, tx *sql.Tx, page pages.WarmPage) error {
 		}
 		if int64(page.Version) == existingVersion && string(page.SourceDigest) == existingDigest {
 			return nil // idempotent
+		}
+		if err := deleteVectorTx(ctx, tx, page.ID); err != nil {
+			return err
 		}
 	}
 

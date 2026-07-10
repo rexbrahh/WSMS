@@ -13,7 +13,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wsms/internal/pages"
@@ -25,7 +27,7 @@ import (
 var schemaSQL string
 
 const (
-	schemaVersion     = "1"
+	schemaVersion     = "2"
 	servingDBName     = "warm.db"
 	rebuildDBName     = "warm.rebuild.db"
 	rebuildLockName   = "rebuild.lock"
@@ -47,6 +49,12 @@ var (
 	ErrRebuildInProgress = errors.New("warm index rebuild in progress")
 	// ErrInvalidSchema reports an unsupported on-disk schema.
 	ErrInvalidSchema = errors.New("unsupported warm index schema")
+	// ErrInvalidCompiler reports derivative rows built by an incompatible page
+	// compiler. The index may be deleted and replayed from L4.
+	ErrInvalidCompiler = errors.New("unsupported warm index compiler")
+	// ErrWatermarkGap reports an attempt to advance past an unapplied source
+	// sequence. L3 must catch up from L4 rather than hide the hole.
+	ErrWatermarkGap = errors.New("warm index watermark gap")
 )
 
 // Options configures optional index capabilities.
@@ -58,12 +66,27 @@ type Options struct {
 
 // Index is a generation of disposable warm-page search state.
 type Index struct {
-	mu        sync.RWMutex
-	dir       string
-	path      string
-	db        *sql.DB
-	denseDims int
+	mu         sync.RWMutex
+	writeMu    sync.Mutex
+	rebuildMu  sync.Mutex
+	dir        string
+	path       string
+	db         *sql.DB
+	denseDims  int
+	generation int64
+	lease      *indexLease
+
+	embeddingNamespace      string
+	embeddingDegradedReason string
 }
+
+type indexLease struct {
+	mu         sync.RWMutex
+	rebuildMu  sync.Mutex
+	generation atomic.Int64
+}
+
+var indexLeases sync.Map // map[absoluteIndexDir]*indexLease
 
 // Health is inspectable index status.
 type Health struct {
@@ -77,6 +100,10 @@ type Health struct {
 	DenseDimensions int
 	DenseMetric     string
 	VectorCount     int64
+
+	EmbeddingNamespace      string
+	EmbeddingDegraded       bool
+	EmbeddingDegradedReason string
 }
 
 // Open opens or creates the warm index under dir (the index/ directory).
@@ -91,27 +118,82 @@ func Open(dir string, opts ...Options) (*Index, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	// Orphan rebuild files are never authoritative.
-	_ = os.Remove(filepath.Join(dir, rebuildDBName))
-	_ = os.Remove(filepath.Join(dir, rebuildDBName+"-wal"))
-	_ = os.Remove(filepath.Join(dir, rebuildDBName+"-shm"))
+	lease := leaseForDir(dir)
+	// Open may recover cutover artifacts or replace an incompatible disposable
+	// generation, so it is a directory mutation rather than a read operation.
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if err := recoverIndexFiles(dir); err != nil {
+		return nil, err
+	}
 
 	path := filepath.Join(dir, servingDBName)
 	db, err := openDB(path)
 	if err != nil {
 		return nil, err
 	}
-	idx := &Index{dir: dir, path: path, db: db}
+	idx := &Index{dir: dir, path: path, db: db, lease: lease}
 	ctx := context.Background()
 	if err := idx.ensureMeta(ctx); err != nil {
+		if !errors.Is(err, ErrInvalidSchema) && !errors.Is(err, ErrInvalidCompiler) {
+			_ = db.Close()
+			return nil, err
+		}
 		_ = db.Close()
-		return nil, err
+		if err := removeDBFiles(path); err != nil {
+			return nil, err
+		}
+		db, err = openDB(path)
+		if err != nil {
+			return nil, err
+		}
+		idx.db = db
+		if err := idx.ensureMeta(ctx); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	if err := idx.initDense(ctx, opt.DenseDimensions); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	gen, err := readGeneration(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	idx.generation = gen
+	// The serving file is authoritative while the exclusive lease is held. An
+	// operator may have safely deleted a fully closed disposable index between
+	// opens, in which case the new generation legitimately resets to one.
+	lease.generation.Store(gen)
 	return idx, nil
+}
+
+func leaseForDir(dir string) *indexLease {
+	key, err := filepath.Abs(dir)
+	if err != nil {
+		key = filepath.Clean(dir)
+	}
+	// MkdirAll runs before this lookup, so EvalSymlinks can collapse aliases to
+	// the same physical directory and prevent parallel leases over one WAL set.
+	if physical, err := filepath.EvalSymlinks(key); err == nil {
+		key = physical
+	}
+	actual, _ := indexLeases.LoadOrStore(key, &indexLease{})
+	return actual.(*indexLease)
+}
+
+func (lease *indexLease) noteGeneration(gen int64) {
+	for {
+		current := lease.generation.Load()
+		if gen <= current {
+			return
+		}
+		if lease.generation.CompareAndSwap(current, gen) {
+			return
+		}
+	}
 }
 
 func openDB(path string) (*sql.DB, error) {
@@ -158,7 +240,68 @@ func (idx *Index) ensureMeta(ctx context.Context) error {
 	if version != schemaVersion {
 		return fmt.Errorf("%w: got %q want %q", ErrInvalidSchema, version, schemaVersion)
 	}
+	var compiler string
+	if err := idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaCompiler).Scan(&compiler); err != nil {
+		return err
+	}
+	if compiler != string(pages.CurrentCompilerVersion) {
+		return fmt.Errorf("%w: got %q want %q", ErrInvalidCompiler, compiler, pages.CurrentCompilerVersion)
+	}
 	return nil
+}
+
+func recoverIndexFiles(dir string) error {
+	if err := removeStaleRebuildLock(filepath.Join(dir, rebuildLockName)); err != nil {
+		return err
+	}
+	serving := filepath.Join(dir, servingDBName)
+	backup := serving + ".old"
+	rebuild := filepath.Join(dir, rebuildDBName)
+	if _, err := os.Stat(serving); os.IsNotExist(err) {
+		switch {
+		case fileExists(backup):
+			if err := os.Rename(backup, serving); err != nil {
+				return fmt.Errorf("restore previous warm index: %w", err)
+			}
+		case fileExists(rebuild):
+			if err := os.Rename(rebuild, serving); err != nil {
+				return fmt.Errorf("promote rebuilt warm index: %w", err)
+			}
+		}
+	} else if err != nil {
+		return err
+	}
+	if fileExists(serving) {
+		for _, path := range []string{rebuild, rebuild + "-wal", rebuild + "-shm", backup, backup + "-wal", backup + "-shm"} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func removeDBFiles(path string) error {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeDBSidecars(path string) error {
+	for _, candidate := range []string{path + "-wal", path + "-shm"} {
+		if err := os.Remove(candidate); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // Dir returns the index directory path.
@@ -174,6 +317,8 @@ func (idx *Index) Close() error {
 	if idx == nil {
 		return nil
 	}
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	if idx.db == nil {
@@ -186,14 +331,22 @@ func (idx *Index) Close() error {
 
 // Health reports generation metadata and page counts.
 func (idx *Index) Health(ctx context.Context) (Health, error) {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return Health{}, err
 	}
+	defer release()
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
+	if idx.db == nil {
+		return Health{}, ErrClosed
+	}
 	h := Health{
 		Ready: true, Path: idx.path,
 		DenseEnabled: idx.denseDims > 0, DenseDimensions: idx.denseDims,
+		EmbeddingNamespace:      idx.embeddingNamespace,
+		EmbeddingDegraded:       idx.embeddingDegradedReason != "",
+		EmbeddingDegradedReason: idx.embeddingDegradedReason,
 	}
 	if h.DenseEnabled {
 		h.DenseMetric = denseMetricCosine
@@ -213,14 +366,75 @@ func (idx *Index) Health(ctx context.Context) (Health, error) {
 	return h, nil
 }
 
-func (idx *Index) guard(ctx context.Context) error {
-	if idx == nil || idx.db == nil {
-		return ErrClosed
+// RecordEmbeddingStatus updates non-authoritative dense-embedding health. It
+// does not touch SQLite and must never affect page-table or watermark commits.
+func (idx *Index) RecordEmbeddingStatus(namespace string, err error) {
+	if idx == nil {
+		return
 	}
-	if ctx == nil {
-		return fmt.Errorf("nil context")
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if namespace != "" {
+		idx.embeddingNamespace = namespace
 	}
-	return ctx.Err()
+	if err == nil {
+		idx.embeddingDegradedReason = ""
+		return
+	}
+	idx.embeddingDegradedReason = compactHealthReason(err)
+}
+
+func compactHealthReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	reason := strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		default:
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}
+	}, err.Error())
+	reason = strings.Join(strings.Fields(reason), " ")
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
+	return reason
+}
+
+func readGeneration(ctx context.Context, db *sql.DB) (int64, error) {
+	var genStr string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaGeneration).Scan(&genStr); err != nil {
+		return 0, err
+	}
+	var gen int64
+	if _, err := fmt.Sscan(genStr, &gen); err != nil || gen <= 0 {
+		return 0, fmt.Errorf("invalid warm index generation %q", genStr)
+	}
+	return gen, nil
+}
+
+func (idx *Index) beginOperation(ctx context.Context) (func(), error) {
+	if idx == nil {
+		return nil, ErrClosed
+	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	if idx.lease == nil {
+		return func() {}, nil
+	}
+	idx.lease.mu.RLock()
+	release := func() { idx.lease.mu.RUnlock() }
+	if err := idx.rebindIfStale(ctx); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
 }
 
 func sqliteDSN(path string) string {
@@ -236,6 +450,70 @@ func sqliteDSN(path string) string {
 	query.Add("_pragma", "busy_timeout=5000")
 	u.RawQuery = query.Encode()
 	return u.String()
+}
+
+func (idx *Index) rebindIfStale(ctx context.Context) error {
+	if idx == nil {
+		return ErrClosed
+	}
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	if idx.lease == nil {
+		return nil
+	}
+	target := idx.lease.generation.Load()
+	if target == 0 {
+		return nil
+	}
+	idx.mu.RLock()
+	closed := idx.db == nil
+	current := idx.generation
+	idx.mu.RUnlock()
+	if closed {
+		return ErrClosed
+	}
+	if current >= target {
+		return nil
+	}
+
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.db == nil {
+		return ErrClosed
+	}
+	target = idx.lease.generation.Load()
+	if idx.generation >= target {
+		return nil
+	}
+	db, err := openDB(idx.path)
+	if err != nil {
+		return err
+	}
+	requestedDenseDims := idx.denseDims
+	old := idx.db
+	idx.db = db
+	if err := idx.ensureMeta(ctx); err != nil {
+		idx.db = old
+		_ = db.Close()
+		return err
+	}
+	if err := idx.initDense(ctx, requestedDenseDims); err != nil {
+		idx.db = old
+		_ = db.Close()
+		return err
+	}
+	gen, err := readGeneration(ctx, db)
+	if err != nil {
+		idx.db = old
+		_ = db.Close()
+		return err
+	}
+	idx.generation = gen
+	idx.lease.noteGeneration(gen)
+	return old.Close()
 }
 
 func contextErr(ctx context.Context) error {

@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -21,14 +22,22 @@ const (
 // VectorRecord is one page embedding for the optional dense projection.
 // Phase 7C accepts fixture vectors; a real embedder arrives in 7D.
 type VectorRecord struct {
-	PageID    pages.PageID
-	SessionID string
-	Vector    []float64
+	PageID             pages.PageID
+	SessionID          string
+	EmbeddingNamespace string
+	Vector             []float64
 }
+
+const DefaultVectorNamespace = "wsms/manual-vector/v1"
 
 // DenseEnabled reports whether this index has a vec0 projection.
 func (idx *Index) DenseEnabled() bool {
-	return idx != nil && idx.denseDims > 0
+	if idx == nil {
+		return false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.db != nil && idx.denseDims > 0
 }
 
 // DenseDimensions returns the configured embedding width, or 0.
@@ -36,6 +45,8 @@ func (idx *Index) DenseDimensions() int {
 	if idx == nil {
 		return 0
 	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	return idx.denseDims
 }
 
@@ -117,11 +128,44 @@ func (idx *Index) ensureDenseTables(ctx context.Context) error {
 }
 
 func ensureDenseTablesTx(ctx context.Context, tx *sql.Tx, dims int) error {
+	dropProjection := false
+	if exists, err := tableExistsTx(ctx, tx, "warm_page_vec_map"); err != nil {
+		return err
+	} else if exists {
+		hasNamespace, err := tableHasColumnTx(ctx, tx, "warm_page_vec_map", "embedding_namespace")
+		if err != nil {
+			return err
+		}
+		if !hasNamespace {
+			dropProjection = true
+		}
+	}
+	if exists, err := tableExistsTx(ctx, tx, "warm_pages_vec"); err != nil {
+		return err
+	} else if exists {
+		hasNamespace, err := tableHasColumnTx(ctx, tx, "warm_pages_vec", "embedding_namespace")
+		if err != nil {
+			return err
+		}
+		if !hasNamespace {
+			dropProjection = true
+		}
+	}
+	if dropProjection {
+		if err := dropDenseProjectionTx(ctx, tx); err != nil {
+			return err
+		}
+	}
+
 	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS warm_page_vec_map (
-  page_id    TEXT PRIMARY KEY NOT NULL,
-  rowid      INTEGER NOT NULL UNIQUE,
-  session_id TEXT NOT NULL
+  page_id             TEXT PRIMARY KEY NOT NULL,
+  rowid               INTEGER NOT NULL UNIQUE,
+  session_id          TEXT NOT NULL,
+  page_version        INTEGER NOT NULL,
+  source_digest       TEXT NOT NULL,
+  compiler_version    TEXT NOT NULL,
+  embedding_namespace TEXT NOT NULL
 )`); err != nil {
 		return err
 	}
@@ -132,6 +176,7 @@ CREATE TABLE IF NOT EXISTS warm_page_vec_map (
 	if err == sql.ErrNoRows {
 		ddl := fmt.Sprintf(`CREATE VIRTUAL TABLE warm_pages_vec USING vec0(
   session_id TEXT PARTITION KEY,
+  embedding_namespace TEXT PARTITION KEY,
   embedding float[%d] distance_metric=cosine
 )`, dims)
 		if _, err := tx.ExecContext(ctx, ddl); err != nil {
@@ -144,16 +189,20 @@ CREATE TABLE IF NOT EXISTS warm_page_vec_map (
 
 // UpsertVectors writes or replaces dense vectors for existing warm pages.
 func (idx *Index) UpsertVectors(ctx context.Context, records []VectorRecord) error {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return err
 	}
-	if !idx.DenseEnabled() {
-		return ErrDenseUnavailable
-	}
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	defer release()
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
 	if idx.db == nil {
 		return ErrClosed
+	}
+	if idx.denseDims <= 0 {
+		return ErrDenseUnavailable
 	}
 	tx, err := idx.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -173,14 +222,21 @@ func (idx *Index) UpsertVectors(ctx context.Context, records []VectorRecord) err
 
 // DeleteVector removes one page's dense projection.
 func (idx *Index) DeleteVector(ctx context.Context, pageID pages.PageID) error {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return err
 	}
-	if !idx.DenseEnabled() {
+	defer release()
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.db == nil {
+		return ErrClosed
+	}
+	if idx.denseDims <= 0 {
 		return ErrDenseUnavailable
 	}
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
 	tx, err := idx.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -199,30 +255,43 @@ func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorReco
 	if err := validateVector(rec.Vector, idx.denseDims); err != nil {
 		return err
 	}
-	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM warm_pages WHERE page_id = ?`, string(rec.PageID)).Scan(&exists); err != nil {
+	namespace, err := normalizeVectorNamespace(rec.EmbeddingNamespace)
+	if err != nil {
+		return err
+	}
+	var pageVersion int64
+	var pageSession, sourceDigest, compilerVersion, status string
+	if err := tx.QueryRowContext(ctx, `SELECT page_version, session_id, source_digest, compiler_version, status FROM warm_pages WHERE page_id = ?`, string(rec.PageID)).Scan(
+		&pageVersion, &pageSession, &sourceDigest, &compilerVersion, &status,
+	); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("page %s is not in warm_pages", rec.PageID)
 		}
 		return err
 	}
+	if pageSession != rec.SessionID {
+		return fmt.Errorf("page %s session %q does not match vector session %q", rec.PageID, pageSession, rec.SessionID)
+	}
+	if status != string(pages.StatusActive) {
+		return fmt.Errorf("page %s is not active", rec.PageID)
+	}
 
 	var rowID int64
-	err := tx.QueryRowContext(ctx, `SELECT rowid FROM warm_page_vec_map WHERE page_id = ?`, string(rec.PageID)).Scan(&rowID)
+	err = tx.QueryRowContext(ctx, `SELECT rowid FROM warm_page_vec_map WHERE page_id = ?`, string(rec.PageID)).Scan(&rowID)
 	switch {
 	case err == sql.ErrNoRows:
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(rowid), 0) + 1 FROM warm_page_vec_map`).Scan(&rowID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO warm_page_vec_map(page_id, rowid, session_id) VALUES(?, ?, ?)`,
-			string(rec.PageID), rowID, rec.SessionID,
+			`INSERT INTO warm_page_vec_map(page_id, rowid, session_id, page_version, source_digest, compiler_version, embedding_namespace) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			string(rec.PageID), rowID, rec.SessionID, pageVersion, sourceDigest, compilerVersion, namespace,
 		); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO warm_pages_vec(rowid, session_id, embedding) VALUES(?, ?, ?)`,
-			rowID, rec.SessionID, vectorJSON(rec.Vector),
+			`INSERT INTO warm_pages_vec(rowid, session_id, embedding_namespace, embedding) VALUES(?, ?, ?, ?)`,
+			rowID, rec.SessionID, namespace, vectorJSON(rec.Vector),
 		); err != nil {
 			return err
 		}
@@ -234,14 +303,14 @@ func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorReco
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE warm_page_vec_map SET session_id = ? WHERE page_id = ?`,
-			rec.SessionID, string(rec.PageID),
+			`UPDATE warm_page_vec_map SET session_id = ?, page_version = ?, source_digest = ?, compiler_version = ?, embedding_namespace = ? WHERE page_id = ?`,
+			rec.SessionID, pageVersion, sourceDigest, compilerVersion, namespace, string(rec.PageID),
 		); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO warm_pages_vec(rowid, session_id, embedding) VALUES(?, ?, ?)`,
-			rowID, rec.SessionID, vectorJSON(rec.Vector),
+			`INSERT INTO warm_pages_vec(rowid, session_id, embedding_namespace, embedding) VALUES(?, ?, ?, ?)`,
+			rowID, rec.SessionID, namespace, vectorJSON(rec.Vector),
 		); err != nil {
 			return err
 		}
@@ -275,20 +344,65 @@ func deleteVectorTx(ctx context.Context, tx *sql.Tx, pageID pages.PageID) error 
 	return err
 }
 
+func tableExistsTx(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
+	var found string
+	err := tx.QueryRowContext(ctx,
+		`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`, name,
+	).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func tableHasColumnTx(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func dropDenseProjectionTx(ctx context.Context, tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS warm_pages_vec`,
+		`DROP TABLE IF EXISTS warm_page_vec_map`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SearchDense runs cosine KNN over the optional vec0 projection.
 // Candidate.Rank is cosine distance (lower is better). Dense is unavailable
 // when the index was opened without DenseDimensions.
 func (idx *Index) SearchDense(ctx context.Context, q SearchQuery, vector []float64) ([]Candidate, error) {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if !idx.DenseEnabled() {
-		return nil, ErrDenseUnavailable
-	}
+	defer release()
 	if q.SessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	if err := validateVector(vector, idx.denseDims); err != nil {
+	namespace, err := normalizeVectorNamespace(q.EmbeddingNamespace)
+	if err != nil {
 		return nil, err
 	}
 	limit := q.Limit
@@ -312,16 +426,24 @@ func (idx *Index) SearchDense(ctx context.Context, q SearchQuery, vector []float
 	if idx.db == nil {
 		return nil, ErrClosed
 	}
+	if idx.denseDims <= 0 {
+		return nil, ErrDenseUnavailable
+	}
+	if err := validateVector(vector, idx.denseDims); err != nil {
+		return nil, err
+	}
 
 	rows, err := idx.db.QueryContext(ctx, `
-SELECT m.page_id, v.distance
+SELECT m.page_id, v.distance, m.page_version, m.source_digest, m.compiler_version
 FROM warm_pages_vec v
 JOIN warm_page_vec_map m ON m.rowid = v.rowid
 WHERE v.embedding MATCH ?
   AND v.k = ?
   AND v.session_id = ?
+  AND v.embedding_namespace = ?
+  AND m.embedding_namespace = ?
 ORDER BY v.distance ASC, m.page_id ASC
-`, vectorJSON(vector), fetch, q.SessionID)
+`, vectorJSON(vector), fetch, q.SessionID, namespace, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("dense search: %w", err)
 	}
@@ -334,7 +456,9 @@ ORDER BY v.distance ASC, m.page_id ASC
 		}
 		var pageID string
 		var distance float64
-		if err := rows.Scan(&pageID, &distance); err != nil {
+		var pageVersion int64
+		var sourceDigest, compilerVersion string
+		if err := rows.Scan(&pageID, &distance, &pageVersion, &sourceDigest, &compilerVersion); err != nil {
 			return nil, err
 		}
 		page, err := loadPageByID(ctx, idx.db, pageID)
@@ -345,6 +469,9 @@ ORDER BY v.distance ASC, m.page_id ASC
 			return nil, err
 		}
 		if page.Status != pages.StatusActive {
+			continue
+		}
+		if int64(page.Version) != pageVersion || string(page.SourceDigest) != sourceDigest || string(page.CompilerVersion) != compilerVersion {
 			continue
 		}
 		if page.SessionID != q.SessionID {
@@ -359,6 +486,9 @@ ORDER BY v.distance ASC, m.page_id ASC
 		if q.Branch != "" && page.Branch != "" && page.Branch != q.Branch {
 			continue
 		}
+		if q.Commit != "" && page.Commit != "" && page.Commit != q.Commit {
+			continue
+		}
 		if len(q.Kinds) > 0 && !kindAllowed(page.Kind, q.Kinds) {
 			continue
 		}
@@ -368,8 +498,8 @@ ORDER BY v.distance ASC, m.page_id ASC
 		out = append(out, Candidate{
 			Page: page,
 			Rank: distance,
-			Explanation: fmt.Sprintf("channel=vec0 metric=cosine distance=%.6f filters=session,status=active page=%s",
-				distance, page.ID),
+			Explanation: fmt.Sprintf("channel=vec0 metric=cosine namespace=%s distance=%.6f filters=session,namespace,status=active,page-version page=%s",
+				namespace, distance, page.ID),
 		})
 		if len(out) >= limit {
 			break
@@ -450,4 +580,75 @@ func vectorJSON(vector []float64) string {
 	}
 	b.WriteByte(']')
 	return b.String()
+}
+
+func normalizeVectorNamespace(value string) (string, error) {
+	if value == "" {
+		return DefaultVectorNamespace, nil
+	}
+	if len(value) > 512 || strings.TrimSpace(value) != value {
+		return "", fmt.Errorf("invalid embedding namespace")
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("invalid embedding namespace")
+		}
+	}
+	return value, nil
+}
+
+func copyCompatibleVectors(ctx context.Context, from *sql.DB, to *Index) (int, error) {
+	rows, err := from.QueryContext(ctx, `
+SELECT m.page_id, m.session_id, m.page_version, m.source_digest,
+       m.compiler_version, m.embedding_namespace, vec_to_json(v.embedding)
+FROM warm_page_vec_map m
+JOIN warm_pages_vec v ON v.rowid = m.rowid
+ORDER BY m.page_id`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var compatible []VectorRecord
+	for rows.Next() {
+		if err := contextErr(ctx); err != nil {
+			return 0, err
+		}
+		var pageID, sessionID, sourceDigest, compilerVersion, namespace, encoded string
+		var pageVersion int64
+		if err := rows.Scan(&pageID, &sessionID, &pageVersion, &sourceDigest, &compilerVersion, &namespace, &encoded); err != nil {
+			return 0, err
+		}
+		var currentVersion int64
+		var currentDigest, currentCompiler, status string
+		err := to.db.QueryRowContext(ctx,
+			`SELECT page_version, source_digest, compiler_version, status FROM warm_pages WHERE page_id = ? AND session_id = ?`,
+			pageID, sessionID,
+		).Scan(&currentVersion, &currentDigest, &currentCompiler, &status)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if currentVersion != pageVersion || currentDigest != sourceDigest || currentCompiler != compilerVersion || status != string(pages.StatusActive) {
+			continue
+		}
+		var vector []float64
+		if err := json.Unmarshal([]byte(encoded), &vector); err != nil {
+			return 0, err
+		}
+		compatible = append(compatible, VectorRecord{
+			PageID: pages.PageID(pageID), SessionID: sessionID,
+			EmbeddingNamespace: namespace, Vector: vector,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(compatible) > 0 {
+		if err := to.UpsertVectors(ctx, compatible); err != nil {
+			return 0, err
+		}
+	}
+	return len(compatible), nil
 }

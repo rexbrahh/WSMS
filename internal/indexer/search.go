@@ -15,15 +15,19 @@ import (
 
 // SearchQuery is a filtered lexical search request.
 type SearchQuery struct {
-	SessionID  string
-	RepoID     string
-	TaskID     string
-	Branch     string
-	Kinds      []pages.PageKind
-	Trust      []pages.Trust
-	Text       string
-	Limit      int
-	ActiveOnly bool
+	SessionID string
+	RepoID    string
+	TaskID    string
+	Branch    string
+	Commit    string
+	// EmbeddingNamespace is used only by dense search. Empty selects the
+	// explicit manual/test namespace used before Phase 7D supplies an embedder.
+	EmbeddingNamespace string
+	Kinds              []pages.PageKind
+	Trust              []pages.Trust
+	Text               string
+	Limit              int
+	ActiveOnly         bool
 }
 
 // Candidate is one ranked warm page from the index.
@@ -35,9 +39,11 @@ type Candidate struct {
 
 // SearchLexical runs FTS5 BM25 over hard-filtered active pages.
 func (idx *Index) SearchLexical(ctx context.Context, q SearchQuery) ([]Candidate, error) {
-	if err := idx.guard(ctx); err != nil {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
 		return nil, err
 	}
+	defer release()
 	if q.SessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
@@ -80,6 +86,10 @@ WHERE warm_pages_fts MATCH ?
 	if q.Branch != "" {
 		b.WriteString(` AND (p.branch = '' OR p.branch = ?)`)
 		args = append(args, q.Branch)
+	}
+	if q.Commit != "" {
+		b.WriteString(` AND (p.commit_id = '' OR p.commit_id = ?)`)
+		args = append(args, q.Commit)
 	}
 	if len(q.Kinds) > 0 {
 		b.WriteString(` AND p.kind IN (`)
@@ -136,6 +146,9 @@ WHERE warm_pages_fts MATCH ?
 		}
 		if q.TaskID != "" {
 			filters = append(filters, "task")
+		}
+		if q.Commit != "" {
+			filters = append(filters, "commit")
 		}
 		out = append(out, Candidate{
 			Page: page,
