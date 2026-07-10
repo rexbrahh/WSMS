@@ -1,10 +1,13 @@
 package ledger
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -21,6 +24,8 @@ const (
 	EventCommandRun        EventType = "command_run"
 	EventCommandOutput     EventType = "command_output"
 	EventFileRead          EventType = "file_read"
+	EventFileSnapshot      EventType = "file_snapshot"
+	EventFileRenamed       EventType = "file_renamed"
 	EventFileWrite         EventType = "file_write"
 	EventGitDiff           EventType = "git_diff"
 	EventTestResult        EventType = "test_result"
@@ -33,8 +38,36 @@ const (
 	EventPageCreated       EventType = "page_created"
 	EventPageAccess        EventType = "page_access"
 	EventMemoryInvalidated EventType = "memory_invalidated"
+	EventMemoryRevalidated EventType = "memory_revalidated"
 	EventNextAction        EventType = "next_action"
 )
+
+// MemoryTargetKind identifies the authoritative address space affected by a
+// coherence mutation. Record targets are session-local WSL/event addresses;
+// path targets are canonical repository-relative paths.
+type MemoryTargetKind string
+
+const (
+	TargetRecord MemoryTargetKind = "record"
+	TargetEvent  MemoryTargetKind = "event"
+	TargetPage   MemoryTargetKind = "page"
+	TargetPath   MemoryTargetKind = "path"
+)
+
+// InvalidationReason is a closed policy set. Security and policy revocations
+// are also consulted by raw-evidence authorization; the other reasons suppress
+// reuse while preserving diagnostic L4 access.
+type InvalidationReason string
+
+const (
+	ReasonSuperseded      InvalidationReason = "superseded"
+	ReasonUserRejected    InvalidationReason = "user_rejected"
+	ReasonSourceDeleted   InvalidationReason = "source_deleted"
+	ReasonPolicyChanged   InvalidationReason = "policy_changed"
+	ReasonSecurityRevoked InvalidationReason = "security_revoked"
+)
+
+var recordTargetRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,127}$`)
 
 // ErrInvalidEvent reports a malformed known event envelope or a missing type.
 var ErrInvalidEvent = errors.New("invalid event")
@@ -99,7 +132,19 @@ func ValidateEvent(ev Event) error {
 		if err := requirePayloadString(ev, "goal", true); err != nil {
 			return err
 		}
-		return validateOptionalStrings(ev, "task_id", "phase", "priority", "branch", "dirty")
+		if err := validateOptionalStrings(ev, "task_id", "phase", "priority", "branch", "dirty"); err != nil {
+			return err
+		}
+		if payloadBranch := ev.PayloadString("branch"); payloadBranch != "" && ev.Branch != "" && payloadBranch != ev.Branch {
+			return invalidPayloadField(ev, "branch", "must match the authoritative event branch")
+		}
+		if ev.Branch != "" {
+			return validateScopeToken(ev, "branch", ev.Branch)
+		}
+		if payloadBranch := ev.PayloadString("branch"); payloadBranch != "" {
+			return validateScopeToken(ev, "branch", payloadBranch)
+		}
+		return nil
 	case EventUserInstruction, EventHumanCorrection, EventAssistantMessage:
 		return requirePayloadString(ev, "text", true)
 	case EventCommandOutput:
@@ -130,9 +175,246 @@ func ValidateEvent(ev Event) error {
 			return err
 		}
 		return validateOptionalStrings(ev, "question")
+	case EventBranchChange:
+		if err := validatePayloadKeys(ev, "from_branch", "from_commit"); err != nil {
+			return err
+		}
+		if err := validateRequiredEnvelopeScope(ev, true, true, false); err != nil {
+			return err
+		}
+		if err := requirePayloadString(ev, "from_branch", true); err != nil {
+			return err
+		}
+		if err := validateScopeToken(ev, "from_branch", ev.PayloadString("from_branch")); err != nil {
+			return err
+		}
+		if ev.PayloadString("from_branch") == ev.Branch {
+			return invalidPayloadField(ev, "from_branch", "must differ from the authoritative post-transition branch")
+		}
+		fromCommit, hasFrom := ev.Payload["from_commit"]
+		if ev.Commit == "" && hasFrom || ev.Commit != "" && !hasFrom {
+			return invalidPayloadField(ev, "from_commit", "must be paired with the authoritative post-transition commit")
+		}
+		if hasFrom {
+			if _, ok := fromCommit.(string); !ok {
+				return invalidPayloadField(ev, "from_commit", "must be a string")
+			}
+			if err := validateScopeToken(ev, "from_commit", ev.PayloadString("from_commit")); err != nil {
+				return err
+			}
+		}
+		return nil
+	case EventCommitChange:
+		if err := validatePayloadKeys(ev, "from_commit"); err != nil {
+			return err
+		}
+		if err := validateRequiredEnvelopeScope(ev, true, true, true); err != nil {
+			return err
+		}
+		if err := requirePayloadString(ev, "from_commit", true); err != nil {
+			return err
+		}
+		if err := validateScopeToken(ev, "from_commit", ev.PayloadString("from_commit")); err != nil {
+			return err
+		}
+		if ev.PayloadString("from_commit") == ev.Commit {
+			return invalidPayloadField(ev, "from_commit", "must differ from the authoritative post-transition commit")
+		}
+		return nil
+	case EventFileSnapshot:
+		if err := validatePayloadKeys(ev, "path", "content_digest"); err != nil {
+			return err
+		}
+		if err := validateRequiredEnvelopeScope(ev, true, true, true); err != nil {
+			return err
+		}
+		if err := validateCanonicalPathPayload(ev, "path"); err != nil {
+			return err
+		}
+		return validateDigestPayload(ev, "content_digest")
+	case EventFileRenamed:
+		if err := validatePayloadKeys(ev, "from_path", "to_path", "content_digest"); err != nil {
+			return err
+		}
+		if err := validateRequiredEnvelopeScope(ev, true, true, false); err != nil {
+			return err
+		}
+		if err := validateCanonicalPathPayload(ev, "from_path"); err != nil {
+			return err
+		}
+		if err := validateCanonicalPathPayload(ev, "to_path"); err != nil {
+			return err
+		}
+		if ev.PayloadString("from_path") == ev.PayloadString("to_path") {
+			return invalidPayloadField(ev, "to_path", "must differ from from_path")
+		}
+		if _, ok := ev.Payload["content_digest"]; ok {
+			return validateDigestPayload(ev, "content_digest")
+		}
+		return nil
+	case EventMemoryInvalidated:
+		return validateMemoryMutation(ev, false)
+	case EventMemoryRevalidated:
+		return validateMemoryMutation(ev, true)
 	default:
 		return nil
 	}
+}
+
+func validateMemoryMutation(ev Event, revalidation bool) error {
+	allowed := []string{"target_kind", "target", "reason"}
+	if revalidation {
+		allowed = []string{"target_kind", "target", "evidence_ref", "expected_stale_revision", "source_digest"}
+	}
+	if err := validatePayloadKeys(ev, allowed...); err != nil {
+		return err
+	}
+	required := []string{"target_kind", "target"}
+	if revalidation {
+		required = append(required, "evidence_ref")
+	} else {
+		required = append(required, "reason")
+	}
+	for _, key := range required {
+		if err := requirePayloadString(ev, key, true); err != nil {
+			return err
+		}
+	}
+	kind := MemoryTargetKind(ev.PayloadString("target_kind"))
+	switch kind {
+	case TargetRecord, TargetEvent, TargetPage:
+		if !recordTargetRE.MatchString(ev.PayloadString("target")) {
+			return invalidPayloadField(ev, "target", "must be a session-local logical address")
+		}
+	case TargetPath:
+		if err := validateCanonicalPathPayload(ev, "target"); err != nil {
+			return err
+		}
+	default:
+		return invalidPayloadField(ev, "target_kind", "must be record, event, page, or path")
+	}
+	if revalidation {
+		if kind == TargetEvent {
+			return invalidPayloadField(ev, "target_kind", "event targets are immutable and cannot be revalidated")
+		}
+		if !recordTargetRE.MatchString(ev.PayloadString("evidence_ref")) {
+			return invalidPayloadField(ev, "evidence_ref", "must be a session-local record/event id")
+		}
+		revision, ok := integerPayload(ev.Payload["expected_stale_revision"])
+		if !ok || revision <= 0 {
+			return invalidPayloadField(ev, "expected_stale_revision", "must be a positive integer")
+		}
+		if kind == TargetPage || kind == TargetPath {
+			return validateDigestPayload(ev, "source_digest")
+		}
+		if _, exists := ev.Payload["source_digest"]; exists {
+			return invalidPayloadField(ev, "source_digest", "is only valid for page or path targets")
+		}
+		return nil
+	}
+	switch InvalidationReason(ev.PayloadString("reason")) {
+	case ReasonSuperseded, ReasonUserRejected, ReasonSourceDeleted, ReasonPolicyChanged, ReasonSecurityRevoked:
+		return nil
+	default:
+		return invalidPayloadField(ev, "reason", "must be superseded, user_rejected, source_deleted, policy_changed, or security_revoked")
+	}
+}
+
+func validatePayloadKeys(ev Event, allowed ...string) error {
+	set := make(map[string]bool, len(allowed))
+	for _, key := range allowed {
+		set[key] = true
+	}
+	for key := range ev.Payload {
+		if !set[key] {
+			return invalidPayloadField(ev, key, "is not allowed by this event contract")
+		}
+	}
+	return nil
+}
+
+func validateRequiredEnvelopeScope(ev Event, repo, branch, commit bool) error {
+	for _, required := range []struct {
+		name  string
+		value string
+		need  bool
+	}{
+		{name: "repo", value: ev.Repo, need: repo},
+		{name: "branch", value: ev.Branch, need: branch},
+		{name: "commit", value: ev.Commit, need: commit},
+	} {
+		if !required.need {
+			continue
+		}
+		if err := validateScopeToken(ev, required.name, required.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCanonicalPathPayload(ev Event, key string) error {
+	if err := requirePayloadString(ev, key, true); err != nil {
+		return err
+	}
+	value := ev.PayloadString(key)
+	cleaned, err := NormalizeRepoPath(value)
+	if err != nil {
+		return invalidPayloadField(ev, key, err.Error())
+	}
+	if cleaned != value {
+		return invalidPayloadField(ev, key, "must already be canonical")
+	}
+	return nil
+}
+
+func validateDigestPayload(ev Event, key string) error {
+	if err := requirePayloadString(ev, key, true); err != nil {
+		return err
+	}
+	digest := ev.PayloadString(key)
+	if len(digest) != 64 || strings.ToLower(digest) != digest {
+		return invalidPayloadField(ev, key, "must be a lowercase SHA-256 digest")
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return invalidPayloadField(ev, key, "must be a lowercase SHA-256 digest")
+	}
+	return nil
+}
+
+func validateScopeToken(ev Event, key, value string) error {
+	if value == "" || strings.TrimSpace(value) != value || len(value) > 256 {
+		return invalidPayloadField(ev, key, "must be a trimmed non-empty token of at most 256 bytes")
+	}
+	if strings.ContainsAny(value, "\x00\r\n\t") {
+		return invalidPayloadField(ev, key, "must not contain control characters")
+	}
+	return nil
+}
+
+// NormalizeRepoPath validates and canonicalizes a repository-relative slash
+// path. It rejects absolute, traversal, Windows-separator, and control inputs.
+func NormalizeRepoPath(value string) (string, error) {
+	if value == "" || strings.TrimSpace(value) != value || len(value) > 4096 {
+		return "", errors.New("must be a trimmed repository-relative path")
+	}
+	if strings.Contains(value, `\`) || strings.HasPrefix(value, "/") || isWindowsDrivePath(value) {
+		return "", errors.New("must not be absolute or contain backslash/control characters")
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return "", errors.New("must not contain control characters")
+		}
+	}
+	cleaned := path.Clean(value)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", errors.New("must not traverse outside the repository")
+	}
+	return cleaned, nil
+}
+
+func isWindowsDrivePath(value string) bool {
+	return len(value) >= 3 && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z')) && value[1] == ':' && value[2] == '/'
 }
 
 func validateCommandOutput(ev Event, allowCommandAlias bool) error {
