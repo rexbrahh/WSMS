@@ -135,14 +135,24 @@ func ValidateMaterializable(ctx context.Context, page WarmPage, change LedgerCha
 	if page.CompilerVersion != CurrentCompilerVersion {
 		return fmt.Errorf("%w: page %s compiler %q is not current %q", ErrUnmaterializableRef, page.ID, page.CompilerVersion, CurrentCompilerVersion)
 	}
-	if page.ScopeEpoch != change.ScopeEpoch {
-		return fmt.Errorf("%w: page %s scope epoch %d is not current %d", ErrUnmaterializableRef, page.ID, page.ScopeEpoch, change.ScopeEpoch)
+	if change.Coherence == nil {
+		return fmt.Errorf("%w: page %s requires authoritative coherence", ErrUnmaterializableRef, page.ID)
+	}
+	currentEpoch := ScopeEpoch(change.Coherence.DescriptorGeneration(page.Scope, page.Branch, page.Commit, page.PathScope))
+	if page.ScopeEpoch != currentEpoch {
+		return fmt.Errorf("%w: page %s scope epoch %d is not current %d", ErrUnmaterializableRef, page.ID, page.ScopeEpoch, currentEpoch)
 	}
 	if uint64(change.Event.Seq) < uint64(page.Version) {
 		return fmt.Errorf("%w: page %s version is from the future", ErrUnmaterializableRef, page.ID)
 	}
 	if !authorityMatchesPage(page, authorityFrom(change)) {
 		return fmt.Errorf("%w: page %s is outside current authority", ErrUnmaterializableRef, page.ID)
+	}
+	if !change.Coherence.PageDescriptorEligible(
+		string(page.ID), logicalCoherenceRefs(page.Refs), page.Scope, page.Branch,
+		page.Commit, page.PathScope, string(page.SourceDigest), uint64(page.ScopeEpoch),
+	) {
+		return fmt.Errorf("%w: page %s or one of its refs is not eligible", ErrUnmaterializableRef, page.ID)
 	}
 	digest, sourceMin, sourceMax, createdAt, err := sourceDigest(ctx, change, page)
 	if err != nil {
@@ -205,7 +215,7 @@ func (c *DeterministicCompiler) compileCheckpoint(ctx context.Context, change Le
 	}
 	return c.build(ctx, change, authority, pageSpec{
 		kind: KindTaskCheckpoint, anchor: task.IDValue, scope: types.ScopeTask,
-		trust: TrustSystem, refs: refs, search: search,
+		trust: TrustMixed, refs: refs, search: search,
 		summary:  []textField{{name: "task", value: task.Goal}, {name: "next", value: nextSummary(change.State.Next())}},
 		salience: 0.85, salienceReason: "active task checkpoint",
 	})
@@ -365,15 +375,18 @@ func (c *DeterministicCompiler) build(ctx context.Context, change LedgerChange, 
 	if !applyAuthority(&page, authority) {
 		return nil, nil
 	}
+	if change.Coherence != nil {
+		page.ScopeEpoch = ScopeEpoch(change.Coherence.DescriptorGeneration(page.Scope, page.Branch, page.Commit, page.PathScope))
+	}
+	if spec.verified {
+		page.LastVerifiedAt = change.Event.TS.UTC()
+	}
 	digest, sourceMin, sourceMax, createdAt, err := sourceDigest(ctx, change, page)
 	if err != nil {
 		return nil, err
 	}
 	page.SourceSeqMin, page.SourceSeqMax = sourceMin, sourceMax
 	page.SourceDigest, page.CreatedAt = digest, createdAt
-	if spec.verified {
-		page.LastVerifiedAt = change.Event.TS.UTC()
-	}
 	mutation := &PageMutation{Op: MutationUpsert, Page: page}
 	if err := mutation.Validate(); err != nil {
 		return nil, err
@@ -404,7 +417,8 @@ func validateLedgerChange(ctx context.Context, change LedgerChange) error {
 		}
 	}
 	for name, pair := range map[string][2]string{
-		"repo": {change.RepoID, ev.Repo}, "branch": {change.Branch, ev.Branch}, "commit": {change.Commit, ev.Commit},
+		"repo": {change.RepoID, ev.Repo}, "task": {change.TaskID, ev.TaskID},
+		"branch": {change.Branch, ev.Branch}, "commit": {change.Commit, ev.Commit},
 	} {
 		if pair[0] != "" && pair[1] != "" && pair[0] != pair[1] {
 			return fmt.Errorf("%w: current %s %q conflicts with event %s %q", ErrInvalidPage, name, pair[0], name, pair[1])
@@ -551,6 +565,8 @@ func sourceDigest(ctx context.Context, change LedgerChange, page WarmPage) (Sour
 		string(page.CompilerVersion), string(page.ID), strconv.FormatUint(uint64(page.Version), 10),
 		page.SessionID, string(page.Kind), string(page.Trust), string(page.Scope),
 		page.RepoID, page.TaskID, page.Branch, page.Commit, strconv.FormatUint(uint64(page.ScopeEpoch), 10),
+		page.SearchText, page.Summary, strconv.FormatFloat(page.Salience, 'g', -1, 64), page.SalienceReason,
+		page.LastVerifiedAt.UTC().Format(time.RFC3339Nano),
 	} {
 		writeDigestPart(h, []byte(field))
 	}
@@ -826,4 +842,20 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func logicalCoherenceRefs(refs []PageRef) []string {
+	out := make([]string, 0, len(refs))
+	seen := map[string]bool{}
+	for _, ref := range refs {
+		if ref.Kind != RefWSLRecord && ref.Kind != RefEvent {
+			continue
+		}
+		if !seen[ref.ID] {
+			seen[ref.ID] = true
+			out = append(out, ref.ID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

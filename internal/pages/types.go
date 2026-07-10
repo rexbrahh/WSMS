@@ -114,7 +114,7 @@ type CompilerVersion string
 
 // CurrentCompilerVersion is changed whenever the logical page representation
 // or deterministic extraction rules change incompatibly.
-const CurrentCompilerVersion CompilerVersion = "pages/v0.1.0"
+const CurrentCompilerVersion CompilerVersion = "pages/v0.2.0"
 
 // SourceDigest is a lowercase SHA-256 digest of canonical evidence inputs.
 type SourceDigest string
@@ -211,6 +211,15 @@ type FileSliceReader interface {
 	ReadFileSlice(context.Context, string, string, int, int) ([]byte, error)
 }
 
+// CoherenceReader supplies the authoritative page-table generation and
+// transitive ref eligibility without importing the coherence implementation.
+// Production materialization requires it; offline compilation may omit it and
+// use the explicit ScopeEpoch fixture value.
+type CoherenceReader interface {
+	DescriptorGeneration(types.Scope, string, string, []string) uint64
+	PageDescriptorEligible(string, []string, types.Scope, string, string, []string, string, uint64) bool
+}
+
 // LedgerChange is one committed ledger event plus the fully derived WSL view
 // after that event. Events and Artifacts are exact-evidence validation seams.
 type LedgerChange struct {
@@ -219,6 +228,7 @@ type LedgerChange struct {
 	Events     EventReader
 	Artifacts  ArtifactReader
 	Files      FileSliceReader
+	Coherence  CoherenceReader
 	RepoID     string
 	TaskID     string
 	Branch     string

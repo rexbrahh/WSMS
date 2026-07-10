@@ -212,39 +212,40 @@ func TestCompilerAuthorityFailClosed(t *testing.T) {
 func TestValidateMaterializableRejectsStaleAndWrongScope(t *testing.T) {
 	s := openPageSession(t, "mat")
 	muts := driveTransportFixStream(t, s)
-	failure, ok := findByKind(muts, pages.KindFailureEpisode)
+	current, ok := findByKind(muts, pages.KindFileContext)
 	if !ok {
-		t.Fatal("missing failure page")
+		t.Fatal("missing current file-context page")
 	}
-	ev := lastFailureEvent(t, s)
+	ev := lastEventByType(t, s, ledger.EventFileSnapshot)
 	snap := s.Coherence.Snapshot()
 	base := pages.LedgerChange{
 		Event: ev, State: s.State.Clone(), Events: s.Ledger, Artifacts: s.Artifacts,
-		RepoID: snap.Current.Repo, TaskID: snap.Current.TaskID, Branch: snap.Current.Branch, Commit: snap.Current.Commit,
+		Coherence: s.Coherence,
+		RepoID:    snap.Current.Repo, TaskID: snap.Current.TaskID, Branch: snap.Current.Branch, Commit: snap.Current.Commit,
 	}
-	if err := pages.ValidateMaterializable(context.Background(), failure, base); err != nil {
+	if err := pages.ValidateMaterializable(context.Background(), current, base); err != nil {
 		t.Fatalf("fresh page should materialize: %v", err)
 	}
 
-	stale := failure
+	stale := current
 	stale.Status = pages.StatusStale
 	if err := pages.ValidateMaterializable(context.Background(), stale, base); err == nil {
 		t.Fatal("stale page materialize succeeded")
 	}
 
-	wrongSession := failure
+	wrongSession := current
 	wrongSession.SessionID = "other"
 	if err := pages.ValidateMaterializable(context.Background(), wrongSession, base); err == nil {
 		t.Fatal("cross-session page materialize succeeded")
 	}
 
-	wrongEpoch := failure
-	wrongEpoch.ScopeEpoch = failure.ScopeEpoch + 9
+	wrongEpoch := current
+	wrongEpoch.ScopeEpoch = current.ScopeEpoch + 9
 	if err := pages.ValidateMaterializable(context.Background(), wrongEpoch, base); err == nil {
 		t.Fatal("wrong scope epoch materialize succeeded")
 	}
 
-	wrongDigest := failure
+	wrongDigest := current
 	wrongDigest.SourceDigest = pages.SourceDigest(strings.Repeat("0", 64))
 	if err := pages.ValidateMaterializable(context.Background(), wrongDigest, base); err == nil {
 		t.Fatal("wrong source digest materialize succeeded")
@@ -320,17 +321,17 @@ func TestPageMutationValidateRejectsTrustMismatchAndBounds(t *testing.T) {
 	}
 }
 
-func lastFailureEvent(t *testing.T, s *harness.Session) ledger.Event {
+func lastEventByType(t *testing.T, s *harness.Session, eventType ledger.EventType) ledger.Event {
 	t.Helper()
 	events, err := s.Ledger.ListBySession(context.Background(), s.Cfg.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Type == ledger.EventCommandOutput && events[i].PayloadInt("exit", 0) != 0 {
+		if events[i].Type == eventType {
 			return events[i]
 		}
 	}
-	t.Fatal("no failure event")
+	t.Fatalf("no %s event", eventType)
 	return ledger.Event{}
 }

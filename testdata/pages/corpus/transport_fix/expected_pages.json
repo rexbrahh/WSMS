@@ -1,5 +1,5 @@
 {
-  "compiler_version": "pages/v0.1.0",
+  "compiler_version": "pages/v0.2.0",
   "session_id": "corpus-transport",
   "pages": [
     {
@@ -8,7 +8,7 @@
       "page_version": 1,
       "search_text": "kind=task_checkpoint goal=fix transport phase=impl priority=hot branch=main commit=abc1234",
       "summary": "task=fix transport",
-      "trust": "system",
+      "trust": "mixed",
       "source_seq_min": 1,
       "source_seq_max": 1
     },
@@ -48,7 +48,7 @@
       "page_version": 5,
       "search_text": "kind=task_checkpoint goal=fix transport phase=impl priority=hot branch=main commit=abc1234 next_action=write regression next_target=stream_test.go",
       "summary": "task=fix transport next=write regression stream_test.go",
-      "trust": "system",
+      "trust": "mixed",
       "source_seq_min": 1,
       "source_seq_max": 5
     },
