@@ -629,6 +629,23 @@ func (s *State) PageStatus(id string, refs []string, scope types.Scope, branch, 
 	return status, revision
 }
 
+// DescriptorGeneration returns the current page-specific branch/commit/path
+// generation. It intentionally ignores unrelated scope mutations.
+func (s *State) DescriptorGeneration(scope types.Scope, branch, commit string, paths []string) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return currentDescriptorGeneration(s.snapshot, scope, branch, commit, paths)
+}
+
+// PageDescriptorEligible is the bool-only pages.CoherenceReader boundary.
+// Eligibility includes transitive logical refs and current descriptor scope.
+func (s *State) PageDescriptorEligible(id string, refs []string, scope types.Scope, branch, commit string, paths []string, sourceDigest string, epoch uint64) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	status, _ := pageStatus(s.snapshot, id, refs, scope, branch, commit, paths, sourceDigest, epoch)
+	return status == StatusActive
+}
+
 // BindingFor returns a cloned current sidecar binding.
 func (s *State) BindingFor(kind ledger.MemoryTargetKind, id string) (Binding, bool) {
 	s.mu.RLock()
