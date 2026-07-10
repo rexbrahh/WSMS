@@ -617,8 +617,9 @@ the direct-ID demo and no-L3 runtime operational.
 
 #### Phase 7A - Frozen semantic corpus and page compiler
 
-**Status:** implemented and verified. Offline `internal/pages` compiler plus
-frozen corpus; not wired into `Scheduler.AfterEvent` (no WarmIndex yet).
+**Status:** implemented, runtime-wired, and independently verified. The page
+compiler remains a pure L4/WSL derivative; Phase 7B owns its best-effort index
+wiring.
 
 **Objective:** establish the unit of retrieval and a correctness oracle before
 selecting a production vector implementation.
@@ -632,26 +633,35 @@ Implementation:
    `file_context` mutations from one durable event + post-event WSL view.
 3. Canonical search text is token/byte-bounded; raw artifact bodies stay in L4
    and are verified via streaming `artifacts.Store.VerifyArtifact`.
-4. Frozen stream and labels live under
-   `testdata/pages/corpus/transport_fix/` (`expected_pages.json`,
-   `queries.json`) with positive, wrong-branch, invalidated, poisoned, and
-   true-no-answer queries.
+4. The strict replay stream and hand labels live at
+   `internal/pages/testdata/frozen_corpus.json`; legacy compiler goldens remain
+   under `testdata/pages/corpus/transport_fix/`. The strict corpus covers all
+   seven page kinds plus isolated wrong-repo/task/branch/commit, trust,
+   invalidation, poison, true-no-answer, and negative-transfer judgments.
 5. `ExactCosineSearch` / `ExactCosineSearchContext` is the tiny-fixture exact
    oracle (cancel-aware, dimension-bounded). Evaluation-only, not production ANN.
-6. `ValidateMaterializable` is the post-candidate gate: session, epoch,
-   authority, and source digest must still match before L2 admission.
+6. `ValidateMaterializable` is the post-candidate gate: session, current
+   coherence generation, transitive ref eligibility, repo/task/branch/commit,
+   compiler version, and projection-bound source digest must still match before
+   L2 admission.
+7. Ledger validation rejects malformed UTF-8 before persistence, preventing
+   live observer/compiler bytes from diverging from reopen replay. The compiler
+   uses mixed trust for task checkpoints and cannot promote tool prose into
+   user/system authority.
 
 Verification/gates:
 
-- [x] Same ledger change recompiles to identical page IDs, versions, search
-      text, refs, and source digests (including after close/reopen).
+- [x] Same ledger change recompiles to byte-identical mutations, including
+      after JSON persistence/reopen and adversarial UTF-8 fuzzing.
 - [x] Independent sessions match structural identity (IDs/text/refs); digests
       differ only by durable event timestamps.
 - [x] Every compiled active page passes `ValidateMaterializable`; stale,
       cross-session, wrong-epoch, and digest mismatch pages fail closed.
 - [x] Assistant/untrusted prose cannot mint constraint or other hard pages.
-- [x] Corpus labels cover positive, abstention, poisoned, wrong-branch, and
-      invalidated cases.
+- [x] Corpus labels cover every page kind and each hard authority axis in
+      isolation; unlabeled or multi-axis drift fails corpus validation.
+- [x] Projection corruption, transitive durable invalidation, task confusion,
+      and trust mismatch fail closed at materialization.
 - [x] Direct-ID `wsms demo` remains vector-free and does not depend on pages.
 
 #### Phase 7B - Separate FTS5 warm index
@@ -665,25 +675,40 @@ Implementation:
 
 1. `internal/indexer` owns disposable `<data-dir>/index/warm.db` (FTS5); never
    writes search tables into `ledger.db`.
-2. Versioned generations, metadata/FTS projections, per-session watermarks,
-   idempotent Apply, rebuild lock, and atomic cutover via `warm.rebuild.db`.
+2. Versioned generations, metadata/FTS projections, contiguous per-session
+   watermarks, idempotent Apply, rebuild lock, and validated atomic cutover via
+   `warm.rebuild.db`.
 3. `internal/retrieval` implements typed `QueryIntent`, hard filters, FTS5 BM25
    candidates, stable `page_id` tie-break, explanations, and
    `SEMANTIC_PAGE_MISS`. `SearchDense` returns `ErrDenseUnavailable` until 7C.
 4. Harness best-effort compile+Apply after each durable event (live and replay);
-   index errors never fail L4 append. `Session.SemanticSearch` rechecks live
-   repo/branch authority before returning candidates.
-5. Rebuild validates active-page/FTS counts before cutover; orphan rebuild files
-   are deleted on open and never served.
+   gaps trigger ordered reconstruction from L4 and index errors never fail the
+   durable append. A watermark cannot jump over a missing source sequence.
+5. `Session.SemanticSearch` rechecks the current coherence/authority/digest,
+   then faults bounded WSL/event refs through the exact resolver. Raw artifact
+   bodies are never auto-faulted by semantic search.
+6. Rebuild validates active-page/FTS counts, checkpoints WAL state, and keeps a
+   restorable prior generation through cutover. A process-local physical-dir
+   lease serializes Open/recovery/rebuild against all handles, including
+   symlink aliases, and stale handles rebind before their next operation.
 
 Verification/gates:
 
 - [x] Deleting `index/` leaves replay, capsules, and direct faults unchanged.
 - [x] Incomplete rebuild artifacts are not served; open cleans orphans.
+- [x] Concurrent schema replacement, Apply/invalidation during rebuild, stale
+      handles, and Close/read races pass under the race detector.
+- [x] Failed indexing cannot forge progress: gap repair resumes at the first
+      unapplied L4 event across reopen.
 - [x] Invalidated pages and recheck failures suppress hits (`SEMANTIC_PAGE_MISS`).
 - [x] Cross-session queries cannot materialize another session's pages.
 - [x] Frozen corpus positive labels hit expected kinds; true-no-answer abstains.
 - [x] `wsms demo` still PASSes (vector-free; index optional).
+
+Deployment boundary: the operation lease is process-local because the MVP is
+one local process. Before adding multi-process workers or a daemon with external
+writers, put Apply/vector writes and rebuild behind one filesystem-wide
+advisory operation lock; `rebuild.lock` alone serializes only rebuild owners.
 
 #### Phase 7C - sqlite-vec compatibility and exact-parity spike
 
@@ -700,20 +725,27 @@ Implementation:
 1. Blank-import `modernc.org/sqlite/vec` only from `internal/indexer/vecregister.go`
    (process-wide registration; ledger never creates `vec0` tables).
 2. Optional dense projection on disposable `warm.db`: `warm_pages_vec` (cosine
-   `vec0` + `session_id` partition key) and `warm_page_vec_map` rowid map.
-3. `UpsertVectors` / `DeleteVector` / invalidate hook; `SearchDense` with KNN,
-   session partition, Go post-filters (status/repo/branch/kind/trust).
+   `vec0` with `session_id` and `embedding_namespace` partition keys) and a
+   version-bound `warm_page_vec_map` rowid map.
+3. `UpsertVectors` / `DeleteVector` / invalidate hook; `SearchDense` with
+   namespace-constrained KNN plus status/repo/task/branch/commit/kind/trust
+   filters. Each vector is bound to page version, source digest, compiler
+   version, session, and embedding namespace.
 4. Exact-oracle parity tests against `pages.ExactCosineSearchContext` on
    well-separated unit vectors (top-k ID order + distance ≈ 1 − similarity).
 5. Config `DenseDimensions` (default 0); harness passes option through.
-6. Restart restores dense dims from `index_meta`; concurrent dense+FTS reads
-   race-clean.
+6. Restart restores dense dims from `index_meta`; legacy session-only vec0
+   layouts are discarded/rebuilt, and rebuild copies only tuple-compatible
+   vectors into the new generation.
 
 Verification/gates:
 
 - [x] Extension initializes without CGO on the verified platform.
 - [x] Default open: dense off, FTS and demo unchanged.
 - [x] Dense KNN, filters, invalidate, batch replace, cancel, concurrent, restart.
+- [x] More than the maximum over-fetch of closer wrong-namespace vectors cannot
+      starve a valid namespace hit.
+- [x] Page updates drop stale vectors; rebuild preserves only compatible vectors.
 - [x] Oracle parity on synthetic fixtures.
 - [x] Pre-1.0 churn isolated to indexer; no ledger/WSL format changes.
 

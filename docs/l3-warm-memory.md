@@ -912,12 +912,13 @@ automatic prefetch disabled.
 
 **Status:** complete (Phase 7A).
 
-- Frozen stream and labeled queries:
-  `testdata/pages/corpus/transport_fix/`.
+- Strict replay corpus: `internal/pages/testdata/frozen_corpus.json`; legacy
+  page compiler goldens remain under `testdata/pages/corpus/transport_fix/`.
 - Page schema, `DeterministicCompiler`, and
   `ExactCosineSearch` / `ExactCosineSearchContext` live in `internal/pages`.
-- Materialization gate: `ValidateMaterializable` (session, epoch, authority,
-  source digest).
+- Materialization gate: `ValidateMaterializable` (session, current coherence
+  generation, transitive ref eligibility, full authority, compiler, and
+  projection-bound source digest).
 - No-L3 baseline remains the direct-ID demo. FTS-only baseline starts in L3-1.
 
 ### L3-1 - Interfaces and lexical path
@@ -928,9 +929,12 @@ automatic prefetch disabled.
   watermarks.
 - `internal/retrieval`: `QueryIntent`, lexical `ResolveSemantic`,
   `SEMANTIC_PAGE_MISS`.
-- Harness best-effort index apply after events; `SemanticSearch` for tests.
-- Delete `index/`, rebuild cutover, cross-session isolation, and corpus FTS
-  labels are covered by package tests.
+- Harness best-effort contiguous index apply/catch-up after events;
+  `SemanticSearch` revalidates then materializes exact L4 evidence.
+- Delete `index/`, WAL-safe rebuild cutover, process-local multi-handle/symlink
+  coordination, cross-session isolation, and corpus FTS labels are covered by
+  package tests. Multi-process writers remain out of MVP scope and require a
+  filesystem-wide operation lock before that boundary expands.
 
 ### L3-2 - sqlite-vec compatibility spike
 
@@ -938,8 +942,10 @@ automatic prefetch disabled.
 config-gated (`DenseDimensions`, default 0).
 
 - `modernc.org/sqlite v1.53.0` + blank `_ "modernc.org/sqlite/vec"`.
-- Optional `vec0` cosine projection with session partition key and page map.
-- `SearchDense`, vector upsert/delete, invalidate cleanup, restart meta restore.
+- Optional `vec0` cosine projection with session + embedding-namespace
+  partition keys and a page-version/source-digest/compiler-bound map.
+- `SearchDense`, vector upsert/delete, invalidate cleanup, legacy projection
+  recreation, compatible-vector rebuild copy, and restart meta restore.
 - Exact cosine oracle parity tests in `internal/indexer/parity_test.go`.
 - Real document/query embeddings still require L3-3 / Phase 7D.
 

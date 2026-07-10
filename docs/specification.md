@@ -419,12 +419,17 @@ Acceptance:
 - Removing `<data-dir>/index` does not remove ledger events, artifacts, or WSL
   replay capability.
 - Per-session index watermarks expose lag and drive idempotent catch-up.
+- Watermarks advance only over contiguous applied L4 sequences; a failed event
+  cannot be hidden by later progress.
 - Schema, compiler, redaction, or embedding incompatibility creates a new index
   generation rather than silently mixing representations.
 - Metadata/FTS/vector projections expose the same active page version after a
   batch commits.
 - A rebuild is validated before atomic generation cutover and can be
   interrupted without corrupting the serving generation.
+- Within the single-process MVP, all handles for one physical index directory
+  serialize recovery/rebuild and rebind to the serving generation. Expanding to
+  multi-process writers requires a filesystem-wide operation lock.
 - The optional ANN backend passes the same filter, explanation, abstention, and
   materialization contract as the embedded backend.
 

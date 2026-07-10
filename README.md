@@ -23,7 +23,8 @@ Python must never own ledger truth, WSL authority, or capsule rendering.
 - [L3 warm memory](docs/l3-warm-memory.md) — hybrid lexical/vector semantic paging, backends, safety, and rollout gates
 - [Implementation plan](docs/implementation-plan.md) — verified demo slice and staged productization
 - [WSL v0](docs/wsl/v0.md) — grammar, records, lint rules
-- Phase 7A frozen corpus: `testdata/pages/corpus/` (page compiler goldens + labeled queries)
+- Phase 7A strict replay corpus: `internal/pages/testdata/frozen_corpus.json`
+  (legacy compiler goldens remain under `testdata/pages/corpus/`)
 - Research drafts under `docs/`
 
 The L3 design uses vector retrieval as a disposable working-set estimator, not
@@ -34,8 +35,10 @@ deterministic vector-free proof of the paging mechanism. Phase 7A adds an
 offline deterministic page compiler and exact cosine oracle. Phase 7B adds a
 disposable FTS5 warm index under `<data-dir>/index/` (safe to delete). Phase 7C
 adds an optional sqlite-vec dense projection (config `DenseDimensions`; off by
-default). The demo path remains a vector-free mechanism proof and does not
-require the index or dense search.
+default), with session + embedding namespace as pre-KNN partition keys. Every
+semantic hit is revalidated and faulted back through current L4 evidence before
+it can be returned. The demo path remains a vector-free mechanism proof and
+does not require the index or dense search.
 
 ## Layout
 

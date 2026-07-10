@@ -762,6 +762,14 @@ same Go packages. A future daemon must not create a second truth layer; it
 should expose the same session/ledger contracts over a local authenticated IPC
 boundary.
 
+All `Index` handles in the MVP share a process-local lease keyed by the
+evaluated physical index directory. Open/recovery/rebuild take the exclusive
+side; reads and ordinary mutations take the shared side and stale handles
+rebind by generation. `rebuild.lock` also rejects a second rebuild owner, but
+it does not serialize ordinary writers in another OS process. A daemon or
+multi-process deployment therefore requires one filesystem-wide advisory
+operation lock before it is supported.
+
 ## 18. Architectural decision record
 
 | Decision | Rationale | Consequence |
