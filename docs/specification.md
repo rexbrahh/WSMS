@@ -228,10 +228,9 @@ MVP observers:
 - Tool digest: failed command/test/tool output to `@failure`.
 - Decision/avoidance: explicit decision evidence to `@decision` and `@avoid`.
 - Next action: explicit operational next step to `@next`.
-
-Branch/file staleness is specified for the post-demo reliability phase. It is a
-product requirement, not part of the first vertical demo, and a stub must not be
-represented as working.
+- Staleness/coherence: explicit branch, commit, rename, invalidation, and
+  stale-only revalidation events to replay-derived scope bindings plus visible
+  provenance-linked `@invalidated` audit records.
 
 ### FR-005 - WSL v0 parsing and canonical serialization (MUST)
 
@@ -253,8 +252,9 @@ Required invariants:
 - A page backed only by stale refs cannot be promoted without revalidation.
 
 The first demo milestone directly proves exact-field immutability, known
-references, and hard-constraint contradiction handling. Branch/page scope and
-stale-only promotion are completed in the later coherence phase.
+references, and hard-constraint contradiction handling. Phase 6 adds
+branch/commit/path epochs, terminal invalidation, CAS revalidation, and a shared
+capsule/page-fault eligibility gate without changing L4 evidence.
 
 ### FR-007 - Memory hierarchy (MUST)
 

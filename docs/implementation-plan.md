@@ -561,9 +561,44 @@ Exact wording may differ; semantic markers and exit behavior are tested.
 
 ### Phase 6 - Coherence and invalidation
 
-- Implement branch, commit, rename, and file-scope invalidation.
-- Add explicit revalidation and stale-page suppression.
-- Define active-scope transitions and cross-branch rules.
+**Status:** implemented and verified as the prerequisite for Phase 7.
+
+Implementation:
+
+1. `internal/coherence` owns a replay-derived per-session scope snapshot and
+   cloned sidecar bindings for records, events, pages, and canonical paths.
+2. Durable post-scope events define `branch_change`, `commit_change`,
+   `file_renamed`, `memory_invalidated`, and `memory_revalidated`. The strict
+   `file_snapshot` path/digest event is additive; legacy `file_read` rows retain
+   their pre-Phase-6 compatibility contract.
+3. Repo/branch/commit/path epochs are keyed by scope. Branch/commit/rename
+   transitions mark only affected bindings stale; terminal invalidation uses a
+   closed reason enum.
+4. Revalidation is stale-only and CAS-like: it requires a positive
+   `expected_stale_revision`, a preexisting eligible `evidence_ref`, and a
+   matching source digest for page/path targets. It never retargets an old path.
+5. Scheduler candidate/commit ordering makes WSL event noting, observer updates,
+   allocator checkpoints, coherence transitions, and hierarchy reconciliation
+   one foreground transaction boundary.
+6. Capsule selection and page faults share the same fail-closed eligibility
+   oracle. The resolver checks it before L2 and before WSL fallback. L4 raw
+   evidence stays diagnostic except for policy/security revocation.
+7. Harness helpers expose validated branch, commit, rename, snapshot,
+   invalidation, and revalidation operations without direct WSL mutation.
+
+Verification gates:
+
+- Live and close/reopen replay produce identical WSL, keyed epochs, bindings,
+  stale revisions, capsule output, hierarchy status, and fault behavior.
+- Branch round trips and commit changes cannot reactivate an older epoch.
+- Rename matching uses path-component boundaries and never silently retargets
+  old refs.
+- A rejected WSL batch leaves coherence, hierarchy, provenance, known events,
+  and allocator counters unchanged.
+- Malformed/noncanonical/cross-scope inputs fail before append and leave the
+  session usable.
+- After invalidation commits, serialized concurrent page faults cannot return a
+  stale L2/WSL hit; cross-session IDs remain isolated under the race detector.
 
 ### Phase 7 - Real residency scheduling
 

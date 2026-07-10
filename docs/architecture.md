@@ -227,6 +227,32 @@ A record/page must match the active session/repo/task/branch/file scope before
 ranking. Invalidated or all-stale pages cannot become resident without explicit
 revalidation.
 
+`internal/coherence` is the authoritative, per-session sidecar for this gate.
+It replays the same durable events as WSL and binds each derived record/page to
+its repo, task, branch, commit, paths, status, and keyed scope epochs. Repo,
+branch, commit, and path epochs advance only at the narrowest affected scope;
+returning to an older branch/commit therefore does not revive an old cache entry.
+
+Transitions use a candidate/commit protocol. The scheduler prepares a cloned
+coherence candidate, derives observer updates, atomically notes the event and
+applies the WSL batch, and only then installs the candidate. A rejected WSL
+batch cannot advance scope epochs, stale revisions, allocator IDs, hierarchy
+flags, or the known-event set. Page faults and capsule rendering serialize on
+the same scheduler boundary.
+
+`branch_change`, `commit_change`, and `file_renamed` make affected bindings
+stale. `memory_revalidated` may restore only a stale target and must compare the
+expected stale revision while citing preexisting eligible evidence. A terminal
+`memory_invalidated` target cannot be revalidated. Its reason is one of
+`superseded`, `user_rejected`, `source_deleted`, `policy_changed`, or
+`security_revoked`.
+
+Logical invalidation suppresses L1-L3 but never deletes WSL/L4. Raw diagnostics
+remain readable for ordinary staleness and the first three invalidation reasons.
+`policy_changed` and `security_revoked` fail closed for raw access as well.
+The resolver applies this authority check before looking in L2 or falling back
+to WSL, so a stale cache body cannot bypass coherence.
+
 ### A7 - Misses are not guesses
 
 An unresolved fault returns `PAGE_MISS`. Operational errors propagate as
@@ -305,7 +331,9 @@ sequenceDiagram
     Session->>Ledger: ListBySession(sessionID)
     loop ordered durable events
         Session->>Scheduler: AfterEvent(event) without append
-        Scheduler->>WSL: NoteEvent, derive, lint, apply
+        Scheduler->>Scheduler: prepare cloned coherence candidate
+        Scheduler->>WSL: atomically note event, derive, lint, apply
+        Scheduler->>Scheduler: commit coherence candidate and reconcile L1-L3
     end
     CLI->>Session: BeforeTurn
     Session->>Renderer: render reconstructed state
