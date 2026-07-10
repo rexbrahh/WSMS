@@ -36,7 +36,7 @@ func (s *WorkingState) NoteEvent(id string) {
 
 // Apply upserts a record after lint. Rejects on error-severity issues.
 func (s *WorkingState) Apply(rec Record) error {
-	return s.applyUpdates([]Update{{Op: "upsert", Record: rec}}, false)
+	return s.applyUpdates([]Update{{Op: "upsert", Record: rec}}, false, "")
 }
 
 // ApplyAll atomically applies records in order.
@@ -45,7 +45,7 @@ func (s *WorkingState) ApplyAll(recs []Record) error {
 	for _, rec := range recs {
 		updates = append(updates, Update{Op: "upsert", Record: rec})
 	}
-	return s.applyUpdates(updates, false)
+	return s.applyUpdates(updates, false, "")
 }
 
 // ApplyUpdate applies one observer-derived update. Derived updates must identify
@@ -63,10 +63,20 @@ func (s *WorkingState) ApplyUpdates(updates []Update) error {
 // ApplyDerivedUpdates validates an observer batch against a cloned candidate
 // and commits it only when every update has a non-empty, noted evidence event.
 func (s *WorkingState) ApplyDerivedUpdates(updates []Update) error {
-	return s.applyUpdates(updates, true)
+	return s.applyUpdates(updates, true, "")
 }
 
-func (s *WorkingState) applyUpdates(updates []Update, requireEvidence bool) error {
+// ApplyEventUpdates atomically notes one durable event and applies all records
+// derived from it. A rejected observer/WSL batch therefore cannot leak an event
+// ref target into the page table.
+func (s *WorkingState) ApplyEventUpdates(eventID string, updates []Update) error {
+	if eventID == "" {
+		return fmt.Errorf("durable event id is required")
+	}
+	return s.applyUpdates(updates, true, eventID)
+}
+
+func (s *WorkingState) applyUpdates(updates []Update, requireEvidence bool, noteEventID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if requireEvidence {
@@ -89,7 +99,13 @@ func (s *WorkingState) applyUpdates(updates []Update, requireEvidence bool) erro
 	}
 
 	candidate := s.cloneUnlocked()
+	if noteEventID != "" {
+		candidate.eventOK[noteEventID] = true
+	}
 	for _, update := range updates {
+		if noteEventID != "" && update.EvidenceID != noteEventID {
+			return fmt.Errorf("derived update evidence event %q does not match current event %q", update.EvidenceID, noteEventID)
+		}
 		if err := candidate.applyUpdateUnlocked(update, requireEvidence); err != nil {
 			return err
 		}
@@ -183,6 +199,31 @@ func (s *WorkingState) Clone() *WorkingState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cloneUnlocked()
+}
+
+// Filter returns an independent view containing only records accepted by keep.
+// Event/provenance indexes are retained so the view remains internally
+// inspectable, but callers cannot mutate the authoritative WorkingState.
+func (s *WorkingState) Filter(keep func(Record) bool) *WorkingState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	view := NewWorkingState()
+	for _, id := range s.order {
+		rec, ok := s.byID[id]
+		if !ok || (keep != nil && !keep(rec.Clone())) {
+			continue
+		}
+		view.upsertUnchecked(rec)
+	}
+	for eventID, known := range s.eventOK {
+		view.eventOK[eventID] = known
+	}
+	for recordID, eventID := range s.evidenceByID {
+		if _, ok := view.byID[recordID]; ok {
+			view.evidenceByID[recordID] = eventID
+		}
+	}
+	return view
 }
 
 func (s *WorkingState) cloneUnlocked() *WorkingState {
