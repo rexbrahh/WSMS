@@ -102,7 +102,50 @@ func clonePage(p *Page) *Page {
 	if p.Refs != nil {
 		cp.Refs = append([]string{}, p.Refs...)
 	}
+	if p.Paths != nil {
+		cp.Paths = append([]string{}, p.Paths...)
+	}
 	return &cp
+}
+
+// PageCoherence is an authoritative metadata refresh for a resident page.
+type PageCoherence struct {
+	Stale         bool
+	Invalidated   bool
+	StaleRevision uint64
+	Branch        string
+	Commit        string
+	Paths         []string
+	ScopeEpoch    uint64
+}
+
+// Reconcile atomically refreshes every resident page's authoritative
+// coherence metadata. The callback receives a clone, so policy evaluation
+// cannot mutate hierarchy-owned pages.
+func (h *Hierarchy) Reconcile(evaluate func(*Page) PageCoherence) {
+	if evaluate == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, tier := range []map[string]*Page{h.l2, h.l3} {
+		for _, page := range tier {
+			status := evaluate(clonePage(page))
+			page.Stale = status.Stale || status.Invalidated
+			page.Invalidated = status.Invalidated
+			page.StaleRevision = status.StaleRevision
+			page.Branch = status.Branch
+			page.Commit = status.Commit
+			page.Paths = append([]string(nil), status.Paths...)
+			page.ScopeEpoch = status.ScopeEpoch
+		}
+	}
+}
+
+// ClearL1Capsule drops the previously rendered working set after a coherence
+// transition. The next safe BeforeTurn boundary rebuilds it from eligible state.
+func (h *Hierarchy) ClearL1Capsule() {
+	h.SetL1Capsule("")
 }
 
 // RecordAccess bumps access stats if page is resident.

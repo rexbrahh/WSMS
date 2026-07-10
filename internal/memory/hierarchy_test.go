@@ -113,3 +113,25 @@ func TestPutResidentPageIsNilSafe(t *testing.T) {
 		t.Fatal("nil insertion created a resident page")
 	}
 }
+
+func TestReconcilePersistsAndCanRestorePageCoherence(t *testing.T) {
+	h := NewHierarchy()
+	h.PutL2(&Page{ID: "F1", Branch: "main", Commit: "a", Paths: []string{"src/a.go"}})
+	h.Reconcile(func(*Page) PageCoherence {
+		return PageCoherence{
+			Stale: true, StaleRevision: 2, Branch: "feature", Commit: "b",
+			Paths: []string{"src/a.go"}, ScopeEpoch: 7,
+		}
+	})
+	page, ok := h.GetPage("F1")
+	if !ok || !page.Stale || page.Invalidated || page.StaleRevision != 2 || page.Branch != "feature" || page.Commit != "b" || page.ScopeEpoch != 7 {
+		t.Fatalf("stale reconciliation=%#v found=%v", page, ok)
+	}
+	h.Reconcile(func(*Page) PageCoherence {
+		return PageCoherence{Branch: "feature", Commit: "b", Paths: []string{"src/a.go"}, ScopeEpoch: 7}
+	})
+	page, ok = h.GetPage("F1")
+	if !ok || page.Stale || page.Invalidated || page.StaleRevision != 0 {
+		t.Fatalf("active reconciliation=%#v found=%v", page, ok)
+	}
+}
