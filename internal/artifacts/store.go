@@ -2,6 +2,7 @@
 package artifacts
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -161,6 +162,59 @@ func (s *Store) Get(hash string) ([]byte, error) {
 		return nil, fmt.Errorf("%w: requested %s, found %s", ErrArtifactCorrupt, normalized, actualHash)
 	}
 	return data, nil
+}
+
+// VerifyArtifact is the cancellation-aware page-compiler capability. It
+// hashes through a bounded buffer so arbitrarily large L4 evidence is never
+// copied into the semantic-page compiler.
+func (s *Store) VerifyArtifact(ctx context.Context, hash string) error {
+	if ctx == nil {
+		return errors.New("nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	normalized, err := normalizeHash(hash)
+	if err != nil {
+		return err
+	}
+	relPath, err := relativePathFor(normalized)
+	if err != nil {
+		return err
+	}
+	file, err := s.root.Open(relPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %s", ErrArtifactNotFound, normalized)
+		}
+		return err
+	}
+	defer file.Close()
+
+	digest := sha256.New()
+	buffer := make([]byte, 32*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := file.Read(buffer)
+		if n > 0 {
+			if _, err := digest.Write(buffer[:n]); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	actual := hex.EncodeToString(digest.Sum(nil))
+	if actual != normalized {
+		return fmt.Errorf("%w: requested %s, found %s", ErrArtifactCorrupt, normalized, actual)
+	}
+	return ctx.Err()
 }
 
 // Exists reports whether hash is present.

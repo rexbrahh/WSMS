@@ -2,6 +2,7 @@ package artifacts
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -314,6 +315,41 @@ func TestArtifactOperationsDoNotEscapeThroughSymlinks(t *testing.T) {
 			t.Fatalf("final artifact unexpectedly created: %v", err)
 		}
 	})
+}
+
+func TestVerifyArtifactSuccessMissingCorruptAndCancel(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "arts"))
+	data := []byte(strings.Repeat("verify-stream-exact-evidence\n", 128))
+	meta, err := s.Put(data, "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.VerifyArtifact(context.Background(), meta.SHA256); err != nil {
+		t.Fatalf("verify good artifact: %v", err)
+	}
+	if err := s.VerifyArtifact(context.Background(), strings.ToUpper(meta.SHA256)); err != nil {
+		t.Fatalf("verify case-normalized hash: %v", err)
+	}
+	if err := s.VerifyArtifact(context.Background(), strings.Repeat("0", 64)); !errors.Is(err, ErrArtifactNotFound) {
+		t.Fatalf("missing error=%v, want not found", err)
+	}
+
+	if err := os.WriteFile(meta.Path, []byte("tampered-stream-evidence"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.VerifyArtifact(context.Background(), meta.SHA256); !errors.Is(err, ErrArtifactCorrupt) {
+		t.Fatalf("corrupt error=%v, want digest mismatch", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.VerifyArtifact(ctx, meta.SHA256); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled error=%v, want context.Canceled", err)
+	}
+	if err := s.VerifyArtifact(nil, meta.SHA256); err == nil {
+		t.Fatal("nil context succeeded")
+	}
 }
 
 func openTestStore(t *testing.T, dir string) *Store {
