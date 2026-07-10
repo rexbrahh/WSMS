@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+type selfReferentialJSON struct {
+	Self *selfReferentialJSON
+}
+
+func (*selfReferentialJSON) MarshalJSON() ([]byte, error) {
+	return []byte(`{"stable":true}`), nil
+}
+
+type selfReferentialText map[string]any
+
+func (selfReferentialText) MarshalText() ([]byte, error) {
+	return []byte("stable"), nil
+}
+
 func TestValidateEventKnownPayloads(t *testing.T) {
 	valid := []Event{
 		{Type: EventTaskStarted, Payload: map[string]any{"goal": "ship demo", "phase": "implementation"}},
@@ -67,6 +81,37 @@ func TestValidateEventRejectsMalformedKnownPayloads(t *testing.T) {
 		if err := ValidateEvent(ev); !errors.Is(err, ErrInvalidEvent) {
 			t.Errorf("ValidateEvent(%q) error=%v, want ErrInvalidEvent", ev.Type, err)
 		}
+	}
+}
+
+func TestValidateEventRejectsInvalidUTF8AcrossPersistenceBoundary(t *testing.T) {
+	invalid := string([]byte{0xff, 0xfe})
+	for name, ev := range map[string]Event{
+		"envelope":  {Type: EventUserInstruction, Branch: invalid, Payload: map[string]any{"text": "valid"}},
+		"payload":   {Type: EventUserInstruction, Payload: map[string]any{"text": invalid}},
+		"nested":    {Type: EventType("future_event"), Payload: map[string]any{"nested": []any{map[string]any{"value": invalid}}}},
+		"scope_key": {Type: EventType("future_event"), Scope: map[string]any{invalid: "value"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateEvent(ev); !errors.Is(err, ErrInvalidEvent) {
+				t.Fatalf("error=%v, want ErrInvalidEvent", err)
+			}
+		})
+	}
+}
+
+func TestValidateEventTreatsCustomJSONMarshalerAsPersistenceBoundary(t *testing.T) {
+	jsonValue := &selfReferentialJSON{}
+	jsonValue.Self = jsonValue
+	textValue := selfReferentialText{}
+	textValue["self"] = textValue
+	for name, value := range map[string]any{"json": jsonValue, "text": textValue} {
+		t.Run(name, func(t *testing.T) {
+			ev := Event{Type: EventType("future_event"), Payload: map[string]any{"custom": value}}
+			if err := ValidateEvent(ev); err != nil {
+				t.Fatalf("forward-compatible custom value rejected: %v", err)
+			}
+		})
 	}
 }
 

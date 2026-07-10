@@ -1,15 +1,18 @@
 package ledger
 
 import (
+	"encoding"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"path"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // EventType enumerates ledger event kinds from the design docs.
@@ -124,6 +127,9 @@ func (e Event) PayloadInt(key string, def int) int {
 // ValidateEvent validates the required payload contract for known MVP events.
 // Unknown non-empty event types remain valid and inert for forward compatibility.
 func ValidateEvent(ev Event) error {
+	if err := validateEventEncoding(ev); err != nil {
+		return err
+	}
 	if ev.Type == "" {
 		return fmt.Errorf("%w: event type is required", ErrInvalidEvent)
 	}
@@ -277,6 +283,118 @@ func ValidateEvent(ev Event) error {
 	default:
 		return nil
 	}
+}
+
+// validateEventEncoding rejects inputs whose in-memory representation cannot
+// survive the ledger's JSON persistence boundary byte-for-byte. encoding/json
+// replaces malformed UTF-8 with U+FFFD, so accepting such strings would let
+// live observers see different evidence than replay after reopen.
+func validateEventEncoding(ev Event) error {
+	for name, value := range map[string]string{
+		"id": ev.ID, "type": string(ev.Type), "session_id": ev.SessionID,
+		"task_id": ev.TaskID, "repo": ev.Repo, "branch": ev.Branch,
+		"commit": ev.Commit, "artifact_hash": ev.ArtifactHash,
+	} {
+		if !utf8.ValidString(value) {
+			return fmt.Errorf("%w: event field %q contains invalid UTF-8", ErrInvalidEvent, name)
+		}
+	}
+	for name, value := range map[string]any{"payload": ev.Payload, "scope": ev.Scope} {
+		// Marshal first so cyclic or otherwise non-JSON values fail before the
+		// recursive string walk. This also keeps unknown event types replayable.
+		if _, err := json.Marshal(value); err != nil {
+			return fmt.Errorf("%w: event %s is not JSON-serializable: %v", ErrInvalidEvent, name, err)
+		}
+		if hasInvalidUTF8(reflect.ValueOf(value)) {
+			return fmt.Errorf("%w: event %s contains invalid UTF-8", ErrInvalidEvent, name)
+		}
+	}
+	return nil
+}
+
+// hasInvalidUTF8 walks values already proven JSON-serializable. Custom JSON
+// marshalers are atomic because their encoded representation, not their
+// private object graph, crosses the persistence boundary.
+func hasInvalidUTF8(value reflect.Value) bool {
+	return hasInvalidUTF8Value(value, make(map[utf8Visit]bool))
+}
+
+type utf8Visit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+func hasInvalidUTF8Value(value reflect.Value, seen map[utf8Visit]bool) bool {
+	if !value.IsValid() {
+		return false
+	}
+	if value.CanInterface() {
+		if _, custom := value.Interface().(json.Marshaler); custom {
+			return false
+		}
+		if _, custom := value.Interface().(encoding.TextMarshaler); custom {
+			return false
+		}
+	}
+	if value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return false
+		}
+		return hasInvalidUTF8Value(value.Elem(), seen)
+	}
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return false
+		}
+		visit := utf8Visit{typ: value.Type(), ptr: value.Pointer()}
+		if seen[visit] {
+			return false
+		}
+		seen[visit] = true
+		defer delete(seen, visit)
+		return hasInvalidUTF8Value(value.Elem(), seen)
+	}
+	switch value.Kind() {
+	case reflect.String:
+		return !utf8.ValidString(value.String())
+	case reflect.Map:
+		iter := value.MapRange()
+		for iter.Next() {
+			if hasInvalidUTF8Value(iter.Key(), seen) || hasInvalidUTF8Value(iter.Value(), seen) {
+				return true
+			}
+		}
+	case reflect.Slice:
+		if !value.IsNil() {
+			visit := utf8Visit{typ: value.Type(), ptr: value.Pointer()}
+			if seen[visit] {
+				return false
+			}
+			seen[visit] = true
+			defer delete(seen, visit)
+		}
+		for i := 0; i < value.Len(); i++ {
+			if hasInvalidUTF8Value(value.Index(i), seen) {
+				return true
+			}
+		}
+	case reflect.Array:
+		for i := 0; i < value.Len(); i++ {
+			if hasInvalidUTF8Value(value.Index(i), seen) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < value.NumField(); i++ {
+			if value.Type().Field(i).PkgPath != "" { // encoding/json ignores unexported fields
+				continue
+			}
+			if hasInvalidUTF8Value(value.Field(i), seen) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validateMemoryMutation(ev Event, revalidation bool) error {
