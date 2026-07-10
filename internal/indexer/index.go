@@ -35,6 +35,7 @@ const (
 	metaCompiler      = "compiler_version"
 	metaGeneration    = "generation"
 	metaCreatedAt     = "created_at"
+	metaEmbeddingNS   = "embedding_namespace"
 )
 
 var (
@@ -55,6 +56,10 @@ var (
 	// ErrWatermarkGap reports an attempt to advance past an unapplied source
 	// sequence. L3 must catch up from L4 rather than hide the hole.
 	ErrWatermarkGap = errors.New("warm index watermark gap")
+	// ErrEmbeddingNamespaceMismatch reports an index generation whose stored
+	// vector ABI does not match the configured embedder. The generation is
+	// disposable and must be replaced before it can serve.
+	ErrEmbeddingNamespaceMismatch = errors.New("warm index embedding namespace mismatch")
 )
 
 // Options configures optional index capabilities.
@@ -62,6 +67,9 @@ type Options struct {
 	// DenseDimensions enables the sqlite-vec projection when > 0.
 	// Zero leaves dense disabled unless the on-disk index already has dense meta.
 	DenseDimensions int
+	// EmbeddingNamespace is the complete vector ABI identity for this index
+	// generation. Empty is an explicit vector-free/manual namespace.
+	EmbeddingNamespace string
 }
 
 // Index is a generation of disposable warm-page search state.
@@ -115,6 +123,9 @@ func Open(dir string, opts ...Options) (*Index, error) {
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
+	if err := validateConfiguredEmbeddingNamespace(opt.EmbeddingNamespace); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -132,9 +143,36 @@ func Open(dir string, opts ...Options) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	idx := &Index{dir: dir, path: path, db: db, lease: lease}
+	idx := &Index{
+		dir: dir, path: path, db: db, lease: lease,
+		embeddingNamespace: opt.EmbeddingNamespace,
+	}
 	ctx := context.Background()
 	if err := idx.ensureMeta(ctx); err != nil {
+		if errors.Is(err, ErrEmbeddingNamespaceMismatch) {
+			gen, genErr := readGeneration(ctx, db)
+			if genErr != nil {
+				_ = db.Close()
+				return nil, errors.Join(err, genErr)
+			}
+			_ = db.Close()
+			if err := removeDBFiles(path); err != nil {
+				return nil, err
+			}
+			db, err = openDB(path)
+			if err != nil {
+				return nil, err
+			}
+			idx.db = db
+			if err := idx.ensureMeta(ctx); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+			if err := writeGeneration(ctx, db, gen+1); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
+		} else {
 		if !errors.Is(err, ErrInvalidSchema) && !errors.Is(err, ErrInvalidCompiler) {
 			_ = db.Close()
 			return nil, err
@@ -151,6 +189,7 @@ func Open(dir string, opts ...Options) (*Index, error) {
 		if err := idx.ensureMeta(ctx); err != nil {
 			_ = db.Close()
 			return nil, err
+		}
 		}
 	}
 	if err := idx.initDense(ctx, opt.DenseDimensions); err != nil {
@@ -227,6 +266,7 @@ func (idx *Index) ensureMeta(ctx context.Context) error {
 			{metaCompiler, string(pages.CurrentCompilerVersion)},
 			{metaGeneration, "1"},
 			{metaCreatedAt, now},
+			{metaEmbeddingNS, idx.embeddingNamespace},
 		} {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO index_meta(key, value) VALUES(?, ?)`, pair[0], pair[1]); err != nil {
 				return err
@@ -246,6 +286,24 @@ func (idx *Index) ensureMeta(ctx context.Context) error {
 	}
 	if compiler != string(pages.CurrentCompilerVersion) {
 		return fmt.Errorf("%w: got %q want %q", ErrInvalidCompiler, compiler, pages.CurrentCompilerVersion)
+	}
+	var storedNamespace string
+	err = idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaEmbeddingNS).Scan(&storedNamespace)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Vector-free legacy generations may be adopted in place. Configuring an
+		// embedder against a legacy generation is an ABI transition and must bump
+		// the generation so replay reconstructs pages and FTS from L4.
+		if idx.embeddingNamespace != "" {
+			return fmt.Errorf("%w: stored legacy namespace is empty, configured %q", ErrEmbeddingNamespaceMismatch, idx.embeddingNamespace)
+		}
+		_, err = idx.db.ExecContext(ctx, `INSERT INTO index_meta(key, value) VALUES(?, ?)`, metaEmbeddingNS, "")
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if storedNamespace != idx.embeddingNamespace {
+		return fmt.Errorf("%w: stored %q configured %q", ErrEmbeddingNamespaceMismatch, storedNamespace, idx.embeddingNamespace)
 	}
 	return nil
 }
@@ -353,6 +411,7 @@ func (idx *Index) Health(ctx context.Context) (Health, error) {
 	}
 	_ = idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaSchemaVersion).Scan(&h.SchemaVersion)
 	_ = idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaCompiler).Scan(&h.CompilerVersion)
+	_ = idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaEmbeddingNS).Scan(&h.EmbeddingNamespace)
 	var gen string
 	if err := idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaGeneration).Scan(&gen); err == nil {
 		_, _ = fmt.Sscan(gen, &h.Generation)
@@ -366,44 +425,31 @@ func (idx *Index) Health(ctx context.Context) (Health, error) {
 	return h, nil
 }
 
-// RecordEmbeddingStatus updates non-authoritative dense-embedding health. It
-// does not touch SQLite and must never affect page-table or watermark commits.
-func (idx *Index) RecordEmbeddingStatus(namespace string, err error) {
+// RecordEmbeddingStatus updates non-authoritative dense-embedding health. The
+// reason must be one of the caller's fixed redacted categories. It does not
+// touch SQLite and must never affect page-table or watermark commits.
+func (idx *Index) RecordEmbeddingStatus(reason string) {
 	if idx == nil {
 		return
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	if namespace != "" {
-		idx.embeddingNamespace = namespace
-	}
-	if err == nil {
-		idx.embeddingDegradedReason = ""
-		return
-	}
-	idx.embeddingDegradedReason = compactHealthReason(err)
+	idx.embeddingDegradedReason = reason
 }
 
-func compactHealthReason(err error) string {
-	if err == nil {
-		return ""
+func validateConfiguredEmbeddingNamespace(namespace string) error {
+	if namespace == "" {
+		return nil
 	}
-	reason := strings.Map(func(r rune) rune {
-		switch r {
-		case '\n', '\r', '\t':
-			return ' '
-		default:
-			if r < 0x20 || r == 0x7f {
-				return -1
-			}
-			return r
+	if len(namespace) > 512 || strings.TrimSpace(namespace) != namespace {
+		return fmt.Errorf("invalid embedding namespace")
+	}
+	for _, r := range namespace {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid embedding namespace")
 		}
-	}, err.Error())
-	reason = strings.Join(strings.Fields(reason), " ")
-	if len(reason) > 200 {
-		reason = reason[:200]
 	}
-	return reason
+	return nil
 }
 
 func readGeneration(ctx context.Context, db *sql.DB) (int64, error) {
@@ -416,6 +462,15 @@ func readGeneration(ctx context.Context, db *sql.DB) (int64, error) {
 		return 0, fmt.Errorf("invalid warm index generation %q", genStr)
 	}
 	return gen, nil
+}
+
+func writeGeneration(ctx context.Context, db *sql.DB, generation int64) error {
+	if generation <= 0 {
+		return fmt.Errorf("invalid warm index generation %d", generation)
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO index_meta(key, value) VALUES(?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaGeneration, fmt.Sprint(generation))
+	return err
 }
 
 func (idx *Index) beginOperation(ctx context.Context) (func(), error) {

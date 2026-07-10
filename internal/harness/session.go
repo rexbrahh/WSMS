@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"wsms/internal/artifacts"
@@ -468,14 +469,14 @@ func (s *Session) recordEmbeddingError(namespace string, err error) {
 	}
 	s.EmbeddingErr = err
 	if s.Index != nil {
-		s.Index.RecordEmbeddingStatus(namespace, err)
+		s.Index.RecordEmbeddingStatus(compactEmbeddingReason(err))
 	}
 }
 
 func (s *Session) recordEmbeddingOK(namespace string) {
 	s.EmbeddingErr = nil
 	if s.Index != nil {
-		s.Index.RecordEmbeddingStatus(namespace, nil)
+		s.Index.RecordEmbeddingStatus("")
 	}
 }
 
@@ -488,6 +489,28 @@ func embeddingVector64(vector []float32) []float64 {
 		out[i] = float64(v)
 	}
 	return out
+}
+
+func compactEmbeddingReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	reason := strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		default:
+			if r < 0x20 || r == 0x7f {
+				return -1
+			}
+			return r
+		}
+	}, err.Error())
+	reason = strings.Join(strings.Fields(reason), " ")
+	if len(reason) > 200 {
+		reason = reason[:200]
+	}
+	return reason
 }
 
 func (s *Session) repairIndexFromLedger(ctx context.Context) error {
