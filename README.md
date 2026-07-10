@@ -11,16 +11,25 @@ The research framing in `docs/` describes this as *working-state virtual memory*
 | Role | Language |
 |------|----------|
 | Runtime (ledger, WSL, observers, scheduler, renderer, harness) | **Go** (default) |
-| Later hotspots / ANN / Rust-only inference glue | **Rust** sidecar (not in scaffold) |
+| Optional measured ANN scale-out / local inference glue | **Rust** sidecar or supervised service (not in scaffold) |
 | Eval stats, plots, HF/torch research | **Python** under `research/` only |
 
 Python must never own ledger truth, WSL authority, or capsule rendering.
 
 ## Docs
 
-- [Architecture](docs/architecture.md) — package map and design boundaries
+- [Product specification](docs/specification.md) — normative behavior and acceptance criteria
+- [Architecture](docs/architecture.md) — package map, Unix VM correspondence, and design boundaries
+- [L3 warm memory](docs/l3-warm-memory.md) — hybrid lexical/vector semantic paging, backends, safety, and rollout gates
+- [Implementation plan](docs/implementation-plan.md) — verified demo slice and staged productization
 - [WSL v0](docs/wsl/v0.md) — grammar, records, lint rules
 - Research drafts under `docs/`
+
+The L3 design uses vector retrieval as a disposable working-set estimator, not
+as the source of truth: known IDs always page directly from exact evidence;
+semantic queries use FTS plus dense retrieval to discover candidate page refs,
+then rejoin the same validated L4-to-L2 page-in path. The first demo remains a
+deterministic vector-free proof of the paging mechanism.
 
 ## Layout
 
@@ -41,6 +50,31 @@ go build -o bin/wsms ./cmd/wsms
 ```
 
 No API keys required for unit tests.
+
+## Run the mechanism demo
+
+```bash
+make demo
+```
+
+Equivalently, run `go run ./cmd/wsms demo`. The command uses a fresh temporary
+data directory and proves the complete vector-free path: ledger/artifact
+backing storage, event-derived WSL mappings, a bounded resident capsule, a real
+close/reopen reconstruction, direct `F1` page-in, independently verified raw
+artifact bytes, the foreground client boundary, and same-database session
+isolation. It prints `DEMO PASS` only after every assertion and resource close
+succeeds.
+
+To keep the SQLite ledger and content-addressed artifacts for inspection, give
+the demo a fresh persistent directory:
+
+```bash
+go run ./cmd/wsms demo --data-dir /tmp/wsms-demo-inspect
+```
+
+The command never removes an explicitly supplied directory or unrelated files
+inside it. It refuses to reuse its fixed demo sessions if they already contain
+events, preventing an old run from being mistaken for fresh evidence.
 
 ## Smoke path
 
