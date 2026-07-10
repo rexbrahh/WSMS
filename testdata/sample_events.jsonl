@@ -1,0 +1,2 @@
+{"type":"user_instruction","payload":{"text":"do not rewrite transport layer"}}
+{"type":"command_output","payload":{"cmd":"go test ./runtime -run TestCancelStream","exit":1,"output":"error: stream goroutine still blocked\nsrc/runtime/stream.go:118: fail","err":"error: stream goroutine still blocked"}}
