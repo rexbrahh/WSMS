@@ -23,6 +23,8 @@ const (
 	RoleQuery    Role = "query"
 )
 
+const normalizationTolerance = 1e-3
+
 var (
 	// ErrInvalidEmbedding reports malformed, mismatched, or role-inverted
 	// vectors. Vectors are never truncated, padded, or reinterpreted silently.
@@ -59,7 +61,7 @@ func (e Embedding) Validate(expected EmbeddingNamespace, role Role) error {
 	if e.Role != role {
 		return fmt.Errorf("%w: role mismatch got %q want %q", ErrInvalidEmbedding, e.Role, role)
 	}
-	if err := validateVector(e.Vector, expected.Profile.Dimensions); err != nil {
+	if err := validateVector(e.Vector, expected.Profile.Dimensions, expected.Profile.Normalization); err != nil {
 		return err
 	}
 	return nil
@@ -90,7 +92,7 @@ func (b EmbeddingBatch) Validate(expected EmbeddingNamespace, count int) error {
 	return nil
 }
 
-func validateVector(vector []float32, dims int) error {
+func validateVector(vector []float32, dims int, normalization Normalization) error {
 	if dims <= 0 {
 		return fmt.Errorf("%w: invalid dimensions %d", ErrInvalidEmbedding, dims)
 	}
@@ -107,6 +109,15 @@ func validateVector(vector []float32, dims int) error {
 	}
 	if norm == 0 || math.IsInf(norm, 0) || math.IsNaN(norm) {
 		return fmt.Errorf("%w: zero or overflowing norm", ErrInvalidEmbedding)
+	}
+	switch normalization {
+	case NormalizationL2:
+		length := math.Sqrt(norm)
+		if math.Abs(length-1) > normalizationTolerance {
+			return fmt.Errorf("%w: vector is not l2-normalized", ErrInvalidEmbedding)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported normalization %q", ErrInvalidEmbedding, normalization)
 	}
 	return nil
 }

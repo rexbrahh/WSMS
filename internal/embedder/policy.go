@@ -10,11 +10,13 @@ import (
 )
 
 const (
-	DefaultMaxBatchSize     = 32
-	DefaultMaxDocumentBytes = 16 * 1024
-	DefaultMaxQueryBytes    = 4 * 1024
-	DefaultMaxDimensions    = 8192
-	CurrentRedactionVersion = "redaction/v0.1.0"
+	DefaultMaxBatchSize            = 32
+	DefaultMaxDocumentBytes        = 16 * 1024
+	DefaultMaxQueryBytes           = 4 * 1024
+	DefaultMaxDocumentPayloadBytes = DefaultMaxDocumentBytes + MaxTemplateBytes + 1
+	DefaultMaxQueryPayloadBytes    = DefaultMaxQueryBytes + MaxInstructionBytes + 1
+	DefaultMaxDimensions           = 8192
+	CurrentRedactionVersion        = "redaction/v0.1.0"
 )
 
 var (
@@ -35,9 +37,11 @@ var (
 
 // AdmissionPolicy decides which text may be embedded.
 type AdmissionPolicy struct {
-	MaxDocumentBytes  int
-	MaxQueryBytes     int
-	DeniedPathMarkers []string
+	MaxDocumentBytes        int
+	MaxQueryBytes           int
+	MaxDocumentPayloadBytes int
+	MaxQueryPayloadBytes    int
+	DeniedPathMarkers      []string
 }
 
 // DefaultAdmissionPolicy returns the conservative local-first Phase 7D policy.
@@ -45,6 +49,8 @@ func DefaultAdmissionPolicy() AdmissionPolicy {
 	return AdmissionPolicy{
 		MaxDocumentBytes: DefaultMaxDocumentBytes,
 		MaxQueryBytes:    DefaultMaxQueryBytes,
+		MaxDocumentPayloadBytes: DefaultMaxDocumentPayloadBytes,
+		MaxQueryPayloadBytes:    DefaultMaxQueryPayloadBytes,
 		DeniedPathMarkers: []string{
 			"/.env", "\\.env", "\n.env", "path: .env", "path:.env",
 			".ssh/", ".ssh\\", "id_rsa", "id_ed25519",
@@ -61,6 +67,12 @@ func (p AdmissionPolicy) withDefaults() AdmissionPolicy {
 	if p.MaxQueryBytes <= 0 {
 		p.MaxQueryBytes = DefaultMaxQueryBytes
 	}
+	if p.MaxDocumentPayloadBytes <= 0 {
+		p.MaxDocumentPayloadBytes = DefaultMaxDocumentPayloadBytes
+	}
+	if p.MaxQueryPayloadBytes <= 0 {
+		p.MaxQueryPayloadBytes = DefaultMaxQueryPayloadBytes
+	}
 	if len(p.DeniedPathMarkers) == 0 {
 		p.DeniedPathMarkers = DefaultAdmissionPolicy().DeniedPathMarkers
 	}
@@ -75,6 +87,24 @@ func (p AdmissionPolicy) canonicalDocument(text string) (string, error) {
 func (p AdmissionPolicy) canonicalQuery(text string) (string, error) {
 	p = p.withDefaults()
 	return p.canonicalize(text, p.MaxQueryBytes, RoleQuery)
+}
+
+func (p AdmissionPolicy) validatePayload(payload string, role Role) error {
+	p = p.withDefaults()
+	limit := p.MaxDocumentPayloadBytes
+	if role == RoleQuery {
+		limit = p.MaxQueryPayloadBytes
+	}
+	if payload == "" {
+		return fmt.Errorf("%w: empty payload", ErrAdmissionDenied)
+	}
+	if len(payload) > limit {
+		return fmt.Errorf("%w: %s payload exceeds %d bytes", ErrAdmissionDenied, role, limit)
+	}
+	if err := admitCanonicalText(payload, p, role); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (p AdmissionPolicy) canonicalize(text string, maxBytes int, role Role) (string, error) {
@@ -109,6 +139,12 @@ func admitCanonicalText(text string, policy AdmissionPolicy, role Role) error {
 	if privateKeyRE.MatchString(text) || openAIKeyRE.MatchString(text) || githubPATRE.MatchString(text) ||
 		awsKeyRE.MatchString(text) || secretKVRE.MatchString(text) {
 		return fmt.Errorf("%w: secret-like content", ErrAdmissionDenied)
+	}
+	if strings.Contains(lower, "top_secret_raw_output") ||
+		strings.Contains(lower, "sensitive-marker") ||
+		strings.Contains(lower, "sensitive_marker") ||
+		strings.Contains(lower, "sensitive marker") {
+		return fmt.Errorf("%w: sensitive marker", ErrAdmissionDenied)
 	}
 	for _, marker := range policy.DeniedPathMarkers {
 		if marker != "" && strings.Contains(lower, strings.ToLower(marker)) {

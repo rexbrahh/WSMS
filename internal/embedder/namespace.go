@@ -27,6 +27,15 @@ const (
 	NormalizationL2 Normalization = "l2"
 )
 
+const (
+	// MaxInstructionBytes bounds namespace identity fields that are copied into
+	// query payloads.
+	MaxInstructionBytes = 2048
+	// MaxTemplateBytes bounds namespace identity fields that are copied into
+	// document payloads.
+	MaxTemplateBytes = 2048
+)
+
 var (
 	// ErrInvalidNamespace reports an incomplete or non-canonical embedding
 	// namespace. Namespace mismatches must fail visibly rather than mixing
@@ -152,6 +161,12 @@ func validateProfile(profile NamespaceProfile) error {
 	}
 	if profile.Dimensions <= 0 {
 		return fmt.Errorf("%w: dimensions must be positive", ErrInvalidNamespace)
+	}
+	if len(profile.QueryInstruction) > MaxInstructionBytes {
+		return fmt.Errorf("%w: query instruction exceeds %d bytes", ErrInvalidNamespace, MaxInstructionBytes)
+	}
+	if len(profile.DocumentTemplate) > MaxTemplateBytes {
+		return fmt.Errorf("%w: document template exceeds %d bytes", ErrInvalidNamespace, MaxTemplateBytes)
 	}
 	switch profile.DistanceMetric {
 	case MetricCosine:

@@ -16,11 +16,29 @@ var (
 	ErrCircuitOpen = errors.New("embedder circuit open")
 )
 
+const (
+	DefaultTimeout          = 2 * time.Second
+	selfCheckDocumentText   = "wsms self check document page cache locality"
+	selfCheckQueryText      = "wsms self check query page fault"
+	selfCheckFailureReason  = "self_check_failed"
+	selfCheckRequiredReason = "self_check_required"
+)
+
 // Backend is the supervised local inference seam. It is intentionally narrower
 // than Embedder and receives already-admitted, role-specific payload text.
 type Backend interface {
 	EmbedDocuments(ctx context.Context, texts []string) ([][]float32, error)
 	EmbedQuery(ctx context.Context, text string) ([]float32, error)
+}
+
+// SelfChecker is an optional readiness extension. It intentionally does not
+// change the documented three-method Embedder ABI.
+type SelfChecker interface {
+	SelfCheck(ctx context.Context) error
+}
+
+type backendSelfChecker interface {
+	SelfCheck(ctx context.Context, namespace EmbeddingNamespace) error
 }
 
 // Options configures a Supervised embedder.
@@ -62,6 +80,8 @@ type Health struct {
 	ConsecutiveFailures int
 	LastFailureAt       time.Time
 	LastSuccessAt       time.Time
+	Checked             bool
+	LastCheckedAt       time.Time
 	CacheEntries        int
 	MaxBatchSize        int
 	MaxDocumentBytes    int
@@ -82,9 +102,12 @@ type Supervised struct {
 	mu                  sync.Mutex
 	breaker             BreakerOptions
 	breakerState        BreakerState
+	halfOpenProbe       bool
 	consecutiveFailures int
 	lastFailureAt       time.Time
 	lastSuccessAt       time.Time
+	checked             bool
+	lastCheckedAt       time.Time
 	reason              string
 }
 
@@ -125,6 +148,10 @@ func New(opts Options) (*Supervised, error) {
 	if breaker.Cooldown <= 0 {
 		breaker.Cooldown = 30 * time.Second
 	}
+	timeout := opts.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
 	return &Supervised{
 		namespace:     opts.Namespace,
 		backend:       opts.Backend,
@@ -132,7 +159,7 @@ func New(opts Options) (*Supervised, error) {
 		policy:        policy,
 		maxBatchSize:  maxBatch,
 		maxDimensions: maxDims,
-		timeout:       opts.Timeout,
+		timeout:       timeout,
 		now:           now,
 		breaker:       breaker,
 		breakerState:  BreakerClosed,
@@ -169,6 +196,7 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 		canonical string
 		payload   string
 		indexes   []int
+		flight    *cacheFlight
 	}
 	missesByKey := make(map[string]*miss)
 	var misses []*miss
@@ -200,15 +228,55 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 		missesByKey[key] = m
 		misses = append(misses, m)
 	}
-	if len(misses) == 0 {
+	leaders := make([]*miss, 0, len(misses))
+	for _, miss := range misses {
+		cached, ok, flight, leader := e.cache.getOrBegin(miss.key)
+		switch {
+		case ok:
+			if err := cached.Validate(e.namespace, RoleDocument); err != nil {
+				return EmbeddingBatch{}, err
+			}
+			for _, index := range miss.indexes {
+				result.Embeddings[index] = cached
+			}
+			result.CacheHits++
+		case !leader:
+			embedding, err := e.cache.waitFlight(ctx, flight)
+			if err != nil {
+				return EmbeddingBatch{}, err
+			}
+			if err := embedding.Validate(e.namespace, RoleDocument); err != nil {
+				return EmbeddingBatch{}, err
+			}
+			for _, index := range miss.indexes {
+				resultEmbedding := embedding
+				resultEmbedding.Vector = copyVector(embedding.Vector)
+				result.Embeddings[index] = resultEmbedding
+			}
+			result.CacheHits++
+		default:
+			miss.indexes = append([]int(nil), miss.indexes...)
+			miss.payload = documentPayload(e.namespace.Profile, miss.canonical)
+			if err := e.policy.validatePayload(miss.payload, RoleDocument); err != nil {
+				e.cache.finishFlight(miss.key, flight, Embedding{}, err)
+				return EmbeddingBatch{}, err
+			}
+			miss.flight = flight
+			leaders = append(leaders, miss)
+		}
+	}
+	if len(leaders) == 0 {
 		return result, result.Validate(e.namespace, len(texts))
 	}
-	result.CacheMisses = len(misses)
+	result.CacheMisses = len(leaders)
 	if err := e.allowBackend(); err != nil {
+		for _, miss := range leaders {
+			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
+		}
 		return EmbeddingBatch{}, err
 	}
-	backendTexts := make([]string, len(misses))
-	for i, miss := range misses {
+	backendTexts := make([]string, len(leaders))
+	for i, miss := range leaders {
 		backendTexts[i] = miss.payload
 	}
 	callCtx, cancel := e.callContext(ctx)
