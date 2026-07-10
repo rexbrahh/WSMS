@@ -12,7 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -32,6 +32,17 @@ const (
 	MaxSummaryTokens = 100
 	// MaxPageRefs prevents a broad event from becoming an unbounded transcript.
 	MaxPageRefs = 16
+	// MaxFileSliceLines bounds exact source materialization independently of
+	// semantic text budgets.
+	MaxFileSliceLines = 512
+	// MaxFileSliceBytes bounds a capability implementation that returns a
+	// pathological slice despite the line limit.
+	MaxFileSliceBytes = 256 * 1024
+	// MaxSearchBytes and MaxSummaryBytes close the unbroken-token bypass around
+	// token-only limits.
+	MaxSearchBytes  = 16 * 1024
+	MaxSummaryBytes = 4 * 1024
+	MaxReasonBytes  = 512
 )
 
 var (
@@ -42,6 +53,11 @@ var (
 	ErrUnmaterializableRef = errors.New("unmaterializable page reference")
 	// ErrInvalidVector reports malformed exact-oracle input.
 	ErrInvalidVector = errors.New("invalid vector")
+)
+
+var (
+	warmPageIDRE = regexp.MustCompile(`^wp_[0-9a-f]{32}$`)
+	logicalIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,127}$`)
 )
 
 // PageID is a stable logical page address.
@@ -146,30 +162,30 @@ func (r PageRef) Address() string {
 
 // WarmPage is the logical, backend-independent semantic page.
 type WarmPage struct {
-	ID               PageID          `json:"page_id"`
-	Version          PageVersion     `json:"page_version"`
-	SessionID        string          `json:"session_id"`
-	RepoID           string          `json:"repo_id,omitempty"`
-	TaskID           string          `json:"task_id,omitempty"`
-	Branch           string          `json:"branch,omitempty"`
-	Commit           string          `json:"commit,omitempty"`
-	PathScope        []string        `json:"path_scope,omitempty"`
-	Scope            types.Scope     `json:"scope"`
-	Kind             PageKind        `json:"kind"`
-	Trust            Trust           `json:"trust"`
-	Status           Status          `json:"status"`
-	Salience         float64         `json:"salience"`
-	SalienceReason   string          `json:"salience_reason"`
-	SearchText       string          `json:"search_text"`
-	Summary          string          `json:"summary"`
-	Refs             []PageRef       `json:"refs"`
-	SourceSeqMin     int64           `json:"source_seq_min"`
-	SourceSeqMax     int64           `json:"source_seq_max"`
-	SourceDigest     SourceDigest    `json:"source_digest"`
-	CompilerVersion  CompilerVersion `json:"compiler_version"`
-	ScopeEpoch       ScopeEpoch      `json:"scope_epoch"`
-	CreatedAt        time.Time       `json:"created_at"`
-	LastVerifiedAt   time.Time       `json:"last_verified_at,omitempty"`
+	ID              PageID          `json:"page_id"`
+	Version         PageVersion     `json:"page_version"`
+	SessionID       string          `json:"session_id"`
+	RepoID          string          `json:"repo_id,omitempty"`
+	TaskID          string          `json:"task_id,omitempty"`
+	Branch          string          `json:"branch,omitempty"`
+	Commit          string          `json:"commit,omitempty"`
+	PathScope       []string        `json:"path_scope,omitempty"`
+	Scope           types.Scope     `json:"scope"`
+	Kind            PageKind        `json:"kind"`
+	Trust           Trust           `json:"trust"`
+	Status          Status          `json:"status"`
+	Salience        float64         `json:"salience"`
+	SalienceReason  string          `json:"salience_reason"`
+	SearchText      string          `json:"search_text"`
+	Summary         string          `json:"summary"`
+	Refs            []PageRef       `json:"refs"`
+	SourceSeqMin    int64           `json:"source_seq_min"`
+	SourceSeqMax    int64           `json:"source_seq_max"`
+	SourceDigest    SourceDigest    `json:"source_digest"`
+	CompilerVersion CompilerVersion `json:"compiler_version"`
+	ScopeEpoch      ScopeEpoch      `json:"scope_epoch"`
+	CreatedAt       time.Time       `json:"created_at"`
+	LastVerifiedAt  time.Time       `json:"last_verified_at,omitempty"`
 }
 
 // PageMutation is the atomic unit consumed by later index generations.
@@ -183,10 +199,16 @@ type EventReader interface {
 	Get(context.Context, string) (ledger.Event, error)
 }
 
-// ArtifactReader is satisfied by artifacts.Store. The compiler reads bytes
-// only to validate the content address; raw bytes never enter a WarmPage.
+// ArtifactReader is satisfied by artifacts.Store. Verification is streaming:
+// raw artifact bytes never enter a WarmPage or the compiler's semantic text.
 type ArtifactReader interface {
-	Get(string) ([]byte, error)
+	VerifyArtifact(context.Context, string) error
+}
+
+// FileSliceReader resolves a commit-pinned repository slice without granting
+// the compiler ambient filesystem access.
+type FileSliceReader interface {
+	ReadFileSlice(context.Context, string, string, int, int) ([]byte, error)
 }
 
 // LedgerChange is one committed ledger event plus the fully derived WSL view
@@ -196,6 +218,11 @@ type LedgerChange struct {
 	State      *wsl.WorkingState
 	Events     EventReader
 	Artifacts  ArtifactReader
+	Files      FileSliceReader
+	RepoID     string
+	TaskID     string
+	Branch     string
+	Commit     string
 	ScopeEpoch ScopeEpoch
 }
 
@@ -215,8 +242,14 @@ func (m PageMutation) Validate() error {
 	if p.ID == "" || p.Version == 0 || p.SessionID == "" {
 		return fmt.Errorf("%w: page id, positive version, and session are required", ErrInvalidPage)
 	}
+	if !warmPageIDRE.MatchString(string(p.ID)) || !validToken(p.SessionID, 256) {
+		return fmt.Errorf("%w: malformed page or session id", ErrInvalidPage)
+	}
 	if !validKind(p.Kind) || !validTrust(p.Trust) || !validStatus(p.Status) || !validScope(p.Scope) {
 		return fmt.Errorf("%w: invalid kind/trust/status/scope on %s", ErrInvalidPage, p.ID)
+	}
+	if !validTrustForKind(p.Kind, p.Trust) {
+		return fmt.Errorf("%w: trust %q cannot authorize kind %q", ErrInvalidPage, p.Trust, p.Kind)
 	}
 	if m.Op == MutationInvalidate && p.Status != StatusInvalidated {
 		return fmt.Errorf("%w: invalidate mutation %s must have invalidated status", ErrInvalidPage, p.ID)
@@ -224,7 +257,7 @@ func (m PageMutation) Validate() error {
 	if m.Op == MutationUpsert && p.Status == StatusInvalidated {
 		return fmt.Errorf("%w: invalidated page %s requires invalidate mutation", ErrInvalidPage, p.ID)
 	}
-	if p.CompilerVersion == "" || p.SourceSeqMin <= 0 || p.SourceSeqMax < p.SourceSeqMin {
+	if p.CompilerVersion == "" || p.Version > PageVersion(^uint64(0)>>1) || p.SourceSeqMin <= 0 || p.SourceSeqMax < p.SourceSeqMin || uint64(p.SourceSeqMax) > uint64(p.Version) {
 		return fmt.Errorf("%w: compiler and valid source sequence range are required", ErrInvalidPage)
 	}
 	if !validDigest(string(p.SourceDigest)) {
@@ -233,14 +266,24 @@ func (m PageMutation) Validate() error {
 	if p.CreatedAt.IsZero() {
 		return fmt.Errorf("%w: source-derived creation time is required", ErrInvalidPage)
 	}
+	if !p.LastVerifiedAt.IsZero() && p.LastVerifiedAt.Before(p.CreatedAt) {
+		return fmt.Errorf("%w: verification predates creation on %s", ErrInvalidPage, p.ID)
+	}
 	if math.IsNaN(p.Salience) || math.IsInf(p.Salience, 0) || p.Salience < 0 || p.Salience > 1 {
 		return fmt.Errorf("%w: salience outside [0,1] on %s", ErrInvalidPage, p.ID)
+	}
+	if strings.TrimSpace(p.SalienceReason) == "" || len(p.SalienceReason) > MaxReasonBytes || hasUnsafeText(p.SalienceReason) {
+		return fmt.Errorf("%w: page %s requires a salience reason", ErrInvalidPage, p.ID)
+	}
+	if err := validatePageScope(p); err != nil {
+		return fmt.Errorf("%w: page %s: %v", ErrInvalidPage, p.ID, err)
 	}
 	if len(p.Refs) == 0 || len(p.Refs) > MaxPageRefs {
 		return fmt.Errorf("%w: page %s has %d refs, expected 1..%d", ErrInvalidPage, p.ID, len(p.Refs), MaxPageRefs)
 	}
 	seen := make(map[string]bool, len(p.Refs))
-	for _, ref := range p.Refs {
+	previous := ""
+	for i, ref := range p.Refs {
 		if err := ref.validate(); err != nil {
 			return fmt.Errorf("%w: page %s: %v", ErrInvalidPage, p.ID, err)
 		}
@@ -248,17 +291,24 @@ func (m PageMutation) Validate() error {
 		if seen[address] {
 			return fmt.Errorf("%w: duplicate ref %s on %s", ErrInvalidPage, address, p.ID)
 		}
+		if i > 0 && address < previous {
+			return fmt.Errorf("%w: refs on %s are not canonically sorted", ErrInvalidPage, p.ID)
+		}
 		seen[address] = true
+		previous = address
 	}
 	if m.Op == MutationUpsert {
 		if strings.TrimSpace(p.SearchText) == "" || strings.TrimSpace(p.Summary) == "" {
 			return fmt.Errorf("%w: active/stale page %s requires search text and summary", ErrInvalidPage, p.ID)
 		}
-		if tokenCount(p.SearchText) > MaxSearchTokens || tokenCount(p.Summary) > MaxSummaryTokens {
+		if len(p.SearchText) > MaxSearchBytes || len(p.Summary) > MaxSummaryBytes || tokenCount(p.SearchText) > MaxSearchTokens || tokenCount(p.Summary) > MaxSummaryTokens {
 			return fmt.Errorf("%w: page %s exceeds text bounds", ErrInvalidPage, p.ID)
 		}
 		if strings.Contains(p.SearchText, "artifact:sha256:") {
 			return fmt.Errorf("%w: page %s leaks artifact addresses into semantic text", ErrInvalidPage, p.ID)
+		}
+		if hasUnsafeText(p.SearchText) || hasUnsafeText(p.Summary) {
+			return fmt.Errorf("%w: page %s contains control text", ErrInvalidPage, p.ID)
 		}
 	}
 	return nil
@@ -267,7 +317,7 @@ func (m PageMutation) Validate() error {
 func (r PageRef) validate() error {
 	switch r.Kind {
 	case RefWSLRecord, RefEvent:
-		if strings.TrimSpace(r.ID) == "" || r.Path != "" || r.Commit != "" || r.StartLine != 0 || r.EndLine != 0 {
+		if !logicalIDRE.MatchString(r.ID) || r.Path != "" || r.Commit != "" || r.StartLine != 0 || r.EndLine != 0 {
 			return fmt.Errorf("malformed %s ref", r.Kind)
 		}
 	case RefArtifact:
@@ -276,7 +326,7 @@ func (r PageRef) validate() error {
 		}
 	case RefFileSlice:
 		cleaned, ok := normalizeRepoPath(r.Path)
-		if !ok || cleaned != r.Path || strings.TrimSpace(r.Commit) == "" || r.StartLine <= 0 || r.EndLine < r.StartLine || r.ID != "" {
+		if !ok || cleaned != r.Path || !validToken(r.Commit, 256) || r.StartLine <= 0 || r.EndLine < r.StartLine || r.EndLine-r.StartLine+1 > MaxFileSliceLines || r.ID != "" {
 			return fmt.Errorf("malformed file-slice ref")
 		}
 	default:
@@ -303,12 +353,8 @@ func validDigest(digest string) bool {
 }
 
 func normalizeRepoPath(value string) (string, bool) {
-	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
-	if value == "" || strings.HasPrefix(value, "/") {
-		return "", false
-	}
-	cleaned := path.Clean(value)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+	cleaned, err := ledger.NormalizeRepoPath(value)
+	if err != nil {
 		return "", false
 	}
 	return cleaned, true
@@ -327,6 +373,23 @@ func validTrust(value Trust) bool {
 	switch value {
 	case TrustUser, TrustRepo, TrustSystem, TrustTool, TrustModel, TrustMixed:
 		return true
+	default:
+		return false
+	}
+}
+
+func validTrustForKind(kind PageKind, trust Trust) bool {
+	switch kind {
+	case KindFailureEpisode, KindKnownGood:
+		return trust == TrustTool
+	case KindConstraint:
+		return trust == TrustUser || trust == TrustRepo || trust == TrustSystem
+	case KindDecision:
+		return trust == TrustUser || trust == TrustSystem || trust == TrustModel || trust == TrustMixed
+	case KindTaskCheckpoint:
+		return trust == TrustUser || trust == TrustSystem || trust == TrustMixed
+	case KindRepoFact, KindFileContext:
+		return trust == TrustRepo || trust == TrustSystem || trust == TrustTool
 	default:
 		return false
 	}
@@ -355,3 +418,66 @@ func validScope(value types.Scope) bool {
 }
 
 func tokenCount(text string) int { return len(strings.Fields(text)) }
+
+func validatePageScope(p WarmPage) error {
+	for _, value := range []string{p.RepoID, p.TaskID, p.Branch, p.Commit} {
+		if value != "" && !validToken(value, 256) {
+			return fmt.Errorf("scope token is malformed")
+		}
+	}
+	if len(p.PathScope) > MaxPageRefs {
+		return fmt.Errorf("too many path-scope entries")
+	}
+	seen := map[string]bool{}
+	for _, candidate := range p.PathScope {
+		cleaned, ok := normalizeRepoPath(candidate)
+		if !ok || cleaned != candidate || seen[candidate] {
+			return fmt.Errorf("path scope is noncanonical or duplicated")
+		}
+		seen[candidate] = true
+	}
+	switch p.Scope {
+	case types.ScopeGlobal:
+		if p.RepoID != "" || p.TaskID != "" || p.Branch != "" || p.Commit != "" || len(p.PathScope) != 0 {
+			return fmt.Errorf("global scope must not carry narrower authority")
+		}
+	case types.ScopeRepo:
+		if p.RepoID == "" || p.TaskID != "" || p.Branch != "" || p.Commit != "" || len(p.PathScope) != 0 {
+			return fmt.Errorf("repo scope requires only repo identity")
+		}
+	case types.ScopeTask:
+		if p.RepoID == "" || p.TaskID == "" || p.Branch != "" || p.Commit != "" || len(p.PathScope) != 0 {
+			return fmt.Errorf("task scope requires repo/task identity without branch/path authority")
+		}
+	case types.ScopeBranch:
+		if p.RepoID == "" || p.Branch == "" || len(p.PathScope) != 0 {
+			return fmt.Errorf("branch scope requires repo/branch identity and no path authority")
+		}
+	case types.ScopeFile:
+		if p.RepoID == "" || p.Branch == "" || p.Commit == "" || len(p.PathScope) == 0 {
+			return fmt.Errorf("file scope requires repo, branch, commit, and paths")
+		}
+	}
+	return nil
+}
+
+func validToken(value string, limit int) bool {
+	if value == "" || len(value) > limit || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func hasUnsafeText(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}

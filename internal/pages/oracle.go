@@ -1,14 +1,22 @@
 package pages
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
 )
 
+const (
+	// MaxVectorDimensions and MaxOracleRecords keep the exact reference backend
+	// intentionally tiny and bound adversarial fixture cost.
+	MaxVectorDimensions = 4096
+	MaxOracleRecords    = 4096
+)
+
 // VectorRecord is one tiny-fixture document vector for the exact oracle.
 type VectorRecord struct {
-	PageID PageID   `json:"page_id"`
+	PageID PageID    `json:"page_id"`
 	Vector []float64 `json:"vector"`
 }
 
@@ -22,8 +30,24 @@ type ScoredPage struct {
 // has no ANN behavior and is suitable only for tiny fixtures and backend
 // correctness comparisons.
 func ExactCosineSearch(query []float64, records []VectorRecord, limit int) ([]ScoredPage, error) {
+	return ExactCosineSearchContext(context.Background(), query, records, limit)
+}
+
+// ExactCosineSearchContext is the cancellation-aware exact oracle. A zero
+// limit deliberately returns zero results after validating the input; callers
+// must opt into every candidate they request.
+func ExactCosineSearchContext(ctx context.Context, query []float64, records []VectorRecord, limit int) ([]ScoredPage, error) {
 	if limit < 0 {
 		return nil, fmt.Errorf("%w: negative result limit", ErrInvalidVector)
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if len(query) > MaxVectorDimensions {
+		return nil, fmt.Errorf("%w: query dimension %d exceeds %d", ErrInvalidVector, len(query), MaxVectorDimensions)
+	}
+	if len(records) > MaxOracleRecords {
+		return nil, fmt.Errorf("%w: record count %d exceeds %d", ErrInvalidVector, len(records), MaxOracleRecords)
 	}
 	queryNorm, err := vectorNorm(query)
 	if err != nil {
@@ -32,6 +56,9 @@ func ExactCosineSearch(query []float64, records []VectorRecord, limit int) ([]Sc
 	seen := make(map[PageID]bool, len(records))
 	results := make([]ScoredPage, 0, len(records))
 	for _, record := range records {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
 		if record.PageID == "" {
 			return nil, fmt.Errorf("%w: empty page id", ErrInvalidVector)
 		}
@@ -48,9 +75,13 @@ func ExactCosineSearch(query []float64, records []VectorRecord, limit int) ([]Sc
 		}
 		var dot float64
 		for i, value := range query {
-			dot += value * record.Vector[i]
+			dot += (value / queryNorm) * (record.Vector[i] / norm)
+			if math.IsNaN(dot) || math.IsInf(dot, 0) {
+				return nil, fmt.Errorf("%w: page %s cosine overflow", ErrInvalidVector, record.PageID)
+			}
 		}
-		results = append(results, ScoredPage{PageID: record.PageID, Score: dot / (queryNorm * norm)})
+		dot = max(-1, min(1, dot))
+		results = append(results, ScoredPage{PageID: record.PageID, Score: dot})
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Score == results[j].Score {
@@ -58,7 +89,7 @@ func ExactCosineSearch(query []float64, records []VectorRecord, limit int) ([]Sc
 		}
 		return results[i].Score > results[j].Score
 	})
-	if limit == 0 || limit > len(results) {
+	if limit > len(results) {
 		limit = len(results)
 	}
 	return append([]ScoredPage(nil), results[:limit]...), nil
@@ -68,15 +99,27 @@ func vectorNorm(vector []float64) (float64, error) {
 	if len(vector) == 0 {
 		return 0, fmt.Errorf("%w: empty vector", ErrInvalidVector)
 	}
-	var squared float64
+	var norm float64
 	for _, value := range vector {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			return 0, fmt.Errorf("%w: non-finite component", ErrInvalidVector)
 		}
-		squared += value * value
+		norm = math.Hypot(norm, value)
 	}
-	if squared == 0 || math.IsInf(squared, 0) {
+	if norm == 0 || math.IsInf(norm, 0) {
 		return 0, fmt.Errorf("%w: zero or overflowing norm", ErrInvalidVector)
 	}
-	return math.Sqrt(squared), nil
+	return norm, nil
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("nil context")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
