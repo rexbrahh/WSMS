@@ -250,11 +250,17 @@ Required invariants:
 - Exact failure and hard-constraint evidence is immutable once established.
 - Branch-scoped pages cannot be promoted into a different branch.
 - A page backed only by stale refs cannot be promoted without revalidation.
+- Decision, page, and avoid dependencies fail closed transitively; dependency
+  cycles are never eligible.
+- Scope intersections may narrow eligibility but never widen it.
+- A terminal path invalidation covers known descendants and blocks later
+  overlapping snapshot/rename mutations.
 
 The first demo milestone directly proves exact-field immutability, known
 references, and hard-constraint contradiction handling. Phase 6 adds
-branch/commit/path epochs, terminal invalidation, CAS revalidation, and a shared
-capsule/page-fault eligibility gate without changing L4 evidence.
+monotonic branch/commit/path epochs, terminal subtree invalidation, CAS
+revalidation, transitive ref gates, and a shared capsule/page-fault eligibility
+oracle without changing L4 evidence.
 
 ### FR-007 - Memory hierarchy (MUST)
 

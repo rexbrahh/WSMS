@@ -571,19 +571,25 @@ Implementation:
    `file_renamed`, `memory_invalidated`, and `memory_revalidated`. The strict
    `file_snapshot` path/digest event is additive; legacy `file_read` rows retain
    their pre-Phase-6 compatibility contract.
-3. Repo/branch/commit/path epochs are keyed by scope. Branch/commit/rename
-   transitions mark only affected bindings stale; terminal invalidation uses a
-   closed reason enum.
+3. Repo/branch/commit/path epochs are keyed by scope and allocated by one
+   monotonic session clock. Independent repo/task/branch/commit requirements can
+   be intersected without widening an address; branch/commit/rename transitions
+   mark only affected bindings stale.
 4. Revalidation is stale-only and CAS-like: it requires a positive
    `expected_stale_revision`, a preexisting eligible `evidence_ref`, and a
    matching source digest for page/path targets. It never retargets an old path.
 5. Scheduler candidate/commit ordering makes WSL event noting, observer updates,
    allocator checkpoints, coherence transitions, and hierarchy reconciliation
    one foreground transaction boundary.
-6. Capsule selection and page faults share the same fail-closed eligibility
-   oracle. The resolver checks it before L2 and before WSL fallback. L4 raw
-   evidence stays diagnostic except for policy/security revocation.
-7. Harness helpers expose validated branch, commit, rename, snapshot,
+6. Capsule selection and page faults share the same recursive, cycle-safe
+   eligibility oracle. Decision/page/avoid refs inherit dependency status, and
+   pages without current refs fail closed.
+7. Path invalidation is terminal across known descendants and rejects future
+   overlapping snapshots/renames. L4 raw evidence stays diagnostic except for
+   policy/security revocation, including aliases beneath a revoked path.
+8. An old resident generation is rematerialized from current WSL/L4 evidence;
+   its body is never made current by metadata refresh alone.
+9. Harness helpers expose validated branch, commit, rename, snapshot,
    invalidation, and revalidation operations without direct WSL mutation.
 
 Verification gates:
@@ -593,6 +599,10 @@ Verification gates:
 - Branch round trips and commit changes cannot reactivate an older epoch.
 - Rename matching uses path-component boundaries and never silently retargets
   old refs.
+- Terminal path ancestors suppress known/future descendants, raw aliases, and
+  overlapping rename/snapshot attempts.
+- Task/branch/repo scope intersections and transitive decision/page/avoid refs
+  cannot widen eligibility.
 - A rejected WSL batch leaves coherence, hierarchy, provenance, known events,
   and allocator counters unchanged.
 - Malformed/noncanonical/cross-scope inputs fail before append and leave the

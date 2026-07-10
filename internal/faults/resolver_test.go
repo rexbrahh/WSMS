@@ -9,8 +9,10 @@ import (
 	"testing"
 
 	"wsms/internal/artifacts"
+	"wsms/internal/coherence"
 	"wsms/internal/ledger"
 	"wsms/internal/memory"
+	"wsms/internal/types"
 	"wsms/internal/wsl"
 )
 
@@ -46,6 +48,45 @@ func TestPageHitFailure(t *testing.T) {
 	}
 	if !contains(got, "stream goroutine still blocked") {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestInvalidatedPageDependencyCannotFallBackToWSL(t *testing.T) {
+	coherent := coherence.NewState()
+	apply := func(ev ledger.Event, updates []wsl.Update) {
+		t.Helper()
+		if err := coherent.WithCandidate(ev, func(candidate *coherence.Candidate) error {
+			return candidate.BindUpdates(updates)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply(ledger.Event{
+		ID: "E0001", Type: ledger.EventTaskStarted, Repo: "repo", Branch: "main", Commit: "aaaaaaa",
+		Payload: map[string]any{"goal": "dependency gate"},
+	}, []wsl.Update{{Record: &wsl.TaskRecord{IDValue: "T1", Goal: "dependency gate", Branch: "main", Commit: "aaaaaaa"}}})
+	page := &wsl.PageRecord{IDValue: "P1", KindStr: "failure_episode", Summary: "cached failure", Refs: "F1", Scope: types.ScopeTask}
+	apply(ledger.Event{ID: "E0002", Type: ledger.EventDecision}, []wsl.Update{
+		{Record: &wsl.FailureRecord{IDValue: "F1", Cmd: "go test", Exit: 1, Err: "failed"}},
+		{Record: page},
+	})
+
+	state := wsl.NewWorkingState()
+	if err := state.Apply(page); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &Resolver{State: state, Hierarchy: memory.NewHierarchy(), Coherence: coherent}
+	if got, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "P1"}); err != nil || got == PageMiss {
+		t.Fatalf("current page=(%q,%v), want WSL hit", got, err)
+	}
+	apply(ledger.Event{
+		ID: "E0003", Type: ledger.EventMemoryInvalidated,
+		Payload: map[string]any{
+			"target_kind": string(ledger.TargetRecord), "target": "F1", "reason": string(ledger.ReasonSuperseded),
+		},
+	}, nil)
+	if got, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "P1"}); err != nil || got != PageMiss {
+		t.Fatalf("invalidated dependency fallback=(%q,%v), want PAGE_MISS", got, err)
 	}
 }
 

@@ -246,7 +246,7 @@ func TestTerminalRenameDestinationFailsBeforeDurableAppend(t *testing.T) {
 	if err := s.StartTask(ctx, TaskStart{Goal: "guard rename", Repo: "repo", Branch: "main", Commit: "aaaaaaa"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"src/old.go", "src/dst.go"} {
+	for _, path := range []string{"src/old.go", "src/revoked"} {
 		if err := s.RecordFileSnapshot(ctx, FileSnapshot{
 			Repo: "repo", Branch: "main", Commit: "aaaaaaa", Path: path, ContentDigest: coherenceDigest,
 		}); err != nil {
@@ -254,7 +254,7 @@ func TestTerminalRenameDestinationFailsBeforeDurableAppend(t *testing.T) {
 		}
 	}
 	if err := s.InvalidateMemory(ctx, MemoryInvalidation{
-		Kind: ledger.TargetPath, Target: "src/dst.go", Reason: ledger.ReasonSecurityRevoked,
+		Kind: ledger.TargetPath, Target: "src/revoked", Reason: ledger.ReasonSecurityRevoked,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -262,16 +262,27 @@ func TestTerminalRenameDestinationFailsBeforeDurableAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RenameFile(ctx, FileRename{
-		Repo: "repo", Branch: "main", FromPath: "src/old.go", ToPath: "src/dst.go",
-	}); err == nil {
-		t.Fatal("rename over terminal destination succeeded")
+	for _, call := range []func() error{
+		func() error {
+			return s.RenameFile(ctx, FileRename{
+				Repo: "repo", Branch: "main", FromPath: "src/old.go", ToPath: "src/revoked/dst.go",
+			})
+		},
+		func() error {
+			return s.RecordFileSnapshot(ctx, FileSnapshot{
+				Repo: "repo", Branch: "main", Commit: "aaaaaaa", Path: "src/revoked/new.go", ContentDigest: coherenceDigest,
+			})
+		},
+	} {
+		if err := call(); err == nil {
+			t.Fatal("mutation below terminal destination succeeded")
+		}
 	}
 	after, err := s.Ledger.ListBySession(ctx, cfg.SessionID)
 	if err != nil || len(after) != len(before) {
 		t.Fatalf("rejected rename persisted: before=%d after=%d err=%v", len(before), len(after), err)
 	}
-	if status, _, _ := s.Coherence.AddressStatus(ledger.TargetPath, "src/dst.go"); status != coherence.StatusInvalidated {
+	if status, _, _ := s.Coherence.AddressStatus(ledger.TargetPath, "src/revoked"); status != coherence.StatusInvalidated {
 		t.Fatalf("terminal destination status=%q", status)
 	}
 }

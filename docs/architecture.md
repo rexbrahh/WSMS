@@ -229,9 +229,12 @@ revalidation.
 
 `internal/coherence` is the authoritative, per-session sidecar for this gate.
 It replays the same durable events as WSL and binds each derived record/page to
-its repo, task, branch, commit, paths, status, and keyed scope epochs. Repo,
-branch, commit, and path epochs advance only at the narrowest affected scope;
+its independently composable repo/task/branch/commit gates, paths, refs, status,
+and keyed scope epochs. Repo, branch, commit, and path epochs draw from one
+monotonic session clock and advance only at the narrowest affected scope;
 returning to an older branch/commit therefore does not revive an old cache entry.
+Reference eligibility is recursive and cycle-safe, so a page, decision, or avoid
+record cannot outlive ineligible grounding evidence.
 
 Transitions use a candidate/commit protocol. The scheduler prepares a cloned
 coherence candidate, derives observer updates, atomically notes the event and
@@ -246,6 +249,13 @@ expected stale revision while citing preexisting eligible evidence. A terminal
 `memory_invalidated` target cannot be revalidated. Its reason is one of
 `superseded`, `user_rejected`, `source_deleted`, `policy_changed`, or
 `security_revoked`.
+
+Path invalidation is terminal for its known subtree and blocks later snapshots
+or renames that overlap the revoked namespace. A materialized page carries the
+maximum relevant monotonic scope generation. If its descriptor is older than an
+eligible logical address, the resolver discards the resident body and
+rematerializes from current WSL/L4 evidence instead of refreshing metadata in
+place.
 
 Logical invalidation suppresses L1-L3 but never deletes WSL/L4. Raw diagnostics
 remain readable for ordinary staleness and the first three invalidation reasons.

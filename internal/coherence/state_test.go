@@ -285,6 +285,7 @@ func TestBranchFactsSurviveCommitWhileAvoidInheritsGrounding(t *testing.T) {
 	applyCandidate(t, state, ledger.Event{ID: "E0004", Type: ledger.EventDecision}, []wsl.Update{
 		{Record: &wsl.AvoidRecord{IDValue: "A1", Text: "do not retry", Ref: "F1"}},
 		{Record: &wsl.DecisionRecord{IDValue: "D1", Chosen: "stay on branch design", Scope: types.ScopeBranch}},
+		{Record: &wsl.DecisionRecord{IDValue: "D2", Chosen: "grounded branch design", Refs: "F1", Scope: types.ScopeBranch}},
 	})
 	applyCandidate(t, state, ledger.Event{
 		ID: "E0005", Type: ledger.EventCommitChange, Repo: "repo", Branch: "main", Commit: "bbbbbbb",
@@ -300,6 +301,9 @@ func TestBranchFactsSurviveCommitWhileAvoidInheritsGrounding(t *testing.T) {
 		if status, _, _ := state.AddressStatus(ledger.TargetRecord, id); status != StatusStale || state.RecordEligible(id) {
 			t.Fatalf("commit-bound %s status=%q eligible=%v", id, status, state.RecordEligible(id))
 		}
+	}
+	if status, _, _ := state.AddressStatus(ledger.TargetRecord, "D2"); status != StatusActive || state.RecordEligible("D2") {
+		t.Fatalf("reference-backed branch fact D2 status=%q eligible=%v, want effectively stale", status, state.RecordEligible("D2"))
 	}
 }
 
@@ -374,5 +378,145 @@ func TestPageStatusRequiresRematerializedScopeGeneration(t *testing.T) {
 	status, _ = state.PageStatus("F1", []string{"F1"}, current.Scope, current.Branch, current.Commit, current.Paths, current.SourceDigest, current.Generation())
 	if status != StatusActive {
 		t.Fatalf("rematerialized generation status=%q, want active", status)
+	}
+}
+
+func TestTerminalPathInvalidationCoversDescendantsAndFutureMutations(t *testing.T) {
+	state := NewState()
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0001", Type: ledger.EventTaskStarted, Repo: "repo", Branch: "main", Commit: "aaaaaaa",
+		Payload: map[string]any{"goal": "revoke subtree"},
+	}, []wsl.Update{{Record: &wsl.TaskRecord{IDValue: "T1", Goal: "revoke subtree", Branch: "main", Commit: "aaaaaaa"}}})
+	digest := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for i, path := range []string{"revoked", "revoked/existing.go", "safe/source.go"} {
+		applyCandidate(t, state, ledger.Event{
+			ID: []string{"E0002", "E0003", "E0004"}[i], Type: ledger.EventFileSnapshot,
+			Repo: "repo", Branch: "main", Commit: "aaaaaaa",
+			Payload: map[string]any{"path": path, "content_digest": digest},
+		}, nil)
+	}
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0005", Type: ledger.EventMemoryInvalidated,
+		Payload: map[string]any{
+			"target_kind": string(ledger.TargetPath), "target": "revoked", "reason": string(ledger.ReasonSecurityRevoked),
+		},
+	}, nil)
+	if status, _, _ := state.AddressStatus(ledger.TargetPath, "revoked/existing.go"); status != StatusInvalidated {
+		t.Fatalf("known descendant status=%q, want invalidated", status)
+	}
+	for _, ev := range []ledger.Event{
+		{
+			ID: "E0006", Type: ledger.EventFileSnapshot, Repo: "repo", Branch: "main", Commit: "aaaaaaa",
+			Payload: map[string]any{"path": "revoked/new.go", "content_digest": digest},
+		},
+		{
+			ID: "E0007", Type: ledger.EventFileRenamed, Repo: "repo", Branch: "main",
+			Payload: map[string]any{"from_path": "safe/source.go", "to_path": "revoked/new.go"},
+		},
+	} {
+		before := state.Snapshot()
+		err := state.WithCandidate(ev, func(*Candidate) error { return nil })
+		if err == nil || !reflect.DeepEqual(before, state.Snapshot()) {
+			t.Fatalf("terminal subtree mutation %s err=%v mutated=%v", ev.Type, err, !reflect.DeepEqual(before, state.Snapshot()))
+		}
+	}
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0008", Type: ledger.EventCommandOutput,
+		Payload: map[string]any{
+			"cmd": "go test", "exit": 1, "output": "failed", "file_hint": "revoked/future.go:9",
+		},
+	}, []wsl.Update{{Record: &wsl.FailureRecord{
+		IDValue: "F2", Cmd: "go test", Exit: 1, Err: "failed", FileHint: "revoked/future.go:9",
+	}}})
+	if state.RecordEligible("F2") || state.RawAllowed("F2") || state.RawAllowed("E0008") {
+		t.Fatal("future descendant evidence bypassed terminal security path")
+	}
+}
+
+func TestDecisionAndPageBindingsFollowReferenceEligibilityAndInvalidation(t *testing.T) {
+	state := seededFailureState(t)
+	applyCandidate(t, state, ledger.Event{ID: "E0003", Type: ledger.EventDecision}, []wsl.Update{
+		{Record: &wsl.DecisionRecord{IDValue: "D1", Chosen: "use exact failure", Refs: "F1", Scope: types.ScopeBranch}},
+		{Record: &wsl.PageRecord{IDValue: "P1", KindStr: "failure_episode", Refs: "F1", Scope: types.ScopeBranch, Branch: "main"}},
+	})
+	if !state.RecordEligible("D1") || !state.RecordEligible("P1") {
+		t.Fatal("current reference-backed bindings unexpectedly ineligible")
+	}
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0004", Type: ledger.EventMemoryInvalidated,
+		Payload: map[string]any{
+			"target_kind": string(ledger.TargetRecord), "target": "F1", "reason": string(ledger.ReasonSuperseded),
+		},
+	}, nil)
+	for _, id := range []string{"D1", "P1"} {
+		if status, _, _ := state.AddressStatus(map[string]ledger.MemoryTargetKind{"D1": ledger.TargetRecord, "P1": ledger.TargetPage}[id], id); status != StatusInvalidated || state.RecordEligible(id) {
+			t.Fatalf("dependent %s status=%q eligible=%v", id, status, state.RecordEligible(id))
+		}
+	}
+}
+
+func TestAvoidIntersectsDecisionAndGroundingScopes(t *testing.T) {
+	state := NewState()
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0001", Type: ledger.EventTaskStarted, Repo: "repo", Branch: "main", Commit: "aaaaaaa",
+		Payload: map[string]any{"goal": "scope intersection"},
+	}, []wsl.Update{{Record: &wsl.TaskRecord{IDValue: "T1", Goal: "scope intersection", Branch: "main", Commit: "aaaaaaa"}}})
+	applyCandidate(t, state, ledger.Event{ID: "E0002", Type: ledger.EventUserInstruction, Payload: map[string]any{"text": "keep task evidence"}}, []wsl.Update{
+		{Record: &wsl.ConstraintRecord{IDValue: "C1", Strength: types.StrengthHard, Scope: types.ScopeTask, Text: "keep task evidence"}},
+	})
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0003", Type: ledger.EventDecision, Payload: map[string]any{"scope": "branch"},
+	}, []wsl.Update{
+		{Record: &wsl.AvoidRecord{IDValue: "A1", Text: "do not retry", Ref: "C1"}},
+		{Record: &wsl.DecisionRecord{IDValue: "D1", Chosen: "branch choice", Scope: types.ScopeBranch}},
+	})
+	avoid, _ := state.BindingFor(ledger.TargetRecord, "A1")
+	if !avoid.RequireTask || !avoid.RequireBranch {
+		t.Fatalf("avoid gates=%#v, want task and branch", avoid)
+	}
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0004", Type: ledger.EventBranchChange, Repo: "repo", Branch: "feature", Commit: "bbbbbbb",
+		Payload: map[string]any{"from_branch": "main", "from_commit": "aaaaaaa"},
+	}, []wsl.Update{{Record: &wsl.TaskRecord{IDValue: "T1", Goal: "scope intersection", Branch: "feature", Commit: "bbbbbbb"}}})
+	if !state.RecordEligible("C1") {
+		t.Fatal("task grounding should remain active across branch switch")
+	}
+	for _, id := range []string{"A1", "D1"} {
+		if status, _, _ := state.AddressStatus(ledger.TargetRecord, id); status != StatusStale || state.RecordEligible(id) {
+			t.Fatalf("branch requirement %s status=%q eligible=%v", id, status, state.RecordEligible(id))
+		}
+	}
+}
+
+func TestAvoidIntersectsGlobalGroundingWithRepoDecision(t *testing.T) {
+	state := NewState()
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0001", Type: ledger.EventTaskStarted, Repo: "repo-a", Branch: "main", Commit: "aaaaaaa",
+		Payload: map[string]any{"goal": "repo A"},
+	}, []wsl.Update{{Record: &wsl.TaskRecord{IDValue: "T1", Goal: "repo A", Branch: "main", Commit: "aaaaaaa"}}})
+	applyCandidate(t, state, ledger.Event{ID: "E0002", Type: ledger.EventUserInstruction, Payload: map[string]any{"text": "global rule"}}, []wsl.Update{
+		{Record: &wsl.ConstraintRecord{IDValue: "C1", Strength: types.StrengthHard, Scope: types.ScopeGlobal, Text: "global rule"}},
+	})
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0003", Type: ledger.EventDecision, Payload: map[string]any{"scope": "repo"},
+	}, []wsl.Update{
+		{Record: &wsl.AvoidRecord{IDValue: "A1", Text: "repo-local avoid", Ref: "C1"}},
+		{Record: &wsl.DecisionRecord{IDValue: "D1", Chosen: "repo-local choice", Scope: types.ScopeRepo}},
+	})
+	avoid, _ := state.BindingFor(ledger.TargetRecord, "A1")
+	if !avoid.RequireRepo || avoid.Repo != "repo-a" || avoid.RequireTask || avoid.RequireBranch {
+		t.Fatalf("global+repo avoid gates=%#v", avoid)
+	}
+	applyCandidate(t, state, ledger.Event{
+		ID: "E0004", Type: ledger.EventTaskStarted, Repo: "repo-b", Branch: "main", Commit: "bbbbbbb",
+		Payload: map[string]any{"goal": "repo B"},
+	}, []wsl.Update{{Record: &wsl.TaskRecord{IDValue: "T2", Goal: "repo B", Branch: "main", Commit: "bbbbbbb"}}})
+	if !state.RecordEligible("C1") {
+		t.Fatal("global grounding should remain active across repos")
+	}
+	for _, id := range []string{"A1", "D1"} {
+		if status, _, _ := state.AddressStatus(ledger.TargetRecord, id); status != StatusStale || state.RecordEligible(id) {
+			t.Fatalf("repo requirement %s status=%q eligible=%v", id, status, state.RecordEligible(id))
+		}
 	}
 }

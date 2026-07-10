@@ -158,6 +158,21 @@ func ValidateEvent(ev Event) error {
 		if err := validateOptionalStrings(ev, "because", "refs", "scope", "avoid_text", "avoid_ref"); err != nil {
 			return err
 		}
+		if scope := ev.PayloadString("scope"); scope != "" {
+			switch scope {
+			case "global", "repo", "branch", "task", "file":
+			default:
+				return invalidPayloadField(ev, "scope", "must be global, repo, branch, task, or file")
+			}
+		}
+		if refs := ev.PayloadString("refs"); refs != "" {
+			for _, field := range strings.Fields(refs) {
+				ref := strings.Trim(field, ",")
+				if !recordTargetRE.MatchString(ref) {
+					return invalidPayloadField(ev, "refs", "must contain only session-local logical addresses")
+				}
+			}
+		}
 		avoidText := strings.TrimSpace(ev.PayloadString("avoid_text"))
 		avoidRef := strings.TrimSpace(ev.PayloadString("avoid_ref"))
 		if avoidText != "" && avoidRef == "" {
@@ -165,6 +180,9 @@ func ValidateEvent(ev Event) error {
 		}
 		if avoidRef != "" && avoidText == "" {
 			return invalidPayloadField(ev, "avoid_text", "is required when avoid_ref is present")
+		}
+		if avoidRef != "" && !recordTargetRE.MatchString(avoidRef) {
+			return invalidPayloadField(ev, "avoid_ref", "must be one session-local logical address")
 		}
 		return nil
 	case EventNextAction:

@@ -59,6 +59,10 @@ type Binding struct {
 	InvalidReason   ledger.InvalidationReason
 	EvidenceEventID string
 	Refs            []string
+	RequireRepo     bool
+	RequireTask     bool
+	RequireBranch   bool
+	RequireCommit   bool
 	RepoEpoch       uint64
 	BranchEpoch     uint64
 	CommitEpoch     uint64
@@ -252,12 +256,13 @@ func (c *Candidate) applyEvent() error {
 	ev := c.event
 	switch ev.Type {
 	case ledger.EventTaskStarted:
-		if snap.Current.Repo != "" && ev.Repo != "" && snap.Current.Repo != ev.Repo {
-			markMatchingStale(snap, func(b Binding) bool { return b.Scope != types.ScopeGlobal })
+		if snap.Current.Repo != ev.Repo {
+			markMatchingStale(snap, func(b Binding) bool { return !trueGlobalBinding(b) })
 		}
-		if snap.Current.TaskID != "" && (ev.TaskID == "" || snap.Current.TaskID != ev.TaskID) {
-			markMatchingStale(snap, func(b Binding) bool { return b.Scope == types.ScopeTask || b.Scope == types.ScopeFile })
-		}
+		// task_started creates a fresh task generation even when the caller lets
+		// the observer allocate the logical T id. This also closes pre-task
+		// task-scoped bindings that were captured with an empty TaskID.
+		markMatchingStale(snap, func(b Binding) bool { return b.RequireTask })
 		snap.Current = Scope{Repo: ev.Repo, TaskID: ev.TaskID, Branch: effectiveTaskBranch(ev), Commit: ev.Commit}
 		enterCurrentScope(snap)
 		markMatchingStale(snap, func(b Binding) bool {
@@ -308,8 +313,8 @@ func (c *Candidate) applyEvent() error {
 			return err
 		}
 		p := ev.PayloadString("path")
-		if existing, ok := snap.Paths[pathKey(ev.Repo, ev.Branch, p)]; ok && existing.Status == StatusInvalidated {
-			return fmt.Errorf("%w: path %s is terminally invalidated", ErrTransition, p)
+		if terminal := terminalPathOverlap(*snap, ev.Repo, ev.Branch, p); terminal != "" {
+			return fmt.Errorf("%w: path %s overlaps terminally invalidated path %s", ErrTransition, p, terminal)
 		}
 		existing, existed := snap.Paths[pathKey(ev.Repo, ev.Branch, p)]
 		previousEpoch := snap.PathEpochs[pathKey(ev.Repo, ev.Branch, p)]
@@ -344,13 +349,11 @@ func (c *Candidate) applyEvent() error {
 		}
 		from, to := ev.PayloadString("from_path"), ev.PayloadString("to_path")
 		fromKey, toKey := pathKey(ev.Repo, ev.Branch, from), pathKey(ev.Repo, ev.Branch, to)
-		fromState, fromExists := snap.Paths[fromKey]
-		if fromExists && fromState.Status == StatusInvalidated {
-			return fmt.Errorf("%w: renamed source %s is terminally invalidated", ErrTransition, from)
+		if terminal := terminalPathOverlap(*snap, ev.Repo, ev.Branch, from); terminal != "" {
+			return fmt.Errorf("%w: renamed source %s overlaps terminally invalidated path %s", ErrTransition, from, terminal)
 		}
-		toState, toExists := snap.Paths[toKey]
-		if toExists && toState.Status == StatusInvalidated {
-			return fmt.Errorf("%w: rename destination %s is terminally invalidated", ErrTransition, to)
+		if terminal := terminalPathOverlap(*snap, ev.Repo, ev.Branch, to); terminal != "" {
+			return fmt.Errorf("%w: rename destination %s overlaps terminally invalidated path %s", ErrTransition, to, terminal)
 		}
 		// A rename replaces both address ranges. Advance every known descendant
 		// once, preserving terminal descendants, then install only the exact new
@@ -410,18 +413,35 @@ func (c *Candidate) applyEvent() error {
 			if p.Status == StatusInvalidated {
 				return fmt.Errorf("%w: path target %s is terminally invalidated", ErrTransition, target)
 			}
-			p.Status, p.InvalidReason = StatusInvalidated, reason
-			p.StaleRevision = nextStaleRevision(p.StaleRevision)
-			p.EvidenceID = ev.ID
-			snap.Paths[key] = p
-			markMatchingInvalidated(snap, reason, func(b Binding) bool {
+			affected := make([]string, 0)
+			for candidateKey, candidate := range snap.Paths {
+				if candidate.Repo == snap.Current.Repo && candidate.Branch == snap.Current.Branch && pathWithin(candidate.Path, target) {
+					affected = append(affected, candidateKey)
+				}
+			}
+			sort.Strings(affected)
+			for _, candidateKey := range affected {
+				candidate := snap.Paths[candidateKey]
+				if candidate.Status == StatusInvalidated {
+					continue
+				}
+				candidate.Status, candidate.InvalidReason = StatusInvalidated, reason
+				candidate.StaleRevision = nextStaleRevision(candidate.StaleRevision)
+				candidate.Epoch = bumpPathEpoch(snap, candidate.Repo, candidate.Branch, candidate.Path)
+				candidate.EvidenceID = ev.ID
+				snap.Paths[candidateKey] = candidate
+			}
+			invalidatedIDs := markMatchingInvalidated(snap, reason, func(b Binding) bool {
 				for _, p := range b.Paths {
-					if pathWithin(p, target) {
+					if pathsOverlap(p, target) {
 						return true
 					}
 				}
 				return false
 			})
+			for _, id := range invalidatedIDs {
+				cascadeInvalidation(snap, id, reason)
+			}
 			break
 		}
 		key := bindingKey(kind, target)
@@ -486,29 +506,40 @@ func (c *Candidate) applyRevalidation() error {
 	// represented by a new version rather than silently retargeted.
 	for _, p := range b.Paths {
 		pathState, ok := snap.Paths[pathKey(snap.Current.Repo, snap.Current.Branch, p)]
-		if !ok || pathState.Status != StatusActive {
+		if !ok || pathState.Status != StatusActive || terminalPathOverlap(*snap, snap.Current.Repo, snap.Current.Branch, p) != "" {
 			return fmt.Errorf("%w: target %s still depends on stale path %s", ErrTransition, target, p)
+		}
+	}
+	for _, ref := range b.Refs {
+		if !eligibleEvidence(*snap, ref) {
+			return fmt.Errorf("%w: target %s still depends on ineligible ref %s", ErrTransition, target, ref)
 		}
 	}
 	// Revalidation changes eligibility, not immutable derivation provenance.
 	// Raw faults still resolve through the original evidence event.
 	b.Status, b.InvalidReason = StatusActive, ""
-	commitBound := b.Commit != ""
-	b.Repo, b.TaskID = snap.Current.Repo, snap.Current.TaskID
-	switch b.Scope {
-	case types.ScopeGlobal:
-		b.Repo, b.TaskID, b.Branch, b.Commit = "", "", "", ""
-	case types.ScopeRepo:
-		b.Branch, b.Commit = "", ""
-	case types.ScopeBranch:
+	if b.RequireRepo {
+		b.Repo = snap.Current.Repo
+	} else {
+		b.Repo = ""
+	}
+	if b.RequireTask {
+		b.TaskID = snap.Current.TaskID
+	} else {
+		b.TaskID = ""
+	}
+	if b.RequireBranch {
 		b.Branch = snap.Current.Branch
-		if commitBound {
-			b.Commit = snap.Current.Commit
-		} else {
-			b.Commit = ""
-		}
-	default:
-		b.Branch, b.Commit = snap.Current.Branch, snap.Current.Commit
+	} else {
+		b.Branch = ""
+	}
+	if b.RequireCommit {
+		b.Commit = snap.Current.Commit
+	} else {
+		b.Commit = ""
+	}
+	if trueGlobalBinding(b) {
+		b.Repo, b.TaskID, b.Branch, b.Commit = "", "", "", ""
 	}
 	captureEpochs(&b, *snap)
 	snap.Bindings[key] = b
@@ -556,7 +587,7 @@ func (s *State) RawAllowed(id string) bool {
 	}
 	for _, kind := range []ledger.MemoryTargetKind{ledger.TargetRecord, ledger.TargetEvent, ledger.TargetPage} {
 		if b, ok := s.snapshot.Bindings[bindingKey(kind, id)]; ok {
-			if deny(b.InvalidReason) {
+			if bindingRawDenied(b, s.snapshot, deny) {
 				return false
 			}
 			if source, found := s.snapshot.Bindings[bindingKey(ledger.TargetEvent, b.EvidenceEventID)]; found && deny(source.InvalidReason) {
@@ -567,11 +598,26 @@ func (s *State) RawAllowed(id string) bool {
 	// A failure's raw bytes can also be requested through its evidence event.
 	// Revocation therefore follows the provenance edge in both directions.
 	for _, b := range s.snapshot.Bindings {
-		if b.EvidenceEventID == id && deny(b.InvalidReason) {
+		if b.EvidenceEventID == id && bindingRawDenied(b, s.snapshot, deny) {
 			return false
 		}
 	}
 	return true
+}
+
+func bindingRawDenied(b Binding, snap Snapshot, deny func(ledger.InvalidationReason) bool) bool {
+	if deny(b.InvalidReason) {
+		return true
+	}
+	for _, p := range b.Paths {
+		for _, pathState := range snap.Paths {
+			if pathState.Repo == b.Repo && pathState.Branch == b.Branch && pathState.Status == StatusInvalidated &&
+				pathsOverlap(p, pathState.Path) && deny(pathState.InvalidReason) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PageStatus evaluates an L2/L3 descriptor without importing memory package
@@ -592,8 +638,9 @@ func (s *State) BindingFor(kind ledger.MemoryTargetKind, id string) (Binding, bo
 }
 
 func (c *Candidate) bindEvent(ev ledger.Event) {
+	scope := eventScope(ev)
 	b := Binding{
-		Kind: ledger.TargetEvent, ID: ev.ID, Scope: eventScope(ev),
+		Kind: ledger.TargetEvent, ID: ev.ID, Scope: scope,
 		Repo: firstNonEmpty(ev.Repo, c.next.Current.Repo), TaskID: firstNonEmpty(ev.TaskID, c.next.Current.TaskID),
 		Branch: firstNonEmpty(ev.Branch, c.next.Current.Branch), Commit: firstNonEmpty(ev.Commit, c.next.Current.Commit),
 		Status: StatusActive, EvidenceEventID: ev.ID,
@@ -601,7 +648,14 @@ func (c *Candidate) bindEvent(ev ledger.Event) {
 	if ev.Type == ledger.EventFileSnapshot {
 		b.Paths = []string{ev.PayloadString("path")}
 		b.SourceDigest = ev.PayloadString("content_digest")
+	} else if p := normalizeFileHint(ev.PayloadString("file_hint")); p != "" {
+		b.Paths = []string{p}
 	}
+	addScopeGates(&b, scope, c.next.Current)
+	if scope == types.ScopeBranch {
+		b.RequireCommit = true
+	}
+	canonicalizeBindingScope(&b)
 	captureEpochs(&b, c.next)
 	c.next.Bindings[bindingKey(b.Kind, b.ID)] = b
 }
@@ -613,28 +667,48 @@ func bindingForRecord(ev ledger.Event, snap Snapshot, rec wsl.Record) (Binding, 
 		Branch: firstNonEmpty(ev.Branch, snap.Current.Branch), Commit: firstNonEmpty(ev.Commit, snap.Current.Commit),
 		Status: StatusActive, EvidenceEventID: ev.ID,
 	}
+	var extraScope types.Scope
 	switch r := rec.(type) {
 	case *wsl.ConstraintRecord:
 		b.Scope = r.Scope
 	case *wsl.FailureRecord:
 		b.Scope = types.ScopeBranch
+		b.RequireCommit = true
 		if p := normalizeFileHint(r.FileHint); p != "" {
 			b.Paths = []string{p}
 		}
 	case *wsl.DecisionRecord:
 		b.Scope = r.Scope
+		refs, err := parseLogicalRefs(r.Refs)
+		if err != nil {
+			return Binding{}, false, fmt.Errorf("%w: decision %s refs: %v", ErrTransition, r.IDValue, err)
+		}
+		b.Refs = refs
 	case *wsl.PageRecord:
 		b.Kind, b.Scope = ledger.TargetPage, r.Scope
 		b.Branch = firstNonEmpty(r.Branch, b.Branch)
+		refs, err := parseLogicalRefs(r.Refs)
+		if err != nil {
+			return Binding{}, false, fmt.Errorf("%w: page %s refs: %v", ErrTransition, r.IDValue, err)
+		}
+		b.Refs = refs
 	case *wsl.TaskRecord:
 		b.Scope, b.Branch, b.Commit = types.ScopeTask, r.Branch, r.Commit
 	case *wsl.AvoidRecord:
 		b.Scope = types.ScopeTask
-		if ref, found := snap.Bindings[bindingKey(ledger.TargetRecord, r.Ref)]; found {
+		b.Refs = []string{r.Ref}
+		extraScope = types.Scope(ev.PayloadString("scope"))
+		if extraScope == "" {
+			extraScope = types.ScopeTask
+		}
+		if !validScope(extraScope) {
+			return Binding{}, false, fmt.Errorf("%w: avoid %s has unsupported decision scope %q", ErrTransition, r.IDValue, extraScope)
+		}
+		if ref, found := bindingByLogicalID(snap, r.Ref); found {
 			grounding := cloneBinding(ref)
 			grounding.Kind, grounding.ID = ledger.TargetRecord, r.IDValue
 			grounding.EvidenceEventID = ev.ID
-			grounding.Refs = []string{r.Ref}
+			grounding.Refs = append([]string(nil), b.Refs...)
 			b = grounding
 		}
 	case *wsl.InvalidatedRecord, *wsl.NextRecord, *wsl.AssumptionRecord:
@@ -645,18 +719,14 @@ func bindingForRecord(ev ledger.Event, snap Snapshot, rec wsl.Record) (Binding, 
 	if b.Scope == "" {
 		b.Scope = types.ScopeTask
 	}
-	// A true branch/repo fact survives commit changes. Commit-bound operational
-	// evidence (failures and file scope) deliberately retains Commit.
-	switch rec.(type) {
-	case *wsl.ConstraintRecord, *wsl.DecisionRecord, *wsl.PageRecord:
-		if b.Scope == types.ScopeBranch || b.Scope == types.ScopeRepo || b.Scope == types.ScopeGlobal {
-			b.Commit = ""
-		}
+	if !validScope(b.Scope) {
+		return Binding{}, false, fmt.Errorf("%w: record %s has unsupported scope %q", ErrTransition, rec.ID(), b.Scope)
 	}
-	if b.Scope == types.ScopeGlobal {
-		b.Repo, b.TaskID, b.Branch, b.Commit = "", "", "", ""
-		b.Paths = nil
+	addScopeGates(&b, b.Scope, snap.Current)
+	if extraScope != "" {
+		addScopeGates(&b, extraScope, snap.Current)
 	}
+	canonicalizeBindingScope(&b)
 	captureEpochs(&b, snap)
 	return b, true, nil
 }
@@ -700,7 +770,11 @@ func pageStatus(snap Snapshot, id string, refs []string, scope types.Scope, bran
 	}
 	if direct != nil {
 		if !pageDescriptorMatchesBinding(*direct, scope, branch, commit, paths, sourceDigest, epoch) {
-			return StatusStale, nextStaleRevision(direct.StaleRevision)
+			revision := direct.StaleRevision
+			if revision == 0 {
+				revision = 1
+			}
+			return StatusStale, revision
 		}
 		return StatusActive, 0
 	}
@@ -711,13 +785,26 @@ func pageStatus(snap Snapshot, id string, refs []string, scope types.Scope, bran
 }
 
 func bindingEligible(b Binding, snap Snapshot) bool {
+	return bindingEligibleStack(b, snap, map[string]bool{})
+}
+
+func bindingEligibleStack(b Binding, snap Snapshot, stack map[string]bool) bool {
+	key := bindingKey(b.Kind, b.ID)
+	if stack[key] {
+		return false
+	}
+	stack[key] = true
+	defer delete(stack, key)
 	if b.Status != StatusActive {
 		return false
 	}
-	if b.Scope != types.ScopeGlobal && b.Repo != snap.Current.Repo {
+	if b.Kind == ledger.TargetPage && len(b.Refs) == 0 {
 		return false
 	}
-	if (b.Scope == types.ScopeTask || b.Scope == types.ScopeFile) && b.TaskID != snap.Current.TaskID {
+	if b.RequireRepo && b.Repo != snap.Current.Repo {
+		return false
+	}
+	if b.RequireTask && b.TaskID != snap.Current.TaskID {
 		return false
 	}
 	if branchScoped(b) && !bindingMatchesCurrent(b, snap) {
@@ -732,6 +819,23 @@ func bindingEligible(b Binding, snap Snapshot) bool {
 		if b.PathEpochs[p] != snap.PathEpochs[key] {
 			return false
 		}
+		if terminal := terminalPathOverlap(snap, b.Repo, b.Branch, p); terminal != "" {
+			return false
+		}
+	}
+	for _, ref := range b.Refs {
+		found := false
+		for _, kind := range []ledger.MemoryTargetKind{ledger.TargetRecord, ledger.TargetEvent, ledger.TargetPage} {
+			if dependency, ok := snap.Bindings[bindingKey(kind, ref)]; ok {
+				found = true
+				if !bindingEligibleStack(dependency, snap, stack) {
+					return false
+				}
+			}
+		}
+		if !found {
+			return false
+		}
 	}
 	return true
 }
@@ -743,17 +847,103 @@ func bindingMatchesCurrent(b Binding, snap Snapshot) bool {
 	if b.BranchEpoch != 0 && b.BranchEpoch != snap.BranchEpochs[branchKey(b.Repo, b.Branch)] {
 		return false
 	}
-	if b.Commit != "" && b.Commit != snap.Current.Commit {
+	if b.RequireCommit && b.Commit != snap.Current.Commit {
 		return false
 	}
-	if b.CommitEpoch != 0 && b.CommitEpoch != snap.CommitEpochs[commitKey(b.Repo, b.Branch, b.Commit)] {
+	if b.RequireCommit && b.CommitEpoch != 0 && b.CommitEpoch != snap.CommitEpochs[commitKey(b.Repo, b.Branch, b.Commit)] {
 		return false
 	}
 	return true
 }
 
 func branchScoped(b Binding) bool {
-	return b.Scope == types.ScopeBranch || b.Scope == types.ScopeFile
+	return b.RequireBranch
+}
+
+func validScope(scope types.Scope) bool {
+	switch scope {
+	case types.ScopeGlobal, types.ScopeRepo, types.ScopeBranch, types.ScopeTask, types.ScopeFile:
+		return true
+	default:
+		return false
+	}
+}
+
+func addScopeGates(b *Binding, scope types.Scope, current Scope) {
+	if b == nil {
+		return
+	}
+	if scope != types.ScopeGlobal {
+		b.RequireRepo = true
+		if b.Repo == "" {
+			b.Repo = current.Repo
+		}
+	}
+	switch scope {
+	case types.ScopeTask:
+		b.RequireTask = true
+	case types.ScopeBranch:
+		b.RequireBranch = true
+	case types.ScopeFile:
+		b.RequireTask, b.RequireBranch, b.RequireCommit = true, true, true
+	}
+	if b.RequireTask && b.TaskID == "" {
+		b.TaskID = current.TaskID
+	}
+	if b.RequireBranch && b.Branch == "" {
+		b.Branch = current.Branch
+	}
+	if b.RequireCommit && b.Commit == "" {
+		b.Commit = current.Commit
+	}
+}
+
+func canonicalizeBindingScope(b *Binding) {
+	if b == nil {
+		return
+	}
+	if !b.RequireRepo {
+		b.Repo = ""
+	}
+	if !b.RequireTask {
+		b.TaskID = ""
+	}
+	if !b.RequireBranch {
+		b.Branch = ""
+	}
+	if !b.RequireCommit {
+		b.Commit = ""
+	}
+	if trueGlobalBinding(*b) {
+		b.Repo, b.TaskID, b.Branch, b.Commit = "", "", "", ""
+		b.Paths = nil
+	}
+}
+
+func trueGlobalBinding(b Binding) bool {
+	return b.Scope == types.ScopeGlobal && !b.RequireRepo && !b.RequireTask && !b.RequireBranch && !b.RequireCommit
+}
+
+var logicalRefRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,127}$`)
+
+func parseLogicalRefs(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	seen := map[string]bool{}
+	var refs []string
+	for _, field := range strings.Fields(value) {
+		ref := strings.Trim(field, ",")
+		if !logicalRefRE.MatchString(ref) {
+			return nil, fmt.Errorf("invalid logical address %q", field)
+		}
+		if !seen[ref] {
+			seen[ref] = true
+			refs = append(refs, ref)
+		}
+	}
+	return refs, nil
 }
 
 // Generation is the scalar scope generation captured by a materialized page.
@@ -764,7 +954,7 @@ func (b Binding) Generation() uint64 {
 	if branchScoped(b) {
 		generation = maxEpoch(generation, b.BranchEpoch)
 	}
-	if b.Commit != "" {
+	if b.RequireCommit {
 		generation = maxEpoch(generation, b.CommitEpoch)
 	}
 	for _, epoch := range b.PathEpochs {
@@ -791,7 +981,7 @@ func pageDescriptorMatchesBinding(b Binding, scope types.Scope, branch, commit s
 	if branchScoped(b) && branch != b.Branch {
 		return false
 	}
-	if b.Commit != "" && commit != b.Commit {
+	if b.RequireCommit && commit != b.Commit {
 		return false
 	}
 	return true
@@ -809,6 +999,9 @@ func pageDescriptorMatchesCurrent(snap Snapshot, scope types.Scope, branch, comm
 	}
 	for _, p := range paths {
 		if ps, ok := snap.Paths[pathKey(snap.Current.Repo, snap.Current.Branch, p)]; ok && ps.Status != StatusActive {
+			return false
+		}
+		if terminalPathOverlap(snap, snap.Current.Repo, snap.Current.Branch, p) != "" {
 			return false
 		}
 	}
@@ -845,6 +1038,15 @@ func eligibleEvidence(snap Snapshot, id string) bool {
 	return false
 }
 
+func bindingByLogicalID(snap Snapshot, id string) (Binding, bool) {
+	for _, kind := range []ledger.MemoryTargetKind{ledger.TargetRecord, ledger.TargetEvent, ledger.TargetPage} {
+		if binding, ok := snap.Bindings[bindingKey(kind, id)]; ok {
+			return binding, true
+		}
+	}
+	return Binding{}, false
+}
+
 func markMatchingStale(snap *Snapshot, match func(Binding) bool) {
 	for key, b := range snap.Bindings {
 		if b.Status == StatusActive && match(b) {
@@ -855,14 +1057,18 @@ func markMatchingStale(snap *Snapshot, match func(Binding) bool) {
 	}
 }
 
-func markMatchingInvalidated(snap *Snapshot, reason ledger.InvalidationReason, match func(Binding) bool) {
+func markMatchingInvalidated(snap *Snapshot, reason ledger.InvalidationReason, match func(Binding) bool) []string {
+	var invalidated []string
 	for key, b := range snap.Bindings {
 		if b.Status != StatusInvalidated && match(b) {
 			b.Status, b.InvalidReason = StatusInvalidated, reason
 			b.StaleRevision = nextStaleRevision(b.StaleRevision)
 			snap.Bindings[key] = b
+			invalidated = append(invalidated, b.ID)
 		}
 	}
+	sort.Strings(invalidated)
+	return invalidated
 }
 
 func cascadeInvalidation(snap *Snapshot, target string, reason ledger.InvalidationReason) {
@@ -934,8 +1140,8 @@ func bumpPathEpoch(snap *Snapshot, repo, branch, p string) uint64 {
 
 func nextScopeEpoch(snap *Snapshot) uint64 {
 	if snap.EpochClock == ^uint64(0) {
-		// Exhaustion is practically unreachable, but retaining the terminal value
-		// fails closed through stale status instead of wrapping to an old token.
+		// Keep the terminal value rather than wrapping to an old token. A session
+		// cannot realistically approach this limit and should be rotated if it does.
 		return snap.EpochClock
 	}
 	snap.EpochClock++
@@ -990,6 +1196,19 @@ func pathWithin(candidate, root string) bool {
 
 func pathsOverlap(left, right string) bool {
 	return pathWithin(left, right) || pathWithin(right, left)
+}
+
+func terminalPathOverlap(snap Snapshot, repo, branch, candidate string) string {
+	var terminal string
+	for _, pathState := range snap.Paths {
+		if pathState.Repo != repo || pathState.Branch != branch || pathState.Status != StatusInvalidated || !pathsOverlap(candidate, pathState.Path) {
+			continue
+		}
+		if terminal == "" || pathState.Path < terminal {
+			terminal = pathState.Path
+		}
+	}
+	return terminal
 }
 
 func bindingKey(kind ledger.MemoryTargetKind, id string) string {
