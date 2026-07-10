@@ -910,11 +910,15 @@ automatic prefetch disabled.
 
 ### L3-0 - Evaluation corpus and exact oracle
 
-- Freeze representative ledger fixtures and semantic queries.
-- Label exact page/evidence targets and no-answer cases.
-- Implement the page schema, deterministic compiler, and brute-force cosine
-  reference backend.
-- Establish no-L3 and FTS-only baselines before choosing weights.
+**Status:** complete (Phase 7A).
+
+- Frozen stream and labeled queries:
+  `testdata/pages/corpus/transport_fix/`.
+- Page schema, `DeterministicCompiler`, and
+  `ExactCosineSearch` / `ExactCosineSearchContext` live in `internal/pages`.
+- Materialization gate: `ValidateMaterializable` (session, epoch, authority,
+  source digest).
+- No-L3 baseline remains the direct-ID demo. FTS-only baseline starts in L3-1.
 
 ### L3-1 - Interfaces and lexical path
 

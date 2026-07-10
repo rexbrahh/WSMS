@@ -617,32 +617,42 @@ the direct-ID demo and no-L3 runtime operational.
 
 #### Phase 7A - Frozen semantic corpus and page compiler
 
+**Status:** implemented and verified. Offline `internal/pages` compiler plus
+frozen corpus; not wired into `Scheduler.AfterEvent` (no WarmIndex yet).
+
 **Objective:** establish the unit of retrieval and a correctness oracle before
 selecting a production vector implementation.
 
 Implementation:
 
-1. Define the `WarmPage`, `PageRef`, page mutation, source digest, compiler
-   version, trust/status, scope epoch, and controlled page-kind types under a
-   new `internal/pages` boundary.
-2. Compile only evidence-backed failure episodes, decisions, constraints, task
-   checkpoints, known-good commands, repo facts, and file context.
-3. Produce 100-400-token, single-topic canonical search text plus exact refs;
-   keep raw artifacts in L4.
-4. Freeze representative ledger streams and hand-label semantic queries,
-   including wrong-branch, invalidated, poisoned, and true-no-answer cases.
-5. Implement an exact brute-force cosine search oracle for tiny fixtures. It is
-   evaluation/test mechanism, not production scale.
+1. `internal/pages` defines `WarmPage`, `PageRef`, `PageMutation`, source
+   digests, compiler version, trust/status, scope epoch, and controlled kinds.
+2. `DeterministicCompiler` emits evidence-backed `failure_episode`, `decision`,
+   `constraint`, `task_checkpoint`, `known_good_command`, `repo_fact`, and
+   `file_context` mutations from one durable event + post-event WSL view.
+3. Canonical search text is token/byte-bounded; raw artifact bodies stay in L4
+   and are verified via streaming `artifacts.Store.VerifyArtifact`.
+4. Frozen stream and labels live under
+   `testdata/pages/corpus/transport_fix/` (`expected_pages.json`,
+   `queries.json`) with positive, wrong-branch, invalidated, poisoned, and
+   true-no-answer queries.
+5. `ExactCosineSearch` / `ExactCosineSearchContext` is the tiny-fixture exact
+   oracle (cancel-aware, dimension-bounded). Evaluation-only, not production ANN.
+6. `ValidateMaterializable` is the post-candidate gate: session, epoch,
+   authority, and source digest must still match before L2 admission.
 
 Verification/gates:
 
-- Deterministic replay produces identical page IDs, versions, search text,
-  refs, and source digests.
-- Every page materializes its current exact evidence or is rejected.
-- Page compiler fuzz/property tests cannot create a hard fact from untrusted
-  model/tool prose.
-- The corpus has explicit labels for abstention and negative transfer, not only
-  positive similarity examples.
+- [x] Same ledger change recompiles to identical page IDs, versions, search
+      text, refs, and source digests (including after close/reopen).
+- [x] Independent sessions match structural identity (IDs/text/refs); digests
+      differ only by durable event timestamps.
+- [x] Every compiled active page passes `ValidateMaterializable`; stale,
+      cross-session, wrong-epoch, and digest mismatch pages fail closed.
+- [x] Assistant/untrusted prose cannot mint constraint or other hard pages.
+- [x] Corpus labels cover positive, abstention, poisoned, wrong-branch, and
+      invalidated cases.
+- [x] Direct-ID `wsms demo` remains vector-free and does not depend on pages.
 
 #### Phase 7B - Separate FTS5 warm index
 
