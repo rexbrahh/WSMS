@@ -73,8 +73,10 @@ go run ./cmd/wsms demo --data-dir /tmp/wsms-demo-inspect
 ```
 
 The command never removes an explicitly supplied directory or unrelated files
-inside it. It refuses to reuse its fixed demo sessions if they already contain
-events, preventing an old run from being mistaken for fresh evidence.
+inside it. For safety it refuses the reserved paths `ledger.db`,
+`ledger.db-journal`, `ledger.db-wal`, `ledger.db-shm`, or `artifacts` when any
+already exists, so use a fresh directory for each persistent run. This prevents
+old or unrelated storage from being mutated or mistaken for fresh evidence.
 
 ## Smoke path
 

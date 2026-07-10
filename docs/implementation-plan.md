@@ -184,7 +184,7 @@ Documentation references:
 - [x] Focused harness reopen tests pass.
 - [x] Existing ledger/harness tests still pass.
 - [x] `go test -race ./internal/ledger ./internal/harness` passes.
-- [ ] Phase 2B closes receiver isolation, append ordering, and decode failures.
+- [x] Phase 2B closes receiver isolation, append ordering, and decode failures.
 
 ## 5. Phase 2 - WSL correctness hardening
 
@@ -330,11 +330,11 @@ Documentation references:
 
 ### Verification checklist
 
-- [ ] Focused ledger ordering/isolation/decode tests pass under `-race`.
-- [ ] Focused WSL atomic/provenance and scheduler tests pass under `-race`.
-- [ ] Focused artifact/fault tests pass under `-race`.
-- [ ] Existing Phase 1/2 tests remain green.
-- [ ] Independent verification and anti-pattern review report no P0/P1 finding.
+- [x] Focused ledger ordering/isolation/decode tests pass under `-race`.
+- [x] Focused WSL atomic/provenance and scheduler tests pass under `-race`.
+- [x] Focused artifact/fault tests pass under `-race`.
+- [x] Existing Phase 1/2 tests remain green.
+- [x] Independent verification and anti-pattern review report no P0/P1 finding.
 
 ## 5C. Phase 2C - Unix VM integrity review fixes
 
@@ -443,9 +443,9 @@ Documentation references:
 
 ### Verification checklist
 
-- [ ] Observer unit tests pass.
-- [ ] Harness live/replay tests include task, avoid, and next state.
-- [ ] Existing constraint/tool-digest behavior remains unchanged.
+- [x] Observer unit tests pass.
+- [x] Harness live/replay tests include task, avoid, and next state.
+- [x] Existing constraint/tool-digest behavior remains unchanged.
 
 ## 7. Phase 4 - One-command vertical-slice demo
 
@@ -490,7 +490,7 @@ BACKING STORE: EVENT ... user_instruction -> C1 hard
 BACKING STORE: EVENT ... command_output exit=1 -> F1
 BACKING STORE: ARTIFACT sha256:...
 RESIDENT WORKING SET: CAPSULE ...
-=== RUNTIME MEMORY DROPPED / PROCESS REOPEN ===
+=== SESSION RUNTIME CLOSED / MEMORY DROPPED / REOPENED ===
 PAGE TABLE: DERIVED MAPPINGS RECONSTRUCTED
 PAGE FAULT F1: PAGE-IN HIT
 BACKING STORE F1: SHA256 VERIFIED
@@ -511,10 +511,10 @@ Exact wording may differ; semantic markers and exit behavior are tested.
 
 ### Verification checklist
 
-- [ ] Demo end-to-end test passes with a temporary directory.
-- [ ] Live `go run ./cmd/wsms demo` exits 0 and prints all evidence markers.
-- [ ] A forced bad invariant causes nonzero exit and no success marker.
-- [ ] README and Makefile commands reproduce the tested path.
+- [x] Demo end-to-end test passes with a temporary directory.
+- [x] Live `go run ./cmd/wsms demo` exits 0 and prints all evidence markers.
+- [x] A forced bad invariant causes nonzero exit and no success marker.
+- [x] README and Makefile commands reproduce the tested path.
 
 ## 8. Phase 5 - Independent verification and quality review
 

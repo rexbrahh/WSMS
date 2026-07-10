@@ -14,6 +14,7 @@ import (
 
 	"wsms/internal/artifacts"
 	"wsms/internal/config"
+	wsmserrors "wsms/internal/errors"
 	"wsms/internal/faults"
 	"wsms/internal/harness"
 	"wsms/internal/ledger"
@@ -34,6 +35,8 @@ const (
 	demoAvoid      = "retrying the failed transport rewrite"
 	demoTarget     = "src/runtime/stream.go:118-176"
 	rawSentinel    = "RAW-EVIDENCE-AFTER-PREVIEW"
+	loopUser       = "Continue with the selected in-place cancellation fix."
+	loopReply      = "continue: inspect the cancellation waiter without rewriting transport"
 )
 
 // Options controls where the demo writes its durable ledger and artifacts.
@@ -60,6 +63,11 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 		return err
 	}
 	cleanupDir := temporary
+	if !temporary {
+		if err := requireReservedPathsAvailable(dataDir); err != nil {
+			return err
+		}
+	}
 	var primary, secondary *harness.Session
 	defer func() {
 		if secondary != nil {
@@ -87,6 +95,14 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 		return fmt.Errorf("open primary session: %w", err)
 	}
 	if err := requireEmptySession(ctx, primary); err != nil {
+		return err
+	}
+	secondaryCfg := demoConfig(dataDir, secondarySessionID)
+	secondary, err = harness.OpenSession(secondaryCfg)
+	if err != nil {
+		return fmt.Errorf("open secondary session: %w", err)
+	}
+	if err := requireEmptySession(ctx, secondary); err != nil {
 		return err
 	}
 
@@ -134,10 +150,7 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 		return err
 	}
 
-	rawOutput := demoFailure + "\n" +
-		"src/runtime/stream.go:118: cancellation waiter did not exit\n" +
-		strings.Repeat("diagnostic context retained in durable backing storage ", 32) +
-		"\n" + rawSentinel
+	rawOutput := demoRawOutput()
 	failureEvent, err := primary.Append(ctx, ledger.Event{
 		Type: ledger.EventCommandOutput,
 		Payload: map[string]any{
@@ -244,6 +257,9 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 	if err := requireCapsule(beforeCapsule); err != nil {
 		return err
 	}
+	if tokens := renderer.EstimateTokens(beforeCapsule); tokens > cfg.CapsuleTokenBudget {
+		return fmt.Errorf("resident capsule exceeds budget: estimated=%d budget=%d", tokens, cfg.CapsuleTokenBudget)
+	}
 	if err := reportf(out, "RESIDENT WORKING SET: CAPSULE BEFORE REOPEN (%d estimated tokens)\n%s", renderer.EstimateTokens(beforeCapsule), beforeCapsule); err != nil {
 		return err
 	}
@@ -259,7 +275,7 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 		return fmt.Errorf("close primary session before runtime reset: %w", err)
 	}
 	primary = nil
-	if err := reportf(out, "=== RUNTIME MEMORY DROPPED / PROCESS REOPEN ===\n"); err != nil {
+	if err := reportf(out, "=== SESSION RUNTIME CLOSED / MEMORY DROPPED / REOPENED ===\n"); err != nil {
 		return err
 	}
 
@@ -304,7 +320,7 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("page-in F1: %w", err)
 	}
-	if page == faults.PageMiss || !strings.Contains(page, demoCommand) || !strings.Contains(page, demoFailure) {
+	if page == faults.PageMiss || !strings.Contains(page, demoCommand) || !strings.Contains(page, "Exit: 1") || !strings.Contains(page, demoFailure) {
 		return fmt.Errorf("structured F1 page mismatch: %q", page)
 	}
 	if err := reportf(out, "PAGE FAULT F1: PAGE-IN HIT (structured command/exit/error verified)\n"); err != nil {
@@ -329,14 +345,6 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 		return err
 	}
 
-	secondaryCfg := demoConfig(dataDir, secondarySessionID)
-	secondary, err = harness.OpenSession(secondaryCfg)
-	if err != nil {
-		return fmt.Errorf("open secondary session: %w", err)
-	}
-	if err := requireEmptySession(ctx, secondary); err != nil {
-		return err
-	}
 	secondaryEvent, err := secondary.Append(ctx, ledger.Event{
 		Type: ledger.EventTaskStarted,
 		Payload: map[string]any{
@@ -350,6 +358,9 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 	}
 	if secondaryEvent.ID != "E0001" {
 		return fmt.Errorf("secondary first event=%s, want independent E0001", secondaryEvent.ID)
+	}
+	if err := requireProvenance(secondary.State, map[string]string{"T1": secondaryEvent.ID}); err != nil {
+		return fmt.Errorf("secondary task provenance: %w", err)
 	}
 	primaryE1, err := primary.Ledger.Get(ctx, "E0001")
 	if err != nil {
@@ -365,12 +376,33 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 	if _, err := primary.Ledger.ListBySession(ctx, secondarySessionID); err == nil {
 		return errors.New("primary ledger listed the secondary session")
 	}
+	if _, err := secondary.Ledger.ListBySession(ctx, primarySessionID); err == nil {
+		return errors.New("secondary ledger listed the primary session")
+	}
+	if _, err := secondary.Ledger.Get(ctx, "E0005"); !errors.Is(err, wsmserrors.ErrNotFound) {
+		return fmt.Errorf("secondary lookup of primary-only E0005 error=%v, want not found", err)
+	}
 	if _, err := primary.Append(ctx, ledger.Event{
 		Type:      ledger.EventAssistantMessage,
 		SessionID: secondarySessionID,
 		Payload:   map[string]any{"text": "must be rejected as a foreign append"},
 	}); err == nil {
 		return errors.New("primary session accepted a foreign-session append")
+	}
+	if _, err := secondary.Append(ctx, ledger.Event{
+		Type:      ledger.EventAssistantMessage,
+		SessionID: primarySessionID,
+		Payload:   map[string]any{"text": "must be rejected in the reverse direction"},
+	}); err == nil {
+		return errors.New("secondary session accepted a foreign-session append")
+	}
+	primaryIsolationEvents, err := primary.Ledger.ListBySession(ctx, primarySessionID)
+	if err != nil || len(primaryIsolationEvents) != 5 {
+		return fmt.Errorf("primary event count changed during isolation probes: count=%d err=%v", len(primaryIsolationEvents), err)
+	}
+	secondaryIsolationEvents, err := secondary.Ledger.ListBySession(ctx, secondarySessionID)
+	if err != nil || len(secondaryIsolationEvents) != 1 {
+		return fmt.Errorf("secondary event count changed during isolation probes: count=%d err=%v", len(secondaryIsolationEvents), err)
 	}
 	if got := primary.State.ActiveTask(); got == nil || got.Goal != demoGoal {
 		return fmt.Errorf("secondary state contaminated primary task: %#v", got)
@@ -382,17 +414,28 @@ func Run(ctx context.Context, out io.Writer, opts Options) (retErr error) {
 		return err
 	}
 
-	client := &verifyingClient{required: []string{demoGoalRender, demoConstraint, demoCommand, demoFailure, demoAvoid, demoTarget, renderer.PageFaultInstruction}}
+	client := &verifyingClient{
+		required:     []string{demoGoalRender, demoConstraint, demoCommand, demoFailure, demoAvoid, demoTarget, renderer.PageFaultInstruction},
+		expectedUser: loopUser,
+	}
 	loop := &harness.Loop{Session: primary, Client: client}
-	assistant, loopCapsule, err := loop.Turn(ctx, "Continue with the selected in-place cancellation fix.")
+	assistant, loopCapsule, err := loop.Turn(ctx, loopUser)
 	if err != nil {
 		return fmt.Errorf("foreground client turn: %w", err)
 	}
-	if !client.called || loopCapsule != afterCapsule || client.capsule != afterCapsule {
+	if client.calls != 1 || loopCapsule != afterCapsule || client.capsule != afterCapsule {
 		return errors.New("foreground client did not receive the reconstructed capsule through harness.Loop")
 	}
-	if assistant != "continue: inspect the cancellation waiter without rewriting transport" {
+	if assistant != loopReply {
 		return fmt.Errorf("unexpected deterministic client response %q", assistant)
+	}
+	turnEvents, err := primary.Ledger.ListBySession(ctx, primarySessionID)
+	if err != nil {
+		return fmt.Errorf("list primary events after foreground turn: %w", err)
+	}
+	if len(turnEvents) != 7 || turnEvents[5].ID != "E0006" || turnEvents[5].Type != ledger.EventUserInstruction || turnEvents[5].PayloadString("text") != loopUser ||
+		turnEvents[6].ID != "E0007" || turnEvents[6].Type != ledger.EventAssistantMessage || turnEvents[6].PayloadString("text") != loopReply {
+		return fmt.Errorf("foreground turn was not durably recorded as E0006/E0007: %#v", turnEvents)
 	}
 	if err := reportf(out, "CLIENT: CAPSULE RECEIVED through harness.Loop\n"); err != nil {
 		return err
@@ -447,6 +490,25 @@ func prepareDataDir(requested string) (path string, temporary bool, err error) {
 	return path, false, nil
 }
 
+func requireReservedPathsAvailable(dataDir string) error {
+	for _, name := range []string{"ledger.db", "ledger.db-journal", "ledger.db-wal", "ledger.db-shm", "artifacts"} {
+		path := filepath.Join(dataDir, name)
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("reserved demo path already exists: %s; choose a fresh --data-dir", path)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect reserved demo path %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func demoRawOutput() string {
+	return demoFailure + "\n" +
+		"src/runtime/stream.go:118: cancellation waiter did not exit\n" +
+		strings.Repeat("diagnostic context retained in durable backing storage ", 32) +
+		"\n" + rawSentinel
+}
+
 func requireEmptySession(ctx context.Context, session *harness.Session) error {
 	events, err := session.Ledger.ListBySession(ctx, session.Cfg.SessionID)
 	if err != nil {
@@ -470,6 +532,10 @@ func requireEvidence(state *wsl.WorkingState, recordID, wantEventID string) erro
 }
 
 func requireProvenance(state *wsl.WorkingState, expected map[string]string) error {
+	got := state.Provenance()
+	if !reflect.DeepEqual(got, expected) {
+		return fmt.Errorf("page-table provenance mismatch: got=%v want=%v", got, expected)
+	}
 	for recordID, eventID := range expected {
 		if err := requireEvidence(state, recordID, eventID); err != nil {
 			return err
@@ -496,16 +562,22 @@ func requireCapsule(capsule string) error {
 }
 
 func reportf(out io.Writer, format string, args ...any) error {
-	if _, err := fmt.Fprintf(out, format, args...); err != nil {
+	message := fmt.Sprintf(format, args...)
+	n, err := io.WriteString(out, message)
+	if err != nil {
 		return fmt.Errorf("write demo evidence: %w", err)
+	}
+	if n != len(message) {
+		return fmt.Errorf("write demo evidence: %w", io.ErrShortWrite)
 	}
 	return nil
 }
 
 type verifyingClient struct {
-	required []string
-	called   bool
-	capsule  string
+	required     []string
+	expectedUser string
+	calls        int
+	capsule      string
 }
 
 func (c *verifyingClient) Chat(ctx context.Context, messages []harness.Message) (string, error) {
@@ -515,12 +587,18 @@ func (c *verifyingClient) Chat(ctx context.Context, messages []harness.Message) 
 	if len(messages) != 2 || messages[0].Role != "system" || messages[1].Role != "user" {
 		return "", fmt.Errorf("unexpected foreground message envelope: %#v", messages)
 	}
+	if c.calls != 0 {
+		return "", errors.New("deterministic client called more than once")
+	}
+	if messages[1].Content != c.expectedUser {
+		return "", fmt.Errorf("unexpected foreground user message %q", messages[1].Content)
+	}
 	for _, text := range c.required {
 		if !strings.Contains(messages[0].Content, text) {
 			return "", fmt.Errorf("client capsule missing %q", text)
 		}
 	}
-	c.called = true
+	c.calls++
 	c.capsule = messages[0].Content
-	return "continue: inspect the cancellation waiter without rewriting transport", nil
+	return loopReply, nil
 }

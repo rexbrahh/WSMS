@@ -554,13 +554,21 @@ imports, if added later, require a separate validated interface.
 |---|---|---|
 | `task_started` | `goal` | `task_id`, `phase`, `priority`, `branch`, `dirty` |
 | `user_instruction` | `text` | scope metadata |
+| `human_correction` | `text` | scope metadata |
 | `command_output` | `cmd`, `exit`, `output` | `err`, `file_hint`, `raw` |
+| `test_result`, `tool_result` | `cmd` or `command`, `exit`, `output` | `err`, `file_hint`, `raw` |
 | `decision` | `chosen` | `because`, `refs`, `scope`, `avoid_text`, `avoid_ref` |
 | `next_action` | `action`, `target` | `question` |
 | `assistant_message` | `text` | none |
 
 Unknown payload fields must be ignored unless a versioned event schema later
 declares them invalid.
+
+An omitted task priority defaults to `hot`; an omitted decision scope defaults
+to `task`. Each `task_started` event receives a generated `T*` address, and the
+most recently started task is active. An `avoid_ref` must resolve in the state
+that existed before its decision batch; a record may not manufacture its own
+grounding by referring to an address created in that same batch.
 
 Known event types and their required fields are validated before durable append.
 Replay validates persisted envelopes again and reports the event ID on failure.
@@ -599,29 +607,29 @@ and query expressions must not cross the Go `WarmIndex` boundary.
 The demo is complete only when all of these are proven by current executable
 evidence:
 
-- [ ] `go run ./cmd/wsms demo` exits 0.
-- [ ] Output shows an appended event stream and generated record IDs.
-- [ ] Output labels the durable backing store and resident working set rather
+- [x] `go run ./cmd/wsms demo` exits 0.
+- [x] Output shows an appended event stream and generated record IDs.
+- [x] Output labels the durable backing store and resident working set rather
       than presenting the capsule as the entire memory system.
-- [ ] The capsule includes an active task, hard constraint, exact failed
+- [x] The capsule includes an active task, hard constraint, exact failed
       command/error, avoidance, next action, and page-fault instruction.
-- [ ] The demo closes and reopens the same session before its final capsule.
-- [ ] The reopened capsule retains the same critical evidence.
-- [ ] `ReadPage(F...)` returns structured failure detail.
-- [ ] The page-fault stage identifies the faulted ID and successful page-in.
-- [ ] `ReadRawLog(F...)` returns the full offloaded log, including a sentinel
+- [x] The demo closes and reopens the same session before its final capsule.
+- [x] The reopened capsule retains the same critical evidence.
+- [x] `ReadPage(F...)` returns structured failure detail.
+- [x] The page-fault stage identifies the faulted ID and successful page-in.
+- [x] `ReadRawLog(F...)` returns the full offloaded log, including a sentinel
       placed beyond the ledger preview.
-- [ ] The artifact ref is syntactically valid and the recovered bytes pass an
+- [x] The artifact ref is syntactically valid and the recovered bytes pass an
       independently recomputed SHA-256 check.
-- [ ] Every demo-derived task/constraint/failure/decision/avoid/next record can
+- [x] Every demo-derived task/constraint/failure/decision/avoid/next record can
       report the ledger event from which it was derived.
-- [ ] A deterministic local client receives the capsule through
+- [x] A deterministic local client receives the capsule through
       `harness.Loop` and returns a continuation response.
-- [ ] A second session can use the same ledger database without event-ID
+- [x] A second session can use the same ledger database without event-ID
       collision or cross-session append/get/list access.
-- [ ] `go test ./...`, `go test -race ./...`, `go vet ./...`, and a production
+- [x] `go test ./...`, `go test -race ./...`, `go vet ./...`, and a production
       CLI build pass.
-- [ ] The documented one-command demo matches current output semantics.
+- [x] The documented one-command demo matches current output semantics.
 
 ## 12. Evaluation specification
 

@@ -313,8 +313,11 @@ sequenceDiagram
 ```
 
 A **model context reset** discards the transcript but may leave the process
-running. A **runtime restart** discards in-memory WSL and L0-L3. The demo must
-exercise the stronger runtime-restart case.
+running. A **runtime-state restart** closes the session resources and discards
+in-memory WSL and L0-L3 before a new composition root replays only durable
+state. This does not require launching a second OS process; the proof boundary
+is that no original runtime object survives. The demo exercises this stronger
+state-reconstruction case rather than a capsule-only or transcript-only reset.
 
 ## 9. Page-fault flow
 
