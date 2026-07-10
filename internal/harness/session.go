@@ -13,9 +13,12 @@ import (
 	"wsms/internal/coherence"
 	"wsms/internal/config"
 	"wsms/internal/faults"
+	"wsms/internal/indexer"
 	"wsms/internal/ledger"
 	"wsms/internal/memory"
 	"wsms/internal/observers"
+	"wsms/internal/pages"
+	"wsms/internal/retrieval"
 	"wsms/internal/scheduler"
 	"wsms/internal/types"
 	"wsms/internal/wsl"
@@ -121,15 +124,19 @@ type Session struct {
 	closeErr    error
 	closed      bool
 	failStopErr error
-	Cfg         config.Config
-	Ledger      *ledger.AppendOnlyLedger
-	Artifacts   *artifacts.Store
-	State       *wsl.WorkingState
-	Coherence   *coherence.State
-	Hierarchy   *memory.Hierarchy
-	Dispatcher  *observers.Dispatcher
-	Scheduler   *scheduler.Scheduler
-	Tools       *faults.Tools
+	// IndexErr is the last non-fatal warm-index error (indexing never fails L4).
+	IndexErr   error
+	Cfg        config.Config
+	Ledger     *ledger.AppendOnlyLedger
+	Artifacts  *artifacts.Store
+	State      *wsl.WorkingState
+	Coherence  *coherence.State
+	Hierarchy  *memory.Hierarchy
+	Dispatcher *observers.Dispatcher
+	Scheduler  *scheduler.Scheduler
+	Tools      *faults.Tools
+	// Index is the disposable L3 warm index. Nil when unavailable.
+	Index *indexer.Index
 }
 
 // OpenSession creates a session under cfg.DataDir.
@@ -178,6 +185,12 @@ func OpenSession(cfg config.Config) (*Session, error) {
 		Scheduler:  sched,
 		Tools:      faults.NewTools(res, sched.PageFault),
 	}
+	// Warm index is disposable and optional. Open failures leave Index nil.
+	if warm, err := indexer.Open(filepath.Join(cfg.DataDir, "index")); err == nil {
+		s.Index = warm
+	} else {
+		s.IndexErr = err
+	}
 	if err := s.replay(context.Background()); err != nil {
 		return nil, errors.Join(err, s.Close())
 	}
@@ -194,6 +207,7 @@ func (s *Session) replay(ctx context.Context) error {
 		if err := s.Scheduler.AfterEvent(ctx, ev); err != nil {
 			return err
 		}
+		s.indexAfterEvent(ctx, ev)
 	}
 	return nil
 }
@@ -204,7 +218,12 @@ func (s *Session) Close() error {
 		s.appendMu.Lock()
 		defer s.appendMu.Unlock()
 		s.closed = true
-		s.closeErr = errors.Join(s.Ledger.Close(), s.Artifacts.Close())
+		var indexErr error
+		if s.Index != nil {
+			indexErr = s.Index.Close()
+			s.Index = nil
+		}
+		s.closeErr = errors.Join(s.Ledger.Close(), s.Artifacts.Close(), indexErr)
 	})
 	return s.closeErr
 }
@@ -259,7 +278,94 @@ func (s *Session) Append(ctx context.Context, ev ledger.Event) (ledger.Event, er
 		)
 		return stored, s.failStopErr
 	}
+	// Best-effort L3 indexing: never fail the durable append path.
+	s.indexAfterEvent(ctx, stored)
 	return stored, nil
+}
+
+// indexAfterEvent compiles warm pages for one durable event and applies them to
+// the disposable index. Errors are recorded on IndexErr only.
+func (s *Session) indexAfterEvent(ctx context.Context, ev ledger.Event) {
+	if s.Index == nil {
+		return
+	}
+	snap := s.Coherence.Snapshot()
+	change := pages.LedgerChange{
+		Event:     ev,
+		State:     s.State.Clone(),
+		Events:    s.Ledger,
+		Artifacts: s.Artifacts,
+		RepoID:    firstNonEmpty(snap.Current.Repo, ev.Repo),
+		TaskID:    firstNonEmpty(snap.Current.TaskID, ev.TaskID),
+		Branch:    firstNonEmpty(snap.Current.Branch, ev.Branch),
+		Commit:    firstNonEmpty(snap.Current.Commit, ev.Commit),
+	}
+	muts, err := pages.NewDeterministicCompiler().Compile(ctx, change)
+	if err != nil {
+		s.IndexErr = err
+		return
+	}
+	var maxVersion int64
+	for _, mut := range muts {
+		if int64(mut.Page.Version) > maxVersion {
+			maxVersion = int64(mut.Page.Version)
+		}
+	}
+	if maxVersion == 0 {
+		maxVersion = ev.Seq
+	}
+	if err := s.Index.ApplyWithWatermark(ctx, muts, s.Cfg.SessionID, ev.Seq, maxVersion); err != nil {
+		s.IndexErr = err
+	}
+}
+
+// SemanticSearch runs a lexical warm-index query for the current session.
+// Known-ID page faults must continue to use PageFault instead.
+func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Result, error) {
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+	if err := s.operationErrorLocked(); err != nil {
+		return retrieval.Result{}, err
+	}
+	if s.Index == nil {
+		return retrieval.Result{}, retrieval.ErrIndexUnavailable
+	}
+	snap := s.Coherence.Snapshot()
+	ret := &retrieval.LexicalRetriever{
+		Index: s.Index,
+		Recheck: func(_ context.Context, page pages.WarmPage) (bool, string) {
+			if page.Status != pages.StatusActive {
+				return false, "status"
+			}
+			// Reject pages outside the live session authority when they carry
+			// a repo/branch that no longer matches current scope.
+			if page.RepoID != "" && snap.Current.Repo != "" && page.RepoID != snap.Current.Repo {
+				return false, "repo"
+			}
+			if page.Branch != "" && snap.Current.Branch != "" && page.Branch != snap.Current.Branch {
+				return false, "branch"
+			}
+			return true, ""
+		},
+	}
+	return ret.ResolveSemantic(ctx, retrieval.QueryIntent{
+		Mode:      retrieval.ModeSemanticFault,
+		SessionID: s.Cfg.SessionID,
+		RepoID:    snap.Current.Repo,
+		TaskID:    snap.Current.TaskID,
+		Branch:    snap.Current.Branch,
+		Commit:    snap.Current.Commit,
+		UserText:  text,
+	})
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // BeforeTurn returns the L1 capsule.
