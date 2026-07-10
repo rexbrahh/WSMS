@@ -40,7 +40,8 @@ var (
 	ErrClosed = errors.New("warm index closed")
 	// ErrEmptyQuery reports a text query with no searchable tokens.
 	ErrEmptyQuery = errors.New("empty lexical query")
-	// ErrDenseUnavailable is returned until Phase 7C enables dense search.
+	// ErrDenseUnavailable reports dense search when the optional vec0 projection
+	// is not enabled for this index.
 	ErrDenseUnavailable = errors.New("dense search unavailable")
 	// ErrRebuildInProgress reports a concurrent rebuild lock.
 	ErrRebuildInProgress = errors.New("warm index rebuild in progress")
@@ -48,12 +49,20 @@ var (
 	ErrInvalidSchema = errors.New("unsupported warm index schema")
 )
 
+// Options configures optional index capabilities.
+type Options struct {
+	// DenseDimensions enables the sqlite-vec projection when > 0.
+	// Zero leaves dense disabled unless the on-disk index already has dense meta.
+	DenseDimensions int
+}
+
 // Index is a generation of disposable warm-page search state.
 type Index struct {
-	mu   sync.RWMutex
-	dir  string
-	path string
-	db   *sql.DB
+	mu        sync.RWMutex
+	dir       string
+	path      string
+	db        *sql.DB
+	denseDims int
 }
 
 // Health is inspectable index status.
@@ -64,12 +73,20 @@ type Health struct {
 	Generation      int64
 	PageCount       int64
 	Path            string
+	DenseEnabled    bool
+	DenseDimensions int
+	DenseMetric     string
+	VectorCount     int64
 }
 
 // Open opens or creates the warm index under dir (the index/ directory).
-func Open(dir string) (*Index, error) {
+func Open(dir string, opts ...Options) (*Index, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("index dir is required")
+	}
+	var opt Options
+	if len(opts) > 0 {
+		opt = opts[0]
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -85,7 +102,12 @@ func Open(dir string) (*Index, error) {
 		return nil, err
 	}
 	idx := &Index{dir: dir, path: path, db: db}
-	if err := idx.ensureMeta(context.Background()); err != nil {
+	ctx := context.Background()
+	if err := idx.ensureMeta(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := idx.initDense(ctx, opt.DenseDimensions); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -169,7 +191,13 @@ func (idx *Index) Health(ctx context.Context) (Health, error) {
 	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	h := Health{Ready: true, Path: idx.path}
+	h := Health{
+		Ready: true, Path: idx.path,
+		DenseEnabled: idx.denseDims > 0, DenseDimensions: idx.denseDims,
+	}
+	if h.DenseEnabled {
+		h.DenseMetric = denseMetricCosine
+	}
 	_ = idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaSchemaVersion).Scan(&h.SchemaVersion)
 	_ = idx.db.QueryRowContext(ctx, `SELECT value FROM index_meta WHERE key = ?`, metaCompiler).Scan(&h.CompilerVersion)
 	var gen string
@@ -179,12 +207,10 @@ func (idx *Index) Health(ctx context.Context) (Health, error) {
 	if err := idx.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM warm_pages`).Scan(&h.PageCount); err != nil {
 		return Health{}, err
 	}
+	if h.DenseEnabled {
+		_ = idx.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM warm_page_vec_map`).Scan(&h.VectorCount)
+	}
 	return h, nil
-}
-
-// SearchDense is unavailable until Phase 7C.
-func (idx *Index) SearchDense(context.Context, SearchQuery, []float64) ([]Candidate, error) {
-	return nil, ErrDenseUnavailable
 }
 
 func (idx *Index) guard(ctx context.Context) error {

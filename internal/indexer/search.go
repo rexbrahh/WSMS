@@ -123,7 +123,7 @@ WHERE warm_pages_fts MATCH ?
 		if err := contextErr(ctx); err != nil {
 			return nil, err
 		}
-		page, rank, err := scanPage(rows)
+		page, rank, err := scanPageWithRank(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -147,38 +147,55 @@ WHERE warm_pages_fts MATCH ?
 	return out, rows.Err()
 }
 
-func scanPage(rows *sql.Rows) (pages.WarmPage, float64, error) {
+func scanPageWithRank(rows *sql.Rows) (pages.WarmPage, float64, error) {
+	var rank float64
+	page, err := scanPageFromScanner(rankScanner{rows: rows, rank: &rank})
+	return page, rank, err
+}
+
+// rankScanner scans the warm_pages columns plus a trailing bm25 rank.
+type rankScanner struct {
+	rows *sql.Rows
+	rank *float64
+}
+
+func (r rankScanner) Scan(dest ...any) error {
+	args := append(dest, r.rank)
+	return r.rows.Scan(args...)
+}
+
+func scanPageFromScanner(row scannable) (pages.WarmPage, error) {
 	var (
 		pageID, sessionID, repoID, taskID, branch, commitID string
 		pathScopeJSON, scope, kind, trust, status           string
 		salienceReason, searchText, summary, refsJSON       string
 		sourceDigest, compilerVersion, createdAt, verified  string
 		pageVersion, sourceSeqMin, sourceSeqMax, scopeEpoch int64
-		salience, rank                                      float64
+		salience                                            float64
 	)
-	if err := rows.Scan(
+	if err := row.Scan(
 		&pageID, &pageVersion, &sessionID, &repoID, &taskID, &branch, &commitID,
 		&pathScopeJSON, &scope, &kind, &trust, &status, &salience, &salienceReason,
 		&searchText, &summary, &refsJSON, &sourceDigest, &sourceSeqMin, &sourceSeqMax,
-		&compilerVersion, &scopeEpoch, &createdAt, &verified, &rank,
+		&compilerVersion, &scopeEpoch, &createdAt, &verified,
 	); err != nil {
-		return pages.WarmPage{}, 0, err
+		return pages.WarmPage{}, err
 	}
 	var refs []pages.PageRef
 	if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil {
-		return pages.WarmPage{}, 0, fmt.Errorf("decode refs: %w", err)
+		return pages.WarmPage{}, fmt.Errorf("decode refs: %w", err)
 	}
 	var paths []string
 	if pathScopeJSON != "" {
 		if err := json.Unmarshal([]byte(pathScopeJSON), &paths); err != nil {
-			return pages.WarmPage{}, 0, fmt.Errorf("decode path scope: %w", err)
+			return pages.WarmPage{}, fmt.Errorf("decode path scope: %w", err)
 		}
 	}
 	created, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
 		created, err = time.Parse(time.RFC3339, createdAt)
 		if err != nil {
-			return pages.WarmPage{}, 0, fmt.Errorf("decode created_at: %w", err)
+			return pages.WarmPage{}, fmt.Errorf("decode created_at: %w", err)
 		}
 	}
 	var lastVerified time.Time
@@ -197,7 +214,7 @@ func scanPage(rows *sql.Rows) (pages.WarmPage, float64, error) {
 		SourceSeqMin: sourceSeqMin, SourceSeqMax: sourceSeqMax,
 		SourceDigest: pages.SourceDigest(sourceDigest), CompilerVersion: pages.CompilerVersion(compilerVersion),
 		ScopeEpoch: pages.ScopeEpoch(scopeEpoch), CreatedAt: created.UTC(), LastVerifiedAt: lastVerified.UTC(),
-	}, rank, nil
+	}, nil
 }
 
 // buildFTSMatch tokenizes user text into a safe FTS5 MATCH expression.

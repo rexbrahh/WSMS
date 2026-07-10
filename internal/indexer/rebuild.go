@@ -68,12 +68,19 @@ func (idx *Index) Rebuild(ctx context.Context, source PageSource) error {
 	if err != nil {
 		return err
 	}
-	// Ensure meta on rebuild DB.
-	tmp := &Index{dir: idx.dir, path: rebuildPath, db: rebuildDB}
+	// Ensure meta on rebuild DB; preserve dense configuration when enabled.
+	tmp := &Index{dir: idx.dir, path: rebuildPath, db: rebuildDB, denseDims: idx.denseDims}
 	if err := tmp.ensureMeta(ctx); err != nil {
 		_ = rebuildDB.Close()
 		_ = os.Remove(rebuildPath)
 		return err
+	}
+	if idx.denseDims > 0 {
+		if err := tmp.enableDense(ctx, idx.denseDims); err != nil {
+			_ = rebuildDB.Close()
+			_ = os.Remove(rebuildPath)
+			return err
+		}
 	}
 
 	var mutations []pages.PageMutation
@@ -152,6 +159,10 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, metaGeneration, nextGen)
 		return err
 	}
 	idx.db = db
+	// Re-bind dense dims from the new generation meta.
+	if err := idx.initDense(ctx, idx.denseDims); err != nil {
+		return err
+	}
 	return nil
 }
 

@@ -206,8 +206,11 @@ WHERE page_id = ? AND session_id = ?
 			return err
 		}
 	}
-	_, err = tx.ExecContext(ctx, `DELETE FROM warm_pages_fts WHERE page_id = ?`, string(page.ID))
-	return err
+	if _, err := tx.ExecContext(ctx, `DELETE FROM warm_pages_fts WHERE page_id = ?`, string(page.ID)); err != nil {
+		return err
+	}
+	// Best-effort dense cleanup; map table may not exist when dense is off.
+	return deleteVectorTx(ctx, tx, page.ID)
 }
 
 func syncFTS(ctx context.Context, tx *sql.Tx, page pages.WarmPage) error {

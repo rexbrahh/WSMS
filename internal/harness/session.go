@@ -186,7 +186,10 @@ func OpenSession(cfg config.Config) (*Session, error) {
 		Tools:      faults.NewTools(res, sched.PageFault),
 	}
 	// Warm index is disposable and optional. Open failures leave Index nil.
-	if warm, err := indexer.Open(filepath.Join(cfg.DataDir, "index")); err == nil {
+	// Dense projection is off by default (cfg.DenseDimensions == 0).
+	if warm, err := indexer.Open(filepath.Join(cfg.DataDir, "index"), indexer.Options{
+		DenseDimensions: cfg.DenseDimensions,
+	}); err == nil {
 		s.Index = warm
 	} else {
 		s.IndexErr = err

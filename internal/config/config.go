@@ -19,6 +19,11 @@ type Config struct {
 
 	// SessionID scopes ledger events.
 	SessionID string
+
+	// DenseDimensions enables the optional sqlite-vec projection on the warm
+	// index when > 0. Zero (default) keeps dense search unavailable; FTS still
+	// works. Real embeddings arrive in Phase 7D.
+	DenseDimensions int
 }
 
 // Default returns scaffold defaults.
@@ -29,6 +34,7 @@ func Default() Config {
 		CapsuleTokenBudget:     512,
 		PageFaultTokenBudget:   256,
 		SessionID:              "session-default",
+		DenseDimensions:        0,
 	}
 }
 
