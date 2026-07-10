@@ -1,0 +1,32 @@
+# Binaries
+/bin/
+/dist/
+/wsms
+cmd/wsms/wsms
+
+# Go
+*.test
+*.out
+coverage.out
+vendor/
+
+# Runtime data
+.wsms/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python research (later only)
+research/**/.venv/
+research/**/__pycache__/
+*.pyc
+
+# Rust sidecars (later only)
+crates/**/target/
