@@ -2,6 +2,7 @@ package faults
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -51,11 +52,56 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (string, error) {
 		return r.resolvePage(ctx, req.ID, budget)
 	case "raw_log":
 		return r.resolveRaw(ctx, req.ID, budget)
+	case "event":
+		return r.resolveEventMetadata(ctx, req.ID, budget)
 	case "file_slice":
 		return "", ErrFileSliceUnauthorized
 	default:
 		return "", fmt.Errorf("unknown fault kind %q", req.Kind)
 	}
+}
+
+func (r *Resolver) resolveEventMetadata(ctx context.Context, eventID string, budget int) (string, error) {
+	if r.Ledger == nil {
+		return "", fmt.Errorf("resolve event %s: ledger unavailable", eventID)
+	}
+	ev, err := r.Ledger.Get(ctx, eventID)
+	if err != nil {
+		if errors.Is(err, wsmserrors.ErrNotFound) {
+			return PageMiss, nil
+		}
+		return "", err
+	}
+	allowed := map[string]any{}
+	for _, key := range []string{
+		"goal", "phase", "priority", "cmd", "command", "exit", "err", "file_hint",
+		"chosen", "because", "action", "target", "question", "path", "content_digest",
+	} {
+		if key == "err" && ev.PayloadInt("exit", 0) == 0 {
+			continue
+		}
+		if value, ok := ev.Payload[key]; ok {
+			allowed[key] = value
+		}
+	}
+	view := struct {
+		ID      string           `json:"id"`
+		Seq     int64            `json:"append_seq"`
+		Type    ledger.EventType `json:"type"`
+		Repo    string           `json:"repo,omitempty"`
+		TaskID  string           `json:"task_id,omitempty"`
+		Branch  string           `json:"branch,omitempty"`
+		Commit  string           `json:"commit,omitempty"`
+		Payload map[string]any   `json:"payload,omitempty"`
+	}{
+		ID: ev.ID, Seq: ev.Seq, Type: ev.Type, Repo: ev.Repo, TaskID: ev.TaskID,
+		Branch: ev.Branch, Commit: ev.Commit, Payload: allowed,
+	}
+	data, err := json.Marshal(view)
+	if err != nil {
+		return "", err
+	}
+	return trimBudget(string(data), budget), nil
 }
 
 func (r *Resolver) resolvePage(ctx context.Context, id string, budget int) (string, error) {

@@ -9,7 +9,7 @@ import (
 
 // Request is a page-fault request.
 type Request struct {
-	Kind   string // page | raw_log | file_slice
+	Kind   string // page | event | raw_log | file_slice
 	ID     string
 	Path   string
 	Start  int
@@ -44,6 +44,13 @@ func (t *Tools) ReadPage(ctx context.Context, pageID string, budget int) (string
 // ReadRawLog loads raw event/artifact text by event or failure id.
 func (t *Tools) ReadRawLog(ctx context.Context, id string, budget int) (string, error) {
 	return t.resolve(ctx, Request{Kind: "raw_log", ID: id, Budget: budget})
+}
+
+// ReadEvent returns bounded, redacted event metadata without following raw
+// artifact output. It is the semantic-page materialization path for pages that
+// have no WSL record body.
+func (t *Tools) ReadEvent(ctx context.Context, id string, budget int) (string, error) {
+	return t.resolve(ctx, Request{Kind: "event", ID: id, Budget: budget})
 }
 
 // ReadFileSlice reads a 1-indexed inclusive line range from path.
