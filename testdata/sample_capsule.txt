@@ -1,0 +1,17 @@
+<working_state>
+TASK T42: Fix stream cancel hang.
+PHASE: Debugging.
+BRANCH: solver-stream-cancel.
+DIRTY FILES: src/runtime/stream.go, src/solver/cancel.rs.
+
+HARD CONSTRAINT C7:
+do not rewrite transport layer
+
+LAST FAILURE F18:
+Command: `go test ./runtime -run TestCancelStream`
+Exit: 1
+Error: "stream goroutine still blocked"
+Likely file area: src/runtime/stream.go:118-176
+
+If details are missing, request a page by ID instead of guessing.
+</working_state>
