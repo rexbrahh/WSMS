@@ -31,8 +31,9 @@ as the source of truth: known IDs always page directly from exact evidence;
 semantic queries use FTS plus dense retrieval to discover candidate page refs,
 then rejoin the same validated L4-to-L2 page-in path. The first demo remains a
 deterministic vector-free proof of the paging mechanism. Phase 7A adds an
-offline deterministic page compiler and exact cosine oracle; it does not yet
-index pages or change the demo path.
+offline deterministic page compiler and exact cosine oracle. Phase 7B adds a
+disposable FTS5 warm index under `<data-dir>/index/` (safe to delete); the demo
+path remains a vector-free mechanism proof and does not require the index.
 
 ## Layout
 

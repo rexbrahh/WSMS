@@ -922,11 +922,15 @@ automatic prefetch disabled.
 
 ### L3-1 - Interfaces and lexical path
 
-- Add `PageCompiler`, `WarmIndex`, `Retriever`, and `PageMaterializer` boundaries.
-- Build the separate `warm.db`, migrations, generations, and watermarks.
-- Implement FTS5 candidate generation, hard filters, explanations, and
+**Status:** complete (Phase 7B). Dense materializer remains partial (no dense).
+
+- `internal/indexer`: disposable FTS5 `warm.db`, Apply, SearchLexical, Rebuild,
+  watermarks.
+- `internal/retrieval`: `QueryIntent`, lexical `ResolveSemantic`,
   `SEMANTIC_PAGE_MISS`.
-- Prove delete/rebuild and stale query-time suppression.
+- Harness best-effort index apply after events; `SemanticSearch` for tests.
+- Delete `index/`, rebuild cutover, cross-session isolation, and corpus FTS
+  labels are covered by package tests.
 
 ### L3-2 - sqlite-vec compatibility spike
 

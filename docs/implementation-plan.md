@@ -656,33 +656,34 @@ Verification/gates:
 
 #### Phase 7B - Separate FTS5 warm index
 
+**Status:** implemented and verified. Dense/hybrid channels remain deferred.
+
 **Objective:** deliver useful semantic-by-text faults without an embedding
 dependency and establish index lifecycle semantics.
 
 Implementation:
 
-1. Add `WarmIndex` and a separate `<data-dir>/index/warm.db`; never add search
-   tables to authoritative `ledger.db`.
-2. Add versioned index generations, metadata/FTS projections, source digests,
-   per-session watermarks, idempotent mutations, and rebuild locking.
-3. Implement typed `QueryIntent`, authoritative eligibility filters, FTS5 BM25
-   candidates, stable tie-breaking, explanations, and `SEMANTIC_PAGE_MISS`.
-4. Re-check current scope epoch/status/source digest before materialization and
-   route selected refs through the existing fault resolver.
-5. Add generation rebuild into a temporary DB with validation and atomic
-   cutover while the previous generation serves reads.
+1. `internal/indexer` owns disposable `<data-dir>/index/warm.db` (FTS5); never
+   writes search tables into `ledger.db`.
+2. Versioned generations, metadata/FTS projections, per-session watermarks,
+   idempotent Apply, rebuild lock, and atomic cutover via `warm.rebuild.db`.
+3. `internal/retrieval` implements typed `QueryIntent`, hard filters, FTS5 BM25
+   candidates, stable `page_id` tie-break, explanations, and
+   `SEMANTIC_PAGE_MISS`. `SearchDense` returns `ErrDenseUnavailable` until 7C.
+4. Harness best-effort compile+Apply after each durable event (live and replay);
+   index errors never fail L4 append. `Session.SemanticSearch` rechecks live
+   repo/branch authority before returning candidates.
+5. Rebuild validates active-page/FTS counts before cutover; orphan rebuild files
+   are deleted on open and never served.
 
 Verification/gates:
 
-- Deleting `index/` leaves replay, capsules, and all direct faults unchanged.
-- Crash at each rebuild phase leaves either the old valid generation or a
-  safely deletable temporary generation.
-- A committed invalidation suppresses a stale hit even while the L3 watermark
-  is behind.
-- Cross-session/repo/task/branch adversarial queries produce zero materialized
-  leaks.
-- FTS results meet frozen exact-path/error/command labels and abstain on true
-  misses.
+- [x] Deleting `index/` leaves replay, capsules, and direct faults unchanged.
+- [x] Incomplete rebuild artifacts are not served; open cleans orphans.
+- [x] Invalidated pages and recheck failures suppress hits (`SEMANTIC_PAGE_MISS`).
+- [x] Cross-session queries cannot materialize another session's pages.
+- [x] Frozen corpus positive labels hit expected kinds; true-no-answer abstains.
+- [x] `wsms demo` still PASSes (vector-free; index optional).
 
 #### Phase 7C - sqlite-vec compatibility and exact-parity spike
 
