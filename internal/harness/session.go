@@ -12,6 +12,7 @@ import (
 	"wsms/internal/artifacts"
 	"wsms/internal/coherence"
 	"wsms/internal/config"
+	"wsms/internal/embedder"
 	"wsms/internal/faults"
 	"wsms/internal/indexer"
 	"wsms/internal/ledger"
@@ -124,6 +125,7 @@ type Session struct {
 	closeErr    error
 	closed      bool
 	failStopErr error
+	lastEvent   ledger.Event
 	// IndexErr is the last non-fatal warm-index error (indexing never fails L4).
 	IndexErr   error
 	Cfg        config.Config
@@ -137,6 +139,12 @@ type Session struct {
 	Tools      *faults.Tools
 	// Index is the disposable L3 warm index. Nil when unavailable.
 	Index *indexer.Index
+	// Embedder is the optional Phase 7D dense projection source. It is never
+	// authoritative and never gates L4 appends or direct page faults.
+	Embedder embedder.Embedder
+	// EmbeddingErr is the last non-fatal dense embedding/vector projection
+	// error. Indexing can still be current while dense search is degraded.
+	EmbeddingErr error
 }
 
 // OpenSession creates a session under cfg.DataDir.
@@ -146,6 +154,9 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	}
 	if cfg.SessionID == "" {
 		cfg.SessionID = "session-default"
+	}
+	if err := configureEmbedder(&cfg); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
@@ -184,6 +195,7 @@ func OpenSession(cfg config.Config) (*Session, error) {
 		Dispatcher: disp,
 		Scheduler:  sched,
 		Tools:      faults.NewTools(res, sched.PageFault),
+		Embedder:   cfg.Embedder,
 	}
 	// Warm index is disposable and optional. Open failures leave Index nil.
 	// Dense projection is off by default (cfg.DenseDimensions == 0).
@@ -200,6 +212,30 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	return s, nil
 }
 
+func configureEmbedder(cfg *config.Config) error {
+	if cfg.Embedder == nil {
+		return nil
+	}
+	ns := cfg.Embedder.Namespace()
+	if err := ns.Validate(); err != nil {
+		return fmt.Errorf("embedding namespace: %w", err)
+	}
+	if cfg.DenseDimensions == 0 {
+		cfg.DenseDimensions = ns.Profile.Dimensions
+	} else if cfg.DenseDimensions != ns.Profile.Dimensions {
+		return fmt.Errorf(
+			"%w: dense dimensions %d do not match namespace dimensions %d",
+			embedder.ErrInvalidNamespace,
+			cfg.DenseDimensions,
+			ns.Profile.Dimensions,
+		)
+	}
+	if cfg.EmbeddingBatchSize < 0 {
+		return fmt.Errorf("embedding batch size must be non-negative")
+	}
+	return nil
+}
+
 // replay reconstructs derived state from durable events without appending them.
 func (s *Session) replay(ctx context.Context) error {
 	events, err := s.Ledger.ListBySession(ctx, s.Cfg.SessionID)
@@ -210,6 +246,7 @@ func (s *Session) replay(ctx context.Context) error {
 		if err := s.Scheduler.AfterEvent(ctx, ev); err != nil {
 			return err
 		}
+		s.lastEvent = ev
 		s.indexAfterEvent(ctx, ev)
 	}
 	return nil
@@ -281,6 +318,7 @@ func (s *Session) Append(ctx context.Context, ev ledger.Event) (ledger.Event, er
 		)
 		return stored, s.failStopErr
 	}
+	s.lastEvent = stored
 	// Best-effort L3 indexing: never fail the durable append path.
 	s.indexAfterEvent(ctx, stored)
 	return stored, nil
@@ -292,12 +330,35 @@ func (s *Session) indexAfterEvent(ctx context.Context, ev ledger.Event) {
 	if s.Index == nil {
 		return
 	}
-	snap := s.Coherence.Snapshot()
+	watermark, _, err := s.Index.Watermark(ctx, s.Cfg.SessionID)
+	if err != nil {
+		s.IndexErr = err
+		return
+	}
+	if ev.Seq <= watermark {
+		return
+	}
+	if ev.Seq != watermark+1 {
+		s.IndexErr = s.repairIndexFromLedger(ctx)
+		return
+	}
+	if err := s.compileAndApplyIndexEvent(ctx, ev, s.State, s.Coherence); err != nil {
+		if repairErr := s.repairIndexFromLedger(ctx); repairErr != nil {
+			s.IndexErr = errors.Join(err, repairErr)
+			return
+		}
+	}
+	s.IndexErr = nil
+}
+
+func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event, state *wsl.WorkingState, coherent *coherence.State) error {
+	snap := coherent.Snapshot()
 	change := pages.LedgerChange{
 		Event:     ev,
-		State:     s.State.Clone(),
+		State:     state.Clone(),
 		Events:    s.Ledger,
 		Artifacts: s.Artifacts,
+		Coherence: coherent,
 		RepoID:    firstNonEmpty(snap.Current.Repo, ev.Repo),
 		TaskID:    firstNonEmpty(snap.Current.TaskID, ev.TaskID),
 		Branch:    firstNonEmpty(snap.Current.Branch, ev.Branch),
@@ -305,8 +366,7 @@ func (s *Session) indexAfterEvent(ctx context.Context, ev ledger.Event) {
 	}
 	muts, err := pages.NewDeterministicCompiler().Compile(ctx, change)
 	if err != nil {
-		s.IndexErr = err
-		return
+		return err
 	}
 	var maxVersion int64
 	for _, mut := range muts {
@@ -318,8 +378,165 @@ func (s *Session) indexAfterEvent(ctx context.Context, ev ledger.Event) {
 		maxVersion = ev.Seq
 	}
 	if err := s.Index.ApplyWithWatermark(ctx, muts, s.Cfg.SessionID, ev.Seq, maxVersion); err != nil {
-		s.IndexErr = err
+		return err
 	}
+	s.embedIndexMutations(ctx, muts)
+	return nil
+}
+
+func (s *Session) embedIndexMutations(ctx context.Context, muts []pages.PageMutation) {
+	if s.Embedder == nil || s.Index == nil {
+		return
+	}
+	ns := s.Embedder.Namespace()
+	namespace := ns.ID
+	if err := ns.Validate(); err != nil {
+		s.recordEmbeddingError(namespace, err)
+		return
+	}
+	if !s.Index.DenseEnabled() {
+		s.recordEmbeddingError(namespace, indexer.ErrDenseUnavailable)
+		return
+	}
+	if dims := s.Index.DenseDimensions(); dims != ns.Profile.Dimensions {
+		s.recordEmbeddingError(namespace, fmt.Errorf("%w: index dimensions %d do not match namespace dimensions %d",
+			embedder.ErrInvalidNamespace, dims, ns.Profile.Dimensions))
+		return
+	}
+	type documentPage struct {
+		page pages.WarmPage
+		text string
+	}
+	var docs []documentPage
+	for _, mut := range muts {
+		if mut.Op != pages.MutationUpsert {
+			continue
+		}
+		page := mut.Page
+		if page.SessionID != s.Cfg.SessionID || page.Status != pages.StatusActive || page.SearchText == "" {
+			continue
+		}
+		docs = append(docs, documentPage{page: page, text: page.SearchText})
+	}
+	if len(docs) == 0 {
+		s.recordEmbeddingOK(namespace)
+		return
+	}
+	batchSize := s.Cfg.EmbeddingBatchSize
+	if batchSize <= 0 {
+		batchSize = embedder.DefaultMaxBatchSize
+	}
+	for start := 0; start < len(docs); start += batchSize {
+		end := start + batchSize
+		if end > len(docs) {
+			end = len(docs)
+		}
+		chunk := docs[start:end]
+		texts := make([]string, len(chunk))
+		for i, doc := range chunk {
+			texts[i] = doc.text
+		}
+		batch, err := s.Embedder.EmbedDocuments(ctx, texts)
+		if err != nil {
+			s.recordEmbeddingError(namespace, err)
+			return
+		}
+		if err := batch.Validate(ns, len(texts)); err != nil {
+			s.recordEmbeddingError(namespace, err)
+			return
+		}
+		records := make([]indexer.VectorRecord, len(chunk))
+		for i, doc := range chunk {
+			records[i] = indexer.VectorRecord{
+				PageID:             doc.page.ID,
+				SessionID:          doc.page.SessionID,
+				EmbeddingNamespace: namespace,
+				Vector:             embeddingVector64(batch.Embeddings[i].Vector),
+			}
+		}
+		if err := s.Index.UpsertVectors(ctx, records); err != nil {
+			s.recordEmbeddingError(namespace, err)
+			return
+		}
+	}
+	s.recordEmbeddingOK(namespace)
+}
+
+func (s *Session) recordEmbeddingError(namespace string, err error) {
+	if err == nil {
+		return
+	}
+	s.EmbeddingErr = err
+	if s.Index != nil {
+		s.Index.RecordEmbeddingStatus(namespace, err)
+	}
+}
+
+func (s *Session) recordEmbeddingOK(namespace string) {
+	s.EmbeddingErr = nil
+	if s.Index != nil {
+		s.Index.RecordEmbeddingStatus(namespace, nil)
+	}
+}
+
+func embeddingVector64(vector []float32) []float64 {
+	if vector == nil {
+		return nil
+	}
+	out := make([]float64, len(vector))
+	for i, v := range vector {
+		out[i] = float64(v)
+	}
+	return out
+}
+
+func (s *Session) repairIndexFromLedger(ctx context.Context) error {
+	if s.Index == nil {
+		return retrieval.ErrIndexUnavailable
+	}
+	watermark, _, err := s.Index.Watermark(ctx, s.Cfg.SessionID)
+	if err != nil {
+		return err
+	}
+	events, err := s.Ledger.ListBySession(ctx, s.Cfg.SessionID)
+	if err != nil {
+		return err
+	}
+	state := wsl.NewWorkingState()
+	coherent := coherence.NewState()
+	dispatcher := observers.Default(observers.NewSeqIDGen(), state)
+	for _, ev := range events {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		candidate, err := coherent.Prepare(ev)
+		if err != nil {
+			return err
+		}
+		updates, err := dispatcher.OnEvent(ctx, ev)
+		if err != nil {
+			return err
+		}
+		for i := range updates {
+			updates[i].EvidenceID = ev.ID
+		}
+		if err := candidate.BindUpdates(updates); err != nil {
+			return err
+		}
+		if err := state.ApplyEventUpdates(ev.ID, updates); err != nil {
+			return err
+		}
+		if err := coherent.Commit(candidate); err != nil {
+			return err
+		}
+		if ev.Seq <= watermark {
+			continue
+		}
+		if err := s.compileAndApplyIndexEvent(ctx, ev, state, coherent); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // SemanticSearch runs a lexical warm-index query for the current session.
@@ -333,25 +550,32 @@ func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Re
 	if s.Index == nil {
 		return retrieval.Result{}, retrieval.ErrIndexUnavailable
 	}
+	if s.lastEvent.ID == "" {
+		return retrieval.Result{}, retrieval.ErrSemanticPageMiss
+	}
 	snap := s.Coherence.Snapshot()
+	degraded := s.denseSemanticProbe(ctx, text, snap)
+	change := pages.LedgerChange{
+		Event: s.lastEvent, State: s.State.Clone(), Events: s.Ledger, Artifacts: s.Artifacts,
+		Coherence: s.Coherence, RepoID: snap.Current.Repo, TaskID: snap.Current.TaskID,
+		Branch: snap.Current.Branch, Commit: snap.Current.Commit,
+	}
+	materialized := map[pages.PageID][]string{}
 	ret := &retrieval.LexicalRetriever{
 		Index: s.Index,
-		Recheck: func(_ context.Context, page pages.WarmPage) (bool, string) {
-			if page.Status != pages.StatusActive {
-				return false, "status"
+		Recheck: func(checkCtx context.Context, page pages.WarmPage) (bool, string) {
+			if err := pages.ValidateMaterializable(checkCtx, page, change); err != nil {
+				return false, "authority"
 			}
-			// Reject pages outside the live session authority when they carry
-			// a repo/branch that no longer matches current scope.
-			if page.RepoID != "" && snap.Current.Repo != "" && page.RepoID != snap.Current.Repo {
-				return false, "repo"
+			evidence, err := s.materializeSemanticPage(checkCtx, page)
+			if err != nil {
+				return false, "fault"
 			}
-			if page.Branch != "" && snap.Current.Branch != "" && page.Branch != snap.Current.Branch {
-				return false, "branch"
-			}
+			materialized[page.ID] = evidence
 			return true, ""
 		},
 	}
-	return ret.ResolveSemantic(ctx, retrieval.QueryIntent{
+	result, err := ret.ResolveSemantic(ctx, retrieval.QueryIntent{
 		Mode:      retrieval.ModeSemanticFault,
 		SessionID: s.Cfg.SessionID,
 		RepoID:    snap.Current.Repo,
@@ -360,6 +584,113 @@ func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Re
 		Commit:    snap.Current.Commit,
 		UserText:  text,
 	})
+	if err != nil {
+		return retrieval.Result{}, err
+	}
+	result.Degraded = append(result.Degraded, degraded...)
+	for _, candidate := range result.Candidates {
+		result.Materialized = append(result.Materialized, retrieval.MaterializedPage{
+			PageID: candidate.Page.ID, Evidence: append([]string(nil), materialized[candidate.Page.ID]...),
+		})
+	}
+	return result, nil
+}
+
+func (s *Session) denseSemanticProbe(ctx context.Context, text string, snap coherence.Snapshot) []string {
+	if s.Embedder == nil || s.Index == nil || !s.Index.DenseEnabled() {
+		return nil
+	}
+	ns := s.Embedder.Namespace()
+	namespace := ns.ID
+	if err := ns.Validate(); err != nil {
+		s.recordEmbeddingError(namespace, err)
+		return []string{"dense=namespace"}
+	}
+	if dims := s.Index.DenseDimensions(); dims != ns.Profile.Dimensions {
+		err := fmt.Errorf("%w: index dimensions %d do not match namespace dimensions %d",
+			embedder.ErrInvalidNamespace, dims, ns.Profile.Dimensions)
+		s.recordEmbeddingError(namespace, err)
+		return []string{"dense=namespace"}
+	}
+	query, err := s.Embedder.EmbedQuery(ctx, text)
+	if err != nil {
+		s.recordEmbeddingError(namespace, err)
+		return []string{"dense=embedder"}
+	}
+	if err := query.Validate(ns, embedder.RoleQuery); err != nil {
+		s.recordEmbeddingError(namespace, err)
+		return []string{"dense=query-vector"}
+	}
+	// Phase 7D keeps semantic resolution FTS-first. The dense probe verifies the
+	// query/document ABI, namespace, and vec0 availability without letting a
+	// vector score become authority; Phase 7E owns fusion/reranking.
+	if _, err := s.Index.SearchDense(ctx, indexer.SearchQuery{
+		SessionID:          s.Cfg.SessionID,
+		RepoID:             snap.Current.Repo,
+		TaskID:             snap.Current.TaskID,
+		Branch:             snap.Current.Branch,
+		Commit:             snap.Current.Commit,
+		EmbeddingNamespace: namespace,
+		Limit:              3,
+		ActiveOnly:         true,
+	}, embeddingVector64(query.Vector)); err != nil {
+		s.recordEmbeddingError(namespace, err)
+		return []string{"dense=search"}
+	}
+	return nil
+}
+
+func (s *Session) materializeSemanticPage(ctx context.Context, page pages.WarmPage) ([]string, error) {
+	const maxRenderedRefs = 4
+	refs := make([]pages.PageRef, 0, maxRenderedRefs)
+	for _, ref := range page.Refs {
+		if ref.Kind == pages.RefWSLRecord {
+			refs = append(refs, ref)
+			if len(refs) == maxRenderedRefs {
+				break
+			}
+		}
+	}
+	if len(refs) == 0 {
+		for _, ref := range page.Refs {
+			if ref.Kind == pages.RefEvent {
+				refs = append(refs, ref)
+				break
+			}
+		}
+	}
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("page %s has no renderable exact ref", page.ID)
+	}
+	budget := s.Cfg.PageFaultTokenBudget
+	if budget <= 0 {
+		budget = 256
+	}
+	perRef := budget / len(refs)
+	if perRef < 32 {
+		perRef = 32
+	}
+	evidence := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		var (
+			body string
+			err  error
+		)
+		switch ref.Kind {
+		case pages.RefWSLRecord:
+			body, err = s.Tools.ReadPage(ctx, ref.ID, perRef)
+		case pages.RefEvent:
+			body, err = s.Tools.ReadEvent(ctx, ref.ID, perRef)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if body == "" || body == faults.PageMiss {
+			return nil, fmt.Errorf("page %s ref %s did not materialize", page.ID, ref.Address())
+		}
+		evidence = append(evidence, body)
+	}
+	return evidence, nil
 }
 
 func firstNonEmpty(values ...string) string {
