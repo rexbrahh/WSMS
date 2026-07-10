@@ -23,12 +23,16 @@ func (o *Operational) Handle(ctx context.Context, ev ledger.Event) ([]wsl.Update
 		if branch == "" {
 			branch = ev.Branch
 		}
+		priority := types.Priority(ev.PayloadString("priority"))
+		if priority == "" {
+			priority = types.PriorityHot
+		}
 		return []wsl.Update{{
 			Op: "upsert",
 			Record: &wsl.TaskRecord{
 				IDValue:  o.IDs.Next("T"),
 				Phase:    ev.PayloadString("phase"),
-				Priority: types.Priority(ev.PayloadString("priority")),
+				Priority: priority,
 				Goal:     ev.PayloadString("goal"),
 				Branch:   branch,
 				Commit:   ev.Commit,

@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -512,6 +514,222 @@ func TestOpenSessionRejectsCorruptReplayEvent(t *testing.T) {
 	var ledgerErr *wsmserrors.LedgerError
 	if !errors.As(err, &ledgerErr) || ledgerErr.Op != "decode_payload" {
 		t.Fatalf("error=%v, want decode_payload LedgerError", err)
+	}
+}
+
+func TestOperationalEventsReplayWithStableIDsAndProvenance(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(t.TempDir(), "wsms-data")
+	cfg.SessionID = "operational-replay"
+	cfg.CapsuleTokenBudget = 512
+	ctx := context.Background()
+
+	live, err := OpenSession(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := live.StartTask(ctx, TaskStart{Goal: "first task", Phase: "planning"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.StartTask(ctx, TaskStart{Goal: "current task", Phase: "debugging", Branch: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.IngestUser(ctx, "do not rewrite transport layer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.IngestCommandOutput(ctx, "go test ./runtime", 1, "error: waiter blocked"); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.RecordDecision(ctx, DecisionInput{
+		Chosen:    "inspect cancellation cleanup",
+		Because:   "F1 is exact evidence",
+		Refs:      "F1",
+		AvoidText: "retry the failed cleanup",
+		AvoidRef:  "F1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.SetNext(ctx, NextAction{Action: "inspect", Target: "first.go", Question: "old question"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.SetNext(ctx, NextAction{Action: "patch", Target: "stream.go"}); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := live.Ledger.ListBySession(ctx, cfg.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 7 {
+		t.Fatalf("event count=%d, want 7", len(events))
+	}
+	expectedProvenance := map[string]string{
+		"T1": "E0001", "T2": "E0002", "C1": "E0003", "F1": "E0004",
+		"D1": "E0005", "A1": "E0005", "next": "E0007",
+	}
+	if got := live.State.Provenance(); !reflect.DeepEqual(got, expectedProvenance) {
+		t.Fatalf("live provenance=%v, want %v", got, expectedProvenance)
+	}
+	if first, ok := live.State.Get("T1"); !ok || first.(*wsl.TaskRecord).Goal != "first task" {
+		t.Fatalf("first task=%#v ok=%v", first, ok)
+	}
+	active := live.State.ActiveTask()
+	if active == nil || active.IDValue != "T2" || active.Goal != "current task" || active.Priority != types.PriorityHot {
+		t.Fatalf("active task=%#v", active)
+	}
+	if next := live.State.Next(); next == nil || next.Action != "patch" || next.Target != "stream.go" || next.Question != "" {
+		t.Fatalf("replacement next=%#v", next)
+	}
+	decisions := live.State.Decisions()
+	if len(decisions) != 1 || decisions[0].Scope != types.ScopeTask {
+		t.Fatalf("default decision scope=%#v", decisions)
+	}
+	beforeState := wsl.Serialize(live.State.Records())
+	beforeCapsule, err := live.BeforeTurn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(beforeCapsule, "TASK T2: Current task") || !strings.Contains(beforeCapsule, "Patch stream.go") {
+		t.Fatalf("capsule did not use latest task/next:\n%s", beforeCapsule)
+	}
+	closeTestSession(t, live)
+
+	replayed, err := OpenSession(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestSession(t, replayed) })
+	if got := wsl.Serialize(replayed.State.Records()); got != beforeState {
+		t.Fatalf("replayed state differs:\n%s\nwant:\n%s", got, beforeState)
+	}
+	if got := replayed.State.Provenance(); !reflect.DeepEqual(got, expectedProvenance) {
+		t.Fatalf("replayed provenance=%v, want %v", got, expectedProvenance)
+	}
+	afterCapsule, err := replayed.BeforeTurn(ctx)
+	if err != nil || afterCapsule != beforeCapsule {
+		t.Fatalf("replayed capsule mismatch err=%v\n%s", err, afterCapsule)
+	}
+	if err := replayed.StartTask(ctx, TaskStart{Goal: "continuation task"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := replayed.State.ActiveTask(); got == nil || got.IDValue != "T3" {
+		t.Fatalf("allocator did not continue after replay: %#v", got)
+	}
+}
+
+func TestSessionPrevalidationLeavesNoEventOrArtifactAndRemainsUsable(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(t.TempDir(), "wsms-data")
+	cfg.SessionID = "prevalidation"
+	cfg.ArtifactThresholdBytes = 1
+	s, err := OpenSession(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestSession(t, s) })
+	ctx := context.Background()
+	large := strings.Repeat("raw evidence ", 100)
+
+	if _, err := s.Append(ctx, ledger.Event{
+		Type:      ledger.EventCommandOutput,
+		SessionID: "foreign",
+		Payload:   map[string]any{"cmd": "go test", "exit": 1, "output": large},
+	}); err == nil {
+		t.Fatal("foreign event was accepted")
+	}
+	if _, err := s.Append(ctx, ledger.Event{
+		Type:    ledger.EventCommandOutput,
+		Payload: map[string]any{"exit": 1, "output": large},
+	}); !errors.Is(err, ledger.ErrInvalidEvent) {
+		t.Fatalf("malformed command error=%v, want ErrInvalidEvent", err)
+	}
+	events, err := s.Ledger.ListBySession(ctx, cfg.SessionID)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("prevalidation persisted events=%#v err=%v", events, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(cfg.DataDir, "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("prevalidation left artifact entries: %#v", entries)
+	}
+	if err := s.StartTask(ctx, TaskStart{Goal: "first valid task"}); err != nil {
+		t.Fatal(err)
+	}
+	events, err = s.Ledger.ListBySession(ctx, cfg.SessionID)
+	if err != nil || len(events) != 1 || events[0].ID != "E0001" {
+		t.Fatalf("first valid event=%#v err=%v", events, err)
+	}
+	if got := s.State.ActiveTask(); got == nil || got.IDValue != "T1" {
+		t.Fatalf("first valid task=%#v", got)
+	}
+}
+
+func TestDecisionWithMissingGroundingFailStopsAtomicallyAndFailsReplayWithContext(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(t.TempDir(), "wsms-data")
+	cfg.SessionID = "bad-decision"
+	ctx := context.Background()
+	s, err := OpenSession(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.Append(ctx, ledger.Event{
+		Type: ledger.EventDecision,
+		Payload: map[string]any{
+			"chosen":     "inspect a missing failure",
+			"avoid_text": "retry missing evidence",
+			"avoid_ref":  "F404",
+		},
+	})
+	if !errors.Is(err, ErrSessionUnavailable) || stored.ID != "E0001" {
+		t.Fatalf("Append=(%#v,%v), want durable E0001 plus ErrSessionUnavailable", stored, err)
+	}
+	if len(s.State.Records()) != 0 || len(s.State.Provenance()) != 0 {
+		t.Fatalf("failed decision leaked state=%#v provenance=%v", s.State.Records(), s.State.Provenance())
+	}
+	if err := s.SetNext(ctx, NextAction{Action: "continue", Target: "later"}); !errors.Is(err, ErrSessionUnavailable) {
+		t.Fatalf("fail-stopped helper error=%v", err)
+	}
+	events, listErr := s.Ledger.ListBySession(ctx, cfg.SessionID)
+	if listErr != nil || len(events) != 1 {
+		t.Fatalf("durable events=%#v err=%v", events, listErr)
+	}
+	closeTestSession(t, s)
+
+	replayed, err := OpenSession(cfg)
+	if replayed != nil {
+		closeTestSession(t, replayed)
+		t.Fatal("replay unexpectedly accepted missing avoidance grounding")
+	}
+	if err == nil || !strings.Contains(err.Error(), "E0001") || !strings.Contains(err.Error(), "decision") || !strings.Contains(err.Error(), "dangling_avoid_ref") {
+		t.Fatalf("replay error lacks event/type/lint context: %v", err)
+	}
+}
+
+func TestOpenSessionRejectsSchemaInvalidPersistedKnownEventWithContext(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(t.TempDir(), "wsms-data")
+	cfg.SessionID = "schema-invalid-replay"
+	s, err := OpenSession(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IngestAssistant(context.Background(), "valid before corruption"); err != nil {
+		t.Fatal(err)
+	}
+	closeTestSession(t, s)
+	execLedgerTestSQL(t, filepath.Join(cfg.DataDir, "ledger.db"),
+		`UPDATE events SET payload_json = '{}' WHERE session_id = ? AND id = 'E0001'`, cfg.SessionID)
+
+	replayed, err := OpenSession(cfg)
+	if replayed != nil {
+		closeTestSession(t, replayed)
+		t.Fatal("OpenSession returned a session for schema-invalid replay input")
+	}
+	if err == nil || !strings.Contains(err.Error(), "E0001") || !strings.Contains(err.Error(), "assistant_message") || !strings.Contains(err.Error(), `"text"`) {
+		t.Fatalf("replay validation error lacks context: %v", err)
 	}
 }
 

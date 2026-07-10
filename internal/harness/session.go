@@ -155,6 +155,17 @@ func (s *Session) Append(ctx context.Context, ev ledger.Event) (ledger.Event, er
 	if err := s.operationErrorLocked(); err != nil {
 		return ledger.Event{}, err
 	}
+	// Reject store-owned or foreign identity fields before artifact offload so
+	// a request the ledger cannot append cannot leave an orphan blob behind.
+	if ev.ID != "" {
+		return ledger.Event{}, fmt.Errorf("validate event before append: caller-supplied event id is not allowed")
+	}
+	if ev.Seq != 0 {
+		return ledger.Event{}, fmt.Errorf("validate event before append: caller-supplied append sequence is not allowed")
+	}
+	if ev.SessionID != "" && ev.SessionID != s.Cfg.SessionID {
+		return ledger.Event{}, fmt.Errorf("validate event before append: session %q is outside session %q", ev.SessionID, s.Cfg.SessionID)
+	}
 	if err := ledger.ValidateEvent(ev); err != nil {
 		return ledger.Event{}, fmt.Errorf("validate event before append: %w", err)
 	}

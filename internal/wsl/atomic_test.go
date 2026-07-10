@@ -46,6 +46,43 @@ func TestApplyUpdatesIsAtomicAndDoesNotLeakProvenance(t *testing.T) {
 	}
 }
 
+func TestDerivedAvoidReferenceMustPreexistEntireBatch(t *testing.T) {
+	st := NewWorkingState()
+	st.NoteEvent("E1")
+	err := st.ApplyDerivedUpdates([]Update{
+		{
+			Op:         "upsert",
+			EvidenceID: "E1",
+			Record: &DecisionRecord{
+				IDValue: "D1",
+				Chosen:  "inspect exact failure evidence",
+			},
+		},
+		{
+			Op:         "upsert",
+			EvidenceID: "E1",
+			Record: &AvoidRecord{
+				IDValue: "A1",
+				Reason:  "failed_attempt",
+				Text:    "self-ground against this decision",
+				Ref:     "D1",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("derived batch accepted a reference created within the same batch")
+	}
+	if _, ok := st.Get("D1"); ok {
+		t.Fatal("rejected batch leaked D1")
+	}
+	if _, ok := st.Get("A1"); ok {
+		t.Fatal("rejected batch leaked A1")
+	}
+	if len(st.Provenance()) != 0 {
+		t.Fatalf("rejected batch leaked provenance: %v", st.Provenance())
+	}
+}
+
 func TestApplyAllIsAtomic(t *testing.T) {
 	st := NewWorkingState()
 	err := st.ApplyAll([]Record{

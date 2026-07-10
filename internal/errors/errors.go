@@ -5,12 +5,12 @@ import "fmt"
 
 // Sentinel errors for common control-flow outcomes.
 var (
-	ErrNotFound      = fmt.Errorf("not found")
-	ErrPageMiss      = fmt.Errorf("page miss")
-	ErrInvalidWSL    = fmt.Errorf("invalid wsl")
-	ErrLintFailed    = fmt.Errorf("wsl lint failed")
-	ErrAppendOnly    = fmt.Errorf("ledger is append-only")
-	ErrDuplicateID   = fmt.Errorf("duplicate id")
+	ErrNotFound       = fmt.Errorf("not found")
+	ErrPageMiss       = fmt.Errorf("page miss")
+	ErrInvalidWSL     = fmt.Errorf("invalid wsl")
+	ErrLintFailed     = fmt.Errorf("wsl lint failed")
+	ErrAppendOnly     = fmt.Errorf("ledger is append-only")
+	ErrDuplicateID    = fmt.Errorf("duplicate id")
 	ErrImmutableField = fmt.Errorf("immutable field changed")
 )
 
@@ -38,6 +38,9 @@ func (e *LintError) Error() string {
 	if len(e.Issues) == 0 {
 		return ErrLintFailed.Error()
 	}
+	if e.Issues[0].Code != "" {
+		return fmt.Sprintf("%s [%s]: %s", ErrLintFailed.Error(), e.Issues[0].Code, e.Issues[0].Message)
+	}
 	return fmt.Sprintf("%s: %s", ErrLintFailed.Error(), e.Issues[0].Message)
 }
 
@@ -45,10 +48,10 @@ func (e *LintError) Unwrap() error { return ErrLintFailed }
 
 // LintIssue is one lint finding.
 type LintIssue struct {
-	Severity  string // "error" or "warning"
-	Code      string
-	Message   string
-	RecordID  string
+	Severity string // "error" or "warning"
+	Code     string
+	Message  string
+	RecordID string
 }
 
 // LedgerError wraps ledger operations.

@@ -75,6 +75,44 @@ func TestAppendOnlyAndList(t *testing.T) {
 	}
 }
 
+func TestAppendRejectsMalformedKnownEventBeforeDurableWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	l, err := Open(path, "validated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestLedger(t, l) })
+
+	if _, err := l.Append(context.Background(), Event{
+		Type:    EventCommandOutput,
+		Payload: map[string]any{"exit": 1, "output": "large but ungrounded output"},
+	}); err == nil {
+		t.Fatal("malformed known event was appended")
+	} else {
+		var ledgerErr *wsmserrors.LedgerError
+		if !errors.As(err, &ledgerErr) || ledgerErr.Op != "validate_event" || !errors.Is(err, ErrInvalidEvent) {
+			t.Fatalf("error=%v, want validate_event wrapping ErrInvalidEvent", err)
+		}
+	}
+	events, err := l.ListBySession(context.Background(), "validated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("invalid event reached durable ledger: %#v", events)
+	}
+	stored, err := l.Append(context.Background(), Event{
+		Type:    EventAssistantMessage,
+		Payload: map[string]any{"text": "first valid event"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID != "E0001" || stored.Seq != 1 {
+		t.Fatalf("first valid identity=(%q,%d), want (E0001,1)", stored.ID, stored.Seq)
+	}
+}
+
 func TestSessionScopedIdentityAndLookup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.db")
 	first, err := Open(path, "session-one")

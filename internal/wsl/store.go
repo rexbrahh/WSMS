@@ -69,6 +69,24 @@ func (s *WorkingState) ApplyDerivedUpdates(updates []Update) error {
 func (s *WorkingState) applyUpdates(updates []Update, requireEvidence bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if requireEvidence {
+		knownBefore := s.knownIDsUnlocked()
+		for _, update := range updates {
+			if isNilRecord(update.Record) {
+				continue
+			}
+			avoid, ok := update.Record.(*AvoidRecord)
+			if !ok || avoid.Ref == "" || refExists(avoid.Ref, knownBefore) {
+				continue
+			}
+			return &wsmserrors.LintError{Issues: []wsmserrors.LintIssue{{
+				Severity: "error",
+				Code:     "dangling_avoid_ref",
+				Message:  fmt.Sprintf("avoid %s refs non-preexisting %s", avoid.IDValue, avoid.Ref),
+				RecordID: avoid.IDValue,
+			}}}
+		}
+	}
 
 	candidate := s.cloneUnlocked()
 	for _, update := range updates {

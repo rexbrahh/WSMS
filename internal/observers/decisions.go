@@ -21,12 +21,16 @@ func (o *Decisions) Handle(ctx context.Context, ev ledger.Event) ([]wsl.Update, 
 		return nil, nil
 	}
 
+	scope := types.Scope(ev.PayloadString("scope"))
+	if scope == "" {
+		scope = types.ScopeTask
+	}
 	decision := &wsl.DecisionRecord{
 		IDValue: o.IDs.Next("D"),
 		Chosen:  ev.PayloadString("chosen"),
 		Because: ev.PayloadString("because"),
 		Refs:    ev.PayloadString("refs"),
-		Scope:   types.Scope(ev.PayloadString("scope")),
+		Scope:   scope,
 	}
 	avoidText := ev.PayloadString("avoid_text")
 	if avoidText == "" {

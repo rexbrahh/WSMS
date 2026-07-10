@@ -100,21 +100,12 @@ func ValidateEvent(ev Event) error {
 			return err
 		}
 		return validateOptionalStrings(ev, "task_id", "phase", "priority", "branch", "dirty")
-	case EventUserInstruction, EventAssistantMessage:
+	case EventUserInstruction, EventHumanCorrection, EventAssistantMessage:
 		return requirePayloadString(ev, "text", true)
 	case EventCommandOutput:
-		if err := requirePayloadString(ev, "cmd", true); err != nil {
-			return err
-		}
-		if value, ok := ev.Payload["exit"]; !ok {
-			return invalidPayloadField(ev, "exit", "is required")
-		} else if _, ok := integerPayload(value); !ok {
-			return invalidPayloadField(ev, "exit", "must be an integer")
-		}
-		if err := requirePayloadString(ev, "output", false); err != nil {
-			return err
-		}
-		return validateOptionalStrings(ev, "err", "file_hint", "raw")
+		return validateCommandOutput(ev, false)
+	case EventTestResult, EventToolResult:
+		return validateCommandOutput(ev, true)
 	case EventDecision:
 		if err := requirePayloadString(ev, "chosen", true); err != nil {
 			return err
@@ -142,6 +133,25 @@ func ValidateEvent(ev Event) error {
 	default:
 		return nil
 	}
+}
+
+func validateCommandOutput(ev Event, allowCommandAlias bool) error {
+	if _, hasCmd := ev.Payload["cmd"]; hasCmd || !allowCommandAlias {
+		if err := requirePayloadString(ev, "cmd", true); err != nil {
+			return err
+		}
+	} else if err := requirePayloadString(ev, "command", true); err != nil {
+		return invalidPayloadField(ev, "cmd", "or payload field \"command\" is required")
+	}
+	if value, ok := ev.Payload["exit"]; !ok {
+		return invalidPayloadField(ev, "exit", "is required")
+	} else if _, ok := integerPayload(value); !ok {
+		return invalidPayloadField(ev, "exit", "must be an integer")
+	}
+	if err := requirePayloadString(ev, "output", false); err != nil {
+		return err
+	}
+	return validateOptionalStrings(ev, "err", "file_hint", "raw")
 }
 
 func requirePayloadString(ev Event, key string, nonEmpty bool) error {
