@@ -1146,11 +1146,31 @@ Verification/gates:
 
 ### Phase 9 - Provider adapters and operator UX
 
-- Add one hosted and one local OpenAI-compatible adapter behind
-  `harness.Client`.
-- Define timeout, cancellation, streaming, tool-call, and provider-compaction
-  interactions.
-- Add session/event/state/page inspection and explicit export/delete commands.
+- [x] Add one hosted and one local OpenAI-compatible adapter behind
+  `harness.Client`. The pi provider seam realizes this: `wsms-local`
+  (`WSMS_LLAMA_BASE_URL`) and hosted `wsms-openai` (gated on `OPENAI_API_KEY`,
+  off unless configured), with a keyless `wsms-mock` echo model as the offline
+  default. Credentials stay env-only; no secret is committed.
+- [ ] Define timeout, cancellation, streaming, tool-call, and provider-compaction
+  interactions. Streaming is verified against live pi (incremental
+  `assistantMessageEvent.delta`, `text_delta`-gated; authoritative content
+  adopted at `message_end`); timeout/cancellation ride the RPC client context.
+  The `wsms_read_page`/`wsms_recall` tool round-trip seam exists but is not yet
+  exercised end to end through a tool-emitting model; provider-compaction is
+  unspecified.
+- [x] Add session/event/state/page inspection and explicit export/delete
+  commands. `internal/operator` + `wsms inspect|export|delete|purge`: seven
+  read-only views, replay-complete JSONL export, logical delete via
+  `memory_invalidated` (L4-retained, cache-honored), and an offline
+  confirmation-gated purge that never touches the data dir or shared artifacts.
+
+**Implementation status:** Provider adapters (local + hosted + offline mock) and
+the operator UX are complete and committed; the operator commands ship with an
+end-to-end test suite that asserts the invariants (e.g. deleting a failure
+record drops it from the L1 capsule while the raw L4 state keeps its
+`@invalidated` tombstone). The remaining Phase 9 work is the tool-call
+round-trip verification and a written timeout/cancellation/provider-compaction
+contract.
 
 ### Phase 10 - Forced-reset benchmark
 
