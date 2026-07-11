@@ -18,10 +18,44 @@ import (
 	wsmserrors "wsms/internal/errors"
 	"wsms/internal/faults"
 	"wsms/internal/ledger"
+	"wsms/internal/memory"
 	"wsms/internal/observers"
 	"wsms/internal/types"
 	"wsms/internal/wsl"
 )
+
+func TestOpenSessionUsesDefaultForZeroResidencyPolicy(t *testing.T) {
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(t.TempDir(), "zero-residency-policy")
+	cfg.SessionID = "zero-residency-policy"
+	cfg.ResidencyPolicy = memory.Policy{}
+
+	s, err := OpenSession(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeTestSession(t, s) })
+	if got, want := s.Hierarchy.Snapshot().Policy, memory.DefaultPolicy(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("resolved residency policy = %#v, want %#v", got, want)
+	}
+}
+
+func TestOpenSessionRejectsInvalidResidencyPolicyBeforeCreatingDataDir(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "must-not-be-created")
+	cfg := config.Default()
+	cfg.DataDir = dataDir
+	cfg.SessionID = "invalid-residency-policy"
+	cfg.ResidencyPolicy.MaxResidentPages = 0
+
+	_, err := OpenSession(cfg)
+	if !errors.Is(err, memory.ErrInvalidPolicy) {
+		t.Fatalf("OpenSession error = %v, want ErrInvalidPolicy", err)
+	}
+	if _, statErr := os.Stat(dataDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("invalid policy mutated data dir: stat error = %v", statErr)
+	}
+}
 
 type failOnceConstraintObserver struct {
 	ids   *observers.SeqIDGen

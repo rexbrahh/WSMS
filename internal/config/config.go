@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"wsms/internal/embedder"
+	"wsms/internal/memory"
 )
 
 // Config is the scaffold configuration for a session runtime.
@@ -20,6 +21,11 @@ type Config struct {
 
 	// PageFaultTokenBudget is the default budget for demand-fetched pages.
 	PageFaultTokenBudget int
+
+	// ResidencyPolicy bounds exact L2 bodies and bodyless ghost/shadow
+	// metadata. The zero value asks OpenSession to use memory.DefaultPolicy;
+	// any nonzero custom policy must validate in full before stores are opened.
+	ResidencyPolicy memory.Policy
 
 	// SessionID scopes ledger events.
 	SessionID string
@@ -46,6 +52,7 @@ func Default() Config {
 		ArtifactThresholdBytes: 4 * 1024, // 4 KiB
 		CapsuleTokenBudget:     512,
 		PageFaultTokenBudget:   256,
+		ResidencyPolicy:        memory.DefaultPolicy(),
 		SessionID:              "session-default",
 		DenseDimensions:        0,
 	}

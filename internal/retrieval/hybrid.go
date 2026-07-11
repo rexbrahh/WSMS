@@ -84,6 +84,7 @@ type PolicyFeatureTrace struct {
 // CandidateTrace is the bounded, text-free ranking explanation for one page.
 type CandidateTrace struct {
 	PageID          pages.PageID
+	FinalPosition   int
 	LexicalPosition int
 	LexicalRank     float64
 	DensePosition   int
@@ -332,6 +333,11 @@ func (r *HybridRetriever) ResolveSemantic(ctx context.Context, intent QueryInten
 	traceIndex := make(map[pages.PageID]int, len(trace.Candidates))
 	for i := range trace.Candidates {
 		traceIndex[trace.Candidates[i].PageID] = i
+	}
+	for position := range fused {
+		if i, ok := traceIndex[fused[position].page.ID]; ok {
+			trace.Candidates[i].FinalPosition = position + 1
+		}
 	}
 	for _, candidate := range fused {
 		if err := ctx.Err(); err != nil {

@@ -4,6 +4,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"wsms/internal/coherence"
@@ -103,10 +104,22 @@ func (s *Scheduler) AfterEvent(ctx context.Context, ev ledger.Event) error {
 	checkpoint.Commit()
 	s.reconcileHierarchy()
 	if coherence.ChangesResidency(ev.Type) {
+		// Ghosts and semantic shadows intentionally retain no dependency refs.
+		// Until a bodyless reverse-dependency index exists, a broad authority
+		// transition must discard those estimators conservatively rather than
+		// carrying cross-scope history forward as if it were revalidated.
+		if ev.Type == ledger.EventMemoryInvalidated {
+			s.Hierarchy.Shootdown(ev.PayloadString("target"))
+		}
+		reason := string(ev.Type)
+		s.Hierarchy.PurgeAllGhosts(reason)
+		s.Hierarchy.CensorAllShadows(reason)
 		s.Hierarchy.ClearL1Capsule()
 	}
 	for _, u := range ups {
-		// Promote failures into L2 only after the full state batch commits.
+		// Pre-admit derived failures as cold/ref0 only after the full state batch
+		// commits. A real exact fault/use, not derivation itself, establishes
+		// reuse and may promote the page.
 		if f, ok := u.Record.(*wsl.FailureRecord); ok {
 			if !s.Coherence.RecordEligible(f.IDValue) {
 				continue
@@ -125,9 +138,13 @@ func (s *Scheduler) AfterEvent(ctx context.Context, ev ledger.Event) error {
 				page.SourceDigest = binding.SourceDigest
 				page.ScopeEpoch = binding.Generation()
 			}
-			s.Hierarchy.PutL2(page)
+			_ = s.Hierarchy.AdmitCold(page)
 		}
 	}
+	// Pinning is a derived-cache decision after the WSL/coherence transaction
+	// commits. Quota rejection remains visible in the residency trace but can
+	// never roll back or fail durable truth.
+	s.syncPinnedAnchors()
 	return nil
 }
 
@@ -153,6 +170,69 @@ func (s *Scheduler) reconcileHierarchy() {
 		}
 		return result
 	})
+}
+
+func (s *Scheduler) syncPinnedAnchors() {
+	if s.Hierarchy == nil || s.State == nil {
+		return
+	}
+	desired := make(map[string]*memory.Page)
+	add := func(record wsl.Record) string {
+		if record == nil || record.ID() == "" || (s.Coherence != nil && !s.Coherence.RecordEligible(record.ID())) {
+			return ""
+		}
+		body := wsl.Serialize([]wsl.Record{record})
+		if body == "" {
+			return ""
+		}
+		page := &memory.Page{ID: record.ID(), Refs: []string{record.ID()}, Body: body}
+		if s.Coherence != nil {
+			if binding, found := s.Coherence.BindingFor(ledger.TargetRecord, record.ID()); found {
+				page.Scope = binding.Scope
+				page.Branch = binding.Branch
+				page.Commit = binding.Commit
+				page.Paths = append([]string(nil), binding.Paths...)
+				page.SourceDigest = binding.SourceDigest
+				page.ScopeEpoch = binding.Generation()
+			}
+		}
+		desired[page.ID] = page
+		return page.ID
+	}
+	taskID := ""
+	if task := s.State.ActiveTask(); task != nil {
+		taskID = add(task)
+	}
+	constraintIDs := make([]string, 0)
+	for _, constraint := range s.State.HardConstraints() {
+		if constraint != nil {
+			if id := add(constraint); id != "" && id != taskID {
+				constraintIDs = append(constraintIDs, id)
+			}
+		}
+	}
+
+	sort.Strings(constraintIDs)
+	ids := make([]string, 0, len(desired))
+	if taskID != "" {
+		ids = append(ids, taskID)
+	}
+	ids = append(ids, constraintIDs...)
+	snapshot := s.Hierarchy.Snapshot()
+	for _, resident := range snapshot.Resident {
+		if resident.State != "pinned" {
+			continue
+		}
+		if _, keep := desired[resident.Tuple.ID]; keep {
+			continue
+		}
+		if page, found := s.Hierarchy.GetPage(resident.Tuple.ID); found {
+			_ = s.Hierarchy.Unpin(page)
+		}
+	}
+	for _, id := range ids {
+		_ = s.Hierarchy.Pin(desired[id])
+	}
 }
 
 func formatFailurePage(f *wsl.FailureRecord) string {

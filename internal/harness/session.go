@@ -58,6 +58,11 @@ type semanticMaterializationBudget struct {
 	bytesRemaining    int
 }
 
+type semanticMaterializedPage struct {
+	page     pages.WarmPage
+	evidence []string
+}
+
 func newSemanticMaterializationBudget(configuredTokens int) *semanticMaterializationBudget {
 	tokens := configuredTokens
 	if tokens <= 0 {
@@ -202,6 +207,23 @@ type EmbeddingStatus struct {
 	Category string
 }
 
+// ResidencySnapshot returns a bodyless, deterministic view of the derived L2
+// hot/cold/pinned set plus ghost and semantic-shadow metadata.
+func (s *Session) ResidencySnapshot() memory.Snapshot {
+	if s == nil || s.Hierarchy == nil {
+		return memory.Snapshot{}
+	}
+	return s.Hierarchy.Snapshot()
+}
+
+// ResidencyTrace returns bounded, redacted replacement/admission diagnostics.
+func (s *Session) ResidencyTrace() []memory.TraceEvent {
+	if s == nil || s.Hierarchy == nil {
+		return nil
+	}
+	return s.Hierarchy.Trace()
+}
+
 // OpenSession creates a session under cfg.DataDir.
 func OpenSession(cfg config.Config) (*Session, error) {
 	if cfg.DataDir == "" {
@@ -210,6 +232,15 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	if cfg.SessionID == "" {
 		cfg.SessionID = "session-default"
 	}
+	residencyPolicy := cfg.ResidencyPolicy
+	if residencyPolicy == (memory.Policy{}) {
+		residencyPolicy = memory.DefaultPolicy()
+	}
+	h, err := memory.NewHierarchyWithPolicy(residencyPolicy)
+	if err != nil {
+		return nil, fmt.Errorf("residency policy: %w", err)
+	}
+	cfg.ResidencyPolicy = residencyPolicy
 	if err := configureEmbedder(&cfg); err != nil {
 		return nil, err
 	}
@@ -228,7 +259,6 @@ func OpenSession(cfg config.Config) (*Session, error) {
 		return nil, errors.Join(err, led.Close())
 	}
 	st := wsl.NewWorkingState()
-	h := memory.NewHierarchy()
 	coherent := coherence.NewState()
 	ids := observers.NewSeqIDGen()
 	disp := observers.Default(ids, st)
@@ -814,9 +844,18 @@ func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Re
 	return s.semanticSearch(ctx, text, nil)
 }
 
+type semanticSearchHooks struct {
+	beforeResolve         func(int)
+	beforeResidencyCommit func(int, retrieval.Result)
+}
+
 // beforeResolve is an internal deterministic concurrency-test seam. Production
 // callers always enter through SemanticSearch with no hook.
 func (s *Session) semanticSearch(ctx context.Context, text string, beforeResolve func(int)) (retrieval.Result, error) {
+	return s.semanticSearchWithHooks(ctx, text, semanticSearchHooks{beforeResolve: beforeResolve})
+}
+
+func (s *Session) semanticSearchWithHooks(ctx context.Context, text string, hooks semanticSearchHooks) (retrieval.Result, error) {
 	semanticCtx, finishSemantic, err := s.beginSemanticOperation(ctx)
 	if err != nil {
 		return retrieval.Result{}, err
@@ -847,9 +886,14 @@ func (s *Session) semanticSearch(ctx context.Context, text string, beforeResolve
 	if err != nil {
 		return retrieval.Result{}, err
 	}
-	budget := newSemanticMaterializationBudget(s.Cfg.PageFaultTokenBudget)
-
 	for attempt := 0; attempt < semanticCoherenceAttempts; attempt++ {
+		// Each coherence-retry attempt is a fresh resolution against the current
+		// scope, so it must start from a full materialization budget. Sharing one
+		// budget across attempts let attempt 0 exhaust it and forced the
+		// commit-time scope-change retry to abstain with a spurious semantic miss
+		// even when a valid, current, exact-evidence result existed. The bounded
+		// semanticCoherenceAttempts still caps total materialization work.
+		budget := newSemanticMaterializationBudget(s.Cfg.PageFaultTokenBudget)
 		index, intent, attemptState, err := s.captureSemanticAttempt(ctx, text, budget.tokensRemaining)
 		if errors.Is(err, errSemanticAttemptChanged) {
 			if attempt+1 < semanticCoherenceAttempts {
@@ -861,7 +905,7 @@ func (s *Session) semanticSearch(ctx context.Context, text string, beforeResolve
 			return retrieval.Result{}, err
 		}
 		revision := attemptState.revision
-		materialized := make(map[pages.PageID][]string)
+		materialized := make(map[pages.PageID]semanticMaterializedPage)
 		scopeChanged := false
 		ret := &retrieval.HybridRetriever{
 			Index: index,
@@ -901,13 +945,15 @@ func (s *Session) semanticSearch(ctx context.Context, text string, beforeResolve
 				if reason != "" {
 					return retrieval.RecheckResult{Reason: reason}, nil
 				}
-				materialized[page.ID] = evidence
+				materialized[page.ID] = semanticMaterializedPage{
+					page: page, evidence: append([]string(nil), evidence...),
+				}
 				return retrieval.RecheckResult{Eligible: true, TokensUsed: tokensUsed}, nil
 			},
 		}
 
-		if beforeResolve != nil {
-			beforeResolve(attempt)
+		if hooks.beforeResolve != nil {
+			hooks.beforeResolve(attempt)
 		}
 		result, resolveErr := ret.ResolveSemantic(ctx, intent)
 		if err := ctx.Err(); err != nil {
@@ -936,17 +982,142 @@ func (s *Session) semanticSearch(ctx context.Context, text string, beforeResolve
 		}
 
 		for _, candidate := range result.Candidates {
-			evidence, ok := materialized[candidate.Page.ID]
+			materializedPage, ok := materialized[candidate.Page.ID]
 			if !ok {
 				return retrieval.Result{}, fmt.Errorf("%w: selected page lacks exact evidence", retrieval.ErrIndexUnavailable)
 			}
 			result.Materialized = append(result.Materialized, retrieval.MaterializedPage{
-				PageID: candidate.Page.ID, Evidence: append([]string(nil), evidence...),
+				PageID: candidate.Page.ID, Evidence: append([]string(nil), materializedPage.evidence...),
 			})
+		}
+		if hooks.beforeResidencyCommit != nil {
+			hooks.beforeResidencyCommit(attempt, result)
+		}
+		changed, err = s.commitSemanticResidency(attemptState, intent, dense, result, materialized)
+		if err != nil {
+			return retrieval.Result{}, err
+		}
+		if changed {
+			if attempt+1 < semanticCoherenceAttempts {
+				continue
+			}
+			return retrieval.Result{}, semanticScopeMiss(result.Trace)
 		}
 		return result, nil
 	}
 	return retrieval.Result{}, retrieval.ErrSemanticPageMiss
+}
+
+func (s *Session) commitSemanticResidency(
+	attempt semanticAttemptSnapshot,
+	intent retrieval.QueryIntent,
+	dense *retrieval.DenseQuery,
+	result retrieval.Result,
+	materialized map[pages.PageID]semanticMaterializedPage,
+) (bool, error) {
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+	if err := s.operationErrorLocked(); err != nil {
+		return false, err
+	}
+	if s.Index != attempt.index {
+		return false, semanticIndexUnavailable("source projection changed")
+	}
+	if s.IndexErr != nil {
+		return false, semanticIndexUnavailable("documented source projection failure")
+	}
+	if s.Coherence.Snapshot().Revision != attempt.revision || s.lastEvent.Seq != attempt.sourceSeq {
+		return true, nil
+	}
+
+	namespace := ""
+	if dense != nil && dense.UnavailableReason == "" {
+		namespace = dense.Namespace
+	}
+	for _, candidate := range result.Candidates {
+		current, ok := materialized[candidate.Page.ID]
+		if !ok {
+			continue
+		}
+		page := semanticResidentPage(current.page, current.evidence)
+		// A selected semantic page is a real demand only after exact evidence
+		// and final authority freshness have succeeded. L2 rejection is cache
+		// telemetry and never changes the exact fault response.
+		_ = s.Hierarchy.AdmitAuthoritativeDemand(page)
+	}
+	s.observeSemanticShadows(intent, namespace, result.Trace)
+	return false, nil
+}
+
+func (s *Session) observeSemanticShadows(intent retrieval.QueryIntent, namespace string, trace retrieval.RetrievalTrace) {
+	if s.Hierarchy == nil {
+		return
+	}
+	eligible := make(map[pages.PageID]indexer.PageTuple, len(intent.EligiblePageTuples))
+	for _, tuple := range intent.EligiblePageTuples {
+		eligible[tuple.PageID] = tuple
+	}
+	selected := make(map[pages.PageID]struct{}, len(trace.Selected))
+	for _, id := range trace.Selected {
+		selected[id] = struct{}{}
+	}
+	suppressed := make(map[pages.PageID]struct{}, len(trace.Suppressions))
+	for _, suppression := range trace.Suppressions {
+		suppressed[suppression.PageID] = struct{}{}
+	}
+	for _, candidate := range trace.Candidates {
+		if candidate.Selected {
+			continue
+		}
+		if candidate.FinalPosition <= 0 {
+			// Candidates rejected before the final fused ordering are suppressed
+			// estimator inputs even if a future trace producer omits the explicit
+			// categorical suppression entry.
+			continue
+		}
+		if _, ok := selected[candidate.PageID]; ok {
+			continue
+		}
+		if _, ok := suppressed[candidate.PageID]; ok {
+			continue
+		}
+		tuple, ok := eligible[candidate.PageID]
+		if !ok {
+			continue
+		}
+		_ = s.Hierarchy.ObserveSemanticObservation(memory.SemanticObservation{
+			Tuple: memory.PageTuple{
+				ID: string(tuple.PageID), PageVersion: uint64(tuple.PageVersion), SessionID: tuple.SessionID,
+				SourceDigest: string(tuple.SourceDigest), CompilerVersion: string(tuple.CompilerVersion),
+				ScopeEpoch: uint64(tuple.ScopeEpoch),
+			},
+			EmbeddingNamespace: namespace,
+			CandidateOrdinal:   candidate.FinalPosition,
+		})
+	}
+}
+
+func semanticResidentPage(page pages.WarmPage, evidence []string) *memory.Page {
+	refs := make([]string, 0, len(page.Refs))
+	seen := make(map[string]struct{}, len(page.Refs))
+	for _, ref := range page.Refs {
+		if ref.Kind != pages.RefWSLRecord && ref.Kind != pages.RefEvent {
+			continue
+		}
+		if _, duplicate := seen[ref.ID]; duplicate {
+			continue
+		}
+		seen[ref.ID] = struct{}{}
+		refs = append(refs, ref.ID)
+	}
+	return &memory.Page{
+		ID: string(page.ID), PageVersion: uint64(page.Version), SessionID: page.SessionID,
+		CompilerVersion: string(page.CompilerVersion),
+		Refs:            refs, Scope: page.Scope, Branch: page.Branch, Commit: page.Commit,
+		Paths: append([]string(nil), page.PathScope...), SourceDigest: string(page.SourceDigest),
+		ScopeEpoch: uint64(page.ScopeEpoch), Salience: page.Salience, CreatedAt: page.CreatedAt,
+		Body: strings.Join(evidence, "\n\n"),
+	}
 }
 
 type semanticProjectionSnapshot struct {

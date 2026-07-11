@@ -109,54 +109,79 @@ func (r *Resolver) resolvePage(ctx context.Context, id string, budget int) (stri
 	if id == "" {
 		return PageMiss, nil
 	}
-	// Authoritative coherence is checked before every cache and WSL lookup.
-	// A stale L2 hit must never win and fallback must never resurrect it.
+	if r.State != nil {
+		if rec, ok := r.State.Get(id); ok {
+			// Authoritative coherence is checked before both the resident copy and
+			// the WSL fallback. A terminally invalid record must not be resurrected
+			// merely because its exact bytes are still present in either layer.
+			if r.Coherence != nil && !r.Coherence.RecordEligible(id) {
+				return PageMiss, nil
+			}
+			page := r.currentRecordPage(id, rec)
+			if r.Hierarchy != nil {
+				if resident, _, hit := r.Hierarchy.LookupAndUseIfCurrent(page); hit {
+					return trimBudget(serveablePageText(resident), budget), nil
+				}
+				// The WSL clone above is the exact current materialization. A
+				// same-ID content or authority change is therefore a page-in/refresh,
+				// not an L2 hit. Capacity rejection remains diagnostic only.
+				_ = r.Hierarchy.AdmitDemand(page)
+			}
+			return trimBudget(serveablePageText(page), budget), nil
+		}
+	}
+
+	// Cache-only addresses are retained for compatibility, but a coherence
+	// state may authorize only known WSL/page bindings here. Compiler-derived
+	// semantic IDs need their descriptor tuple and refs revalidated by the
+	// semantic materializer; they are not served through this weaker ID-only
+	// fallback.
 	if r.Coherence != nil && !r.Coherence.RecordEligible(id) {
 		return PageMiss, nil
 	}
 	if r.Hierarchy != nil {
-		if p, ok := r.Hierarchy.GetPage(id); ok {
-			if !p.Stale && !p.Invalidated {
-				r.Hierarchy.RecordAccess(id)
-				body := p.Body
-				if body == "" {
-					body = p.Summary
-				}
+		if page, ok := r.Hierarchy.LookupAndUse(id); ok {
+			if body := serveablePageText(page); body != "" {
 				return trimBudget(body, budget), nil
 			}
-			// An eligible logical address with an old resident generation is a
-			// cache miss, not an authority miss. Fall through to WSL/L4 and
-			// rematerialize instead of refreshing stale body metadata in place.
 		}
-	}
-	if r.State == nil {
-		return PageMiss, nil
-	}
-	if f := r.State.FailureByID(id); f != nil {
-		// materialize into L2 when a hierarchy is configured
-		body := renderer.RenderFailureDetail(f)
-		if r.Hierarchy != nil {
-			page := &memory.Page{ID: id, Summary: f.Err, Refs: []string{id}, Body: body}
-			if r.Coherence != nil {
-				if binding, ok := r.Coherence.BindingFor(ledger.TargetRecord, id); ok {
-					page.Scope = binding.Scope
-					page.Branch = binding.Branch
-					page.Commit = binding.Commit
-					page.Paths = append([]string(nil), binding.Paths...)
-					page.SourceDigest = binding.SourceDigest
-					page.ScopeEpoch = binding.Generation()
-				}
-			}
-			r.Hierarchy.PutL2(page)
-			r.Hierarchy.RecordAccess(id)
-		}
-		return trimBudget(body, budget), nil
-	}
-	if rec, ok := r.State.Get(id); ok {
-		text := wsl.Serialize([]wsl.Record{rec})
-		return trimBudget(text, budget), nil
 	}
 	return PageMiss, nil
+}
+
+func (r *Resolver) currentRecordPage(id string, rec wsl.Record) *memory.Page {
+	body := wsl.Serialize([]wsl.Record{rec})
+	summary := ""
+	if failure, isFailure := rec.(*wsl.FailureRecord); isFailure {
+		body = renderer.RenderFailureDetail(failure)
+		summary = failure.Err
+	}
+	page := &memory.Page{ID: id, Summary: summary, Refs: []string{id}, Body: body}
+	if r.Coherence != nil {
+		binding, found := r.Coherence.BindingFor(ledger.TargetRecord, id)
+		if !found {
+			binding, found = r.Coherence.BindingFor(ledger.TargetPage, id)
+		}
+		if found {
+			page.Scope = binding.Scope
+			page.Branch = binding.Branch
+			page.Commit = binding.Commit
+			page.Paths = append([]string(nil), binding.Paths...)
+			page.SourceDigest = binding.SourceDigest
+			page.ScopeEpoch = binding.Generation()
+		}
+	}
+	return page
+}
+
+func serveablePageText(page *memory.Page) string {
+	if page == nil {
+		return ""
+	}
+	if page.Body != "" {
+		return page.Body
+	}
+	return page.Summary
 }
 
 func (r *Resolver) resolveRaw(ctx context.Context, id string, budget int) (string, error) {

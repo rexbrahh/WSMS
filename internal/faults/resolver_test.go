@@ -51,6 +51,105 @@ func TestPageHitFailure(t *testing.T) {
 	}
 }
 
+func TestKnownPageFaultAdmitsThenPromotesOnRepeatedUse(t *testing.T) {
+	state := wsl.NewWorkingState()
+	if err := state.Apply(&wsl.ConstraintRecord{
+		IDValue: "C1", Strength: types.StrengthHard, Source: types.SourceUser,
+		Text: "keep exact demand pages bounded", Scope: types.ScopeTask,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hierarchy := memory.NewHierarchy()
+	resolver := &Resolver{State: state, Hierarchy: hierarchy}
+
+	first, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "C1", Budget: 256})
+	if err != nil || !strings.Contains(first, "keep exact demand pages bounded") {
+		t.Fatalf("first fault = (%q, %v)", first, err)
+	}
+	firstSnapshot := hierarchy.Snapshot()
+	if firstSnapshot.ColdPages != 1 || firstSnapshot.HotPages != 0 || len(firstSnapshot.Resident) != 1 || firstSnapshot.Resident[0].RealUses != 1 {
+		t.Fatalf("first demand snapshot = %#v", firstSnapshot)
+	}
+
+	second, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "C1", Budget: 256})
+	if err != nil || second != first {
+		t.Fatalf("second fault = (%q, %v), want first body %q", second, err, first)
+	}
+	secondSnapshot := hierarchy.Snapshot()
+	if secondSnapshot.HotPages != 1 || secondSnapshot.ColdPages != 0 || len(secondSnapshot.Resident) != 1 || secondSnapshot.Resident[0].RealUses != 2 {
+		t.Fatalf("second demand snapshot = %#v", secondSnapshot)
+	}
+	if secondSnapshot.Metrics.DemandPageIns != 1 || secondSnapshot.Metrics.Hits != 1 {
+		t.Fatalf("fault metrics = %#v, want one page-in then one L2 hit", secondSnapshot.Metrics)
+	}
+}
+
+func TestMutableSameIDRecordMustMatchCurrentMaterialization(t *testing.T) {
+	state := wsl.NewWorkingState()
+	if err := state.Apply(&wsl.NextRecord{Action: "inspect", Target: "old-target"}); err != nil {
+		t.Fatal(err)
+	}
+	hierarchy := memory.NewHierarchy()
+	resolver := &Resolver{State: state, Hierarchy: hierarchy}
+
+	first, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "next", Budget: 256})
+	if err != nil || !strings.Contains(first, "old-target") {
+		t.Fatalf("first next fault = (%q, %v)", first, err)
+	}
+	if err := state.Apply(&wsl.NextRecord{Action: "verify", Target: "new-target"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "next", Budget: 256})
+	if err != nil || !strings.Contains(second, "new-target") || strings.Contains(second, "old-target") {
+		t.Fatalf("updated next fault = (%q, %v)", second, err)
+	}
+	afterRefresh := hierarchy.Snapshot()
+	if afterRefresh.Metrics.DemandPageIns != 2 || afterRefresh.Metrics.Hits != 0 {
+		t.Fatalf("same-ID refresh metrics = %#v, want two page-ins and no false hit", afterRefresh.Metrics)
+	}
+
+	third, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "next", Budget: 256})
+	if err != nil || third != second {
+		t.Fatalf("stable next fault = (%q, %v), want %q", third, err, second)
+	}
+	afterHit := hierarchy.Snapshot()
+	if afterHit.Metrics.DemandPageIns != 2 || afterHit.Metrics.Hits != 1 {
+		t.Fatalf("stable current hit metrics = %#v", afterHit.Metrics)
+	}
+}
+
+func TestBodyClearedResidentFallsThroughToL4Rematerialization(t *testing.T) {
+	state := wsl.NewWorkingState()
+	if err := state.Apply(&wsl.FailureRecord{
+		IDValue: "F1",
+		Cmd:     "go test ./...",
+		Exit:    1,
+		Err:     "current nonempty L4 evidence",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hierarchy := memory.NewHierarchy()
+	hierarchy.PutL2(&memory.Page{ID: "F1", Summary: "poison summary", Body: "poison body", Refs: []string{"F1"}})
+	hierarchy.Reconcile(func(*memory.Page) memory.PageCoherence {
+		return memory.PageCoherence{Stale: true, StaleRevision: 1}
+	})
+	hierarchy.Reconcile(func(*memory.Page) memory.PageCoherence {
+		return memory.PageCoherence{}
+	})
+	if page, ok := hierarchy.GetPage("F1"); !ok || page.Body != "" || page.Summary != "" {
+		t.Fatalf("precondition body-cleared resident=%#v ok=%v", page, ok)
+	}
+	resolver := &Resolver{State: state, Hierarchy: hierarchy}
+	got, err := resolver.Resolve(context.Background(), Request{Kind: "page", ID: "F1", Budget: 512})
+	if err != nil || !strings.Contains(got, "current nonempty L4 evidence") || strings.Contains(got, "poison") {
+		t.Fatalf("rematerialized fault=(%q,%v)", got, err)
+	}
+	page, ok := hierarchy.GetPage("F1")
+	if !ok || page.Body == "" || strings.Contains(page.Body, "poison") {
+		t.Fatalf("resident not repopulated with current body: %#v ok=%v", page, ok)
+	}
+}
+
 func TestInvalidatedPageDependencyCannotFallBackToWSL(t *testing.T) {
 	coherent := coherence.NewState()
 	apply := func(ev ledger.Event, updates []wsl.Update) {
