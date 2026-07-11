@@ -758,32 +758,42 @@ Stop conditions (not hit on verified platform):
 
 #### Phase 7D - Namespaced local embedder
 
+**Status:** complete on the development path. The embedder remains optional,
+local-first, and non-authoritative; semantic resolution is still FTS-first until
+Phase 7E hybrid ranking is explicitly implemented.
+
 **Objective:** add reproducible private query/document embeddings without
 placing inference in the truth path.
 
 Implementation:
 
-1. Define `EmbeddingNamespace` over exact model revision, dimensions, metric,
-   normalization, tokenizer, query instruction, document template, page schema,
-   and redaction version.
-2. Add `Embedder` with distinct `EmbedDocuments` and `EmbedQuery` methods.
-3. Implement the reference Qwen3-Embedding-0.6B profile behind a supervised
+1. [x] Define `EmbeddingNamespace` over exact model revision, dimensions,
+   metric, normalization, tokenizer, query instruction, document template, page
+   schema, and redaction version.
+2. [x] Add `Embedder` with distinct `EmbedDocuments` and `EmbedQuery` methods.
+3. [x] Implement the reference Qwen3-Embedding-0.6B profile behind a supervised
    local sidecar/adapter with bounded Unix-socket or loopback transport.
-4. Add startup self-check, batch limits, deadlines, cancellation, circuit
+4. [x] Add startup self-check, batch limits, deadlines, cancellation, circuit
    breaker, content-addressed document embedding cache, and health reporting.
-5. Exclude secrets, denied paths, unrestricted artifacts, and raw transcripts;
-   retain inspectable canonical search text locally.
-6. Keep hosted providers disabled unless explicitly configured with redaction,
-   payload inspection, cost/error telemetry, and a distinct namespace.
+5. [x] Exclude secrets, denied paths, unrestricted artifacts, and raw
+   transcripts; retain inspectable canonical search text locally.
+6. [x] Keep hosted providers disabled unless explicitly configured with
+   redaction, payload inspection, cost/error telemetry, and a distinct
+   namespace.
 
 Verification/gates:
 
-- Query/document inversion, dimension mismatch, namespace mismatch, and
-  malformed vectors fail visibly.
-- Embedder timeout degrades to FTS-only while ledger writes and direct faults
-  continue.
-- Re-embedding identical canonical content reuses the namespaced cache.
-- A namespace change builds a new generation; mixed-vector search is impossible.
+- [x] Query/document inversion, dimension mismatch, namespace mismatch, and
+      malformed vectors fail visibly.
+- [x] Embedder timeout degrades to FTS-only while ledger writes and direct
+      faults continue.
+- [x] Re-embedding identical canonical content reuses the namespaced cache.
+- [x] A namespace change builds a new generation; mixed-vector search is
+      impossible.
+- [x] Failed embedding backfills do not advance truth: page watermarks continue
+      and missing-vector pages are retried in-session and after reopen.
+- [x] Embedding inference runs out of the append/direct-fault path; a blocked or
+      failed embedder cannot delay ledger writes or exact page faults.
 
 #### Phase 7E - Hybrid semantic faults
 

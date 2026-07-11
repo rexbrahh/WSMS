@@ -35,10 +35,13 @@ deterministic vector-free proof of the paging mechanism. Phase 7A adds an
 offline deterministic page compiler and exact cosine oracle. Phase 7B adds a
 disposable FTS5 warm index under `<data-dir>/index/` (safe to delete). Phase 7C
 adds an optional sqlite-vec dense projection (config `DenseDimensions`; off by
-default), with session + embedding namespace as pre-KNN partition keys. Every
-semantic hit is revalidated and faulted back through current L4 evidence before
-it can be returned. The demo path remains a vector-free mechanism proof and
-does not require the index or dense search.
+default), with session + embedding namespace as pre-KNN partition keys. Phase
+7D adds the supervised private embedder ABI, Qwen3-compatible local profile,
+loopback/Unix-socket sidecar client, self-checks, circuit breaking, bounded
+document cache, and async vector backfill. Every semantic hit is revalidated
+and faulted back through current L4 evidence before it can be returned. The
+demo path remains a vector-free mechanism proof and does not require the index,
+dense search, or an embedding sidecar.
 
 ## Layout
 

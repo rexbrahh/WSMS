@@ -947,14 +947,22 @@ config-gated (`DenseDimensions`, default 0).
 - `SearchDense`, vector upsert/delete, invalidate cleanup, legacy projection
   recreation, compatible-vector rebuild copy, and restart meta restore.
 - Exact cosine oracle parity tests in `internal/indexer/parity_test.go`.
-- Real document/query embeddings still require L3-3 / Phase 7D.
+- Real document/query embeddings are supplied by L3-3 / Phase 7D when a local
+  embedder is configured; FTS remains the default fallback and truth path.
 
 ### L3-3 - Local embedding adapter
 
-- Implement namespace/profile types and document/query separation.
-- Add the local Qwen3 profile through a supervised adapter.
-- Add redaction, batching, deadlines, circuit breaking, self-checks, and caches.
-- Make FTS fallback visible and deterministic.
+**Status:** complete on the development path; optional and local-first.
+
+- Namespace/profile types and document/query separation are implemented in
+  `internal/embedder`.
+- The reference Qwen3 profile is represented as a complete namespace ABI and
+  runs behind the supervised local sidecar client.
+- Redaction/admission, batching, deadlines, circuit breaking, self-checks,
+  document-cache singleflight, and bounded response handling are covered by
+  tests.
+- FTS fallback remains visible and deterministic; dense embedding/backfill is
+  asynchronous and never blocks L4 append or direct page faults.
 
 ### L3-4 - Hybrid semantic faults
 
