@@ -64,6 +64,20 @@ var (
 	// whose expected page tuple no longer matches the current warm page. The
 	// caller should discard the result and rediscover the current backlog.
 	ErrStalePageTuple = errors.New("stale warm page tuple")
+	// ErrInvalidPageTuple reports an incomplete or unrepresentable exact page
+	// identity supplied to an authority-complete search.
+	ErrInvalidPageTuple = errors.New("invalid warm page tuple")
+	// ErrAuthoritySnapshotTooLarge reports that the active page-table snapshot
+	// cannot be represented within the bounded serving contract. Callers must
+	// treat this as an operational fault, never as an empty authority set.
+	ErrAuthoritySnapshotTooLarge = errors.New("warm index authority snapshot exceeds bound")
+	// ErrEligibilitySetTooLarge reports an authority-complete search whose exact
+	// tuple set or encoded SQL payload exceeds the bounded serving contract.
+	ErrEligibilitySetTooLarge = errors.New("warm index eligibility set exceeds bound")
+	// ErrAuthorityDescriptorCorrupt reports malformed stored page-table metadata
+	// encountered while reconstructing an authority-complete serving snapshot.
+	// Callers must treat it as an operational index fault, never a semantic miss.
+	ErrAuthorityDescriptorCorrupt = errors.New("warm index authority descriptor is corrupt")
 )
 
 const (

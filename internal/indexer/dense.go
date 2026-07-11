@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -201,6 +202,23 @@ CREATE INDEX IF NOT EXISTS warm_page_vec_rows_session_namespace
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS warm_page_vec_shadow (
+  page_id             TEXT PRIMARY KEY NOT NULL,
+  session_id          TEXT NOT NULL,
+  page_version        INTEGER NOT NULL,
+  source_digest       TEXT NOT NULL,
+  compiler_version    TEXT NOT NULL,
+  embedding_namespace TEXT NOT NULL,
+  vector_json         TEXT NOT NULL
+)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS warm_page_vec_shadow_session_namespace
+  ON warm_page_vec_shadow(session_id, embedding_namespace)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS warm_page_vec_suppressed (
   page_id             TEXT PRIMARY KEY NOT NULL,
   session_id          TEXT NOT NULL,
@@ -247,6 +265,17 @@ FROM warm_page_vec_map`)
 
 // UpsertVectors writes or replaces dense vectors for existing warm pages.
 func (idx *Index) UpsertVectors(ctx context.Context, records []VectorRecord) error {
+	return idx.upsertVectors(ctx, records, false)
+}
+
+// upsertCanonicalVectors restores vectors already encoded at the local
+// unit-float32 ABI boundary. It is reserved for rebuild copy so a canonical
+// shadow value is not repeatedly renormalized across generations.
+func (idx *Index) upsertCanonicalVectors(ctx context.Context, records []VectorRecord) error {
+	return idx.upsertVectors(ctx, records, true)
+}
+
+func (idx *Index) upsertVectors(ctx context.Context, records []VectorRecord, canonical bool) error {
 	release, err := idx.beginOperation(ctx)
 	if err != nil {
 		return err
@@ -271,7 +300,17 @@ func (idx *Index) UpsertVectors(ctx context.Context, records []VectorRecord) err
 		if err := contextErr(ctx); err != nil {
 			return err
 		}
-		if err := idx.upsertVectorTx(ctx, tx, rec); err != nil {
+		if canonical {
+			if err := validateCanonicalVector(rec.Vector, idx.denseDims); err != nil {
+				return err
+			}
+		} else {
+			rec.Vector, err = canonicalizeVector(rec.Vector, idx.denseDims)
+			if err != nil {
+				return err
+			}
+		}
+		if err := idx.upsertCanonicalVectorTx(ctx, tx, rec); err != nil {
 			return err
 		}
 	}
@@ -397,6 +436,13 @@ LEFT JOIN warm_page_vec_rows r
  AND r.page_id = m.page_id
  AND r.session_id = p.session_id
  AND r.embedding_namespace = ?
+LEFT JOIN warm_page_vec_shadow sh
+  ON sh.page_id = p.page_id
+ AND sh.session_id = p.session_id
+ AND sh.page_version = p.page_version
+ AND sh.source_digest = p.source_digest
+ AND sh.compiler_version = p.compiler_version
+ AND sh.embedding_namespace = ?
 LEFT JOIN warm_page_vec_suppressed s
   ON s.page_id = p.page_id
  AND s.session_id = p.session_id
@@ -408,9 +454,9 @@ WHERE p.session_id = ?
   AND p.status = 'active'
   AND p.search_text <> ''
   AND s.page_id IS NULL
-  AND (m.page_id IS NULL OR r.rowid IS NULL)
+  AND (m.page_id IS NULL OR r.rowid IS NULL OR sh.page_id IS NULL)
 ORDER BY p.source_seq_max ASC, p.page_id ASC
-LIMIT ?`, namespace, namespace, namespace, sessionID, limit)
+LIMIT ?`, namespace, namespace, namespace, namespace, sessionID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -429,10 +475,7 @@ LIMIT ?`, namespace, namespace, namespace, sessionID, limit)
 	return out, rows.Err()
 }
 
-func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorRecord) error {
-	if err := validateVector(rec.Vector, idx.denseDims); err != nil {
-		return err
-	}
+func (idx *Index) upsertCanonicalVectorTx(ctx context.Context, tx *sql.Tx, rec VectorRecord) error {
 	namespace, err := idx.vectorNamespace(rec.EmbeddingNamespace)
 	if err != nil {
 		return err
@@ -512,7 +555,19 @@ ON CONFLICT(rowid) DO UPDATE SET
 			return err
 		}
 	}
-	return nil
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO warm_page_vec_shadow(page_id, session_id, page_version, source_digest, compiler_version, embedding_namespace, vector_json)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(page_id) DO UPDATE SET
+  session_id = excluded.session_id,
+  page_version = excluded.page_version,
+  source_digest = excluded.source_digest,
+  compiler_version = excluded.compiler_version,
+  embedding_namespace = excluded.embedding_namespace,
+  vector_json = excluded.vector_json`,
+		string(rec.PageID), rec.SessionID, pageVersion, sourceDigest, compilerVersion, namespace, vectorJSON(rec.Vector),
+	)
+	return err
 }
 
 func (idx *Index) suppressVectorTx(ctx context.Context, tx *sql.Tx, rec VectorSuppression) error {
@@ -623,6 +678,11 @@ func deleteDenseProjectionTx(ctx context.Context, tx *sql.Tx, pageID pages.PageI
 	if pageID == "" {
 		return nil
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM warm_page_vec_shadow WHERE page_id = ?`, string(pageID)); err != nil {
+		if !strings.Contains(err.Error(), "no such table") {
+			return err
+		}
+	}
 	var rowID int64
 	err := tx.QueryRowContext(ctx, `SELECT rowid FROM warm_page_vec_map WHERE page_id = ?`, string(pageID)).Scan(&rowID)
 	if err == sql.ErrNoRows {
@@ -689,6 +749,7 @@ func dropDenseProjectionTx(ctx context.Context, tx *sql.Tx) error {
 		`DROP TABLE IF EXISTS warm_pages_vec`,
 		`DROP TABLE IF EXISTS warm_page_vec_suppressed`,
 		`DROP TABLE IF EXISTS warm_page_vec_rows`,
+		`DROP TABLE IF EXISTS warm_page_vec_shadow`,
 		`DROP TABLE IF EXISTS warm_page_vec_map`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -698,7 +759,9 @@ func dropDenseProjectionTx(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// SearchDense runs cosine KNN over the optional vec0 projection.
+// SearchDense applies hard eligibility filters through sqlite-vec's rowid-IN
+// bitmap before cosine KNN scoring. The regular shadow remains the canonical
+// rebuild/residency value; vec0 is the disposable local serving projection.
 // Candidate.Rank is cosine distance (lower is better). Dense is unavailable
 // when the index was opened without DenseDimensions.
 func (idx *Index) SearchDense(ctx context.Context, q SearchQuery, vector []float64) ([]Candidate, error) {
@@ -710,24 +773,13 @@ func (idx *Index) SearchDense(ctx context.Context, q SearchQuery, vector []float
 	if q.SessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	namespace, err := idx.vectorNamespace(q.EmbeddingNamespace)
+	plan, err := newSearchPlan(q)
 	if err != nil {
 		return nil, err
 	}
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 10
-	}
-	if limit > 100 {
-		limit = 100
-	}
-	// Over-fetch so Go post-filters can still fill the limit.
-	fetch := limit * 4
-	if fetch < 20 {
-		fetch = 20
-	}
-	if fetch > 200 {
-		fetch = 200
+	namespace, err := idx.vectorNamespace(q.EmbeddingNamespace)
+	if err != nil {
+		return nil, err
 	}
 
 	idx.mu.RLock()
@@ -738,21 +790,83 @@ func (idx *Index) SearchDense(ctx context.Context, q SearchQuery, vector []float
 	if idx.denseDims <= 0 {
 		return nil, ErrDenseUnavailable
 	}
-	if err := validateVector(vector, idx.denseDims); err != nil {
+	canonicalVector, err := canonicalizeVector(vector, idx.denseDims)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := idx.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	generation, watermark, err := searchSnapshotTx(ctx, tx, plan.sessionID)
+	if err != nil {
 		return nil, err
 	}
 
-	rows, err := idx.db.QueryContext(ctx, `
-SELECT m.page_id, v.distance, m.page_version, m.source_digest, m.compiler_version
+	args := []any{vectorJSON(canonicalVector), plan.limit, plan.sessionID, namespace, plan.sessionID, namespace}
+	var b strings.Builder
+	b.WriteString(`
+SELECT p.page_id, p.page_version, p.session_id, p.repo_id, p.task_id, p.branch, p.commit_id,
+       p.path_scope_json, p.scope, p.kind, p.trust, p.status, p.salience, p.salience_reason,
+       p.search_text, p.summary, p.refs_json, p.source_digest, p.source_seq_min, p.source_seq_max,
+       p.compiler_version, p.scope_epoch, p.created_at, p.last_verified_at,
+       v.distance
 FROM warm_pages_vec v
-JOIN warm_page_vec_map m ON m.rowid = v.rowid
+JOIN warm_page_vec_map m
+  ON m.rowid = v.rowid
+JOIN warm_page_vec_rows r
+  ON r.rowid = m.rowid
+ AND r.page_id = m.page_id
+ AND r.session_id = m.session_id
+ AND r.embedding_namespace = m.embedding_namespace
+JOIN warm_page_vec_shadow sh
+  ON sh.page_id = m.page_id
+ AND sh.session_id = m.session_id
+ AND sh.page_version = m.page_version
+ AND sh.source_digest = m.source_digest
+ AND sh.compiler_version = m.compiler_version
+ AND sh.embedding_namespace = m.embedding_namespace
+JOIN warm_pages p
+  ON p.page_id = m.page_id
+ AND p.session_id = m.session_id
+ AND p.page_version = m.page_version
+ AND p.source_digest = m.source_digest
+ AND p.compiler_version = m.compiler_version
 WHERE v.embedding MATCH ?
   AND v.k = ?
   AND v.session_id = ?
   AND v.embedding_namespace = ?
-  AND m.embedding_namespace = ?
-ORDER BY v.distance ASC, m.page_id ASC
-`, vectorJSON(vector), fetch, q.SessionID, namespace, namespace)
+  AND v.rowid IN (
+    SELECT fm.rowid
+    FROM warm_page_vec_map fm
+    JOIN warm_page_vec_rows fr
+      ON fr.rowid = fm.rowid
+     AND fr.page_id = fm.page_id
+     AND fr.session_id = fm.session_id
+     AND fr.embedding_namespace = fm.embedding_namespace
+    JOIN warm_page_vec_shadow fsh
+      ON fsh.page_id = fm.page_id
+     AND fsh.session_id = fm.session_id
+     AND fsh.page_version = fm.page_version
+     AND fsh.source_digest = fm.source_digest
+     AND fsh.compiler_version = fm.compiler_version
+     AND fsh.embedding_namespace = fm.embedding_namespace
+    JOIN warm_pages p
+      ON p.page_id = fm.page_id
+     AND p.session_id = fm.session_id
+     AND p.page_version = fm.page_version
+     AND p.source_digest = fm.source_digest
+     AND p.compiler_version = fm.compiler_version
+    WHERE p.session_id = ?
+      AND fm.embedding_namespace = ?
+`)
+	plan.appendSQL(&b, &args)
+	b.WriteString(`
+  )
+ORDER BY v.distance ASC`)
+
+	rows, err := tx.QueryContext(ctx, b.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("dense search: %w", err)
 	}
@@ -763,68 +877,44 @@ ORDER BY v.distance ASC, m.page_id ASC
 		if err := contextErr(ctx); err != nil {
 			return nil, err
 		}
-		var pageID string
-		var distance float64
-		var pageVersion int64
-		var sourceDigest, compilerVersion string
-		if err := rows.Scan(&pageID, &distance, &pageVersion, &sourceDigest, &compilerVersion); err != nil {
-			return nil, err
-		}
-		page, err := loadPageByID(ctx, idx.db, pageID)
+		page, distance, err := scanPageWithRank(rows)
 		if err != nil {
-			if err == sql.ErrNoRows {
-				continue
-			}
 			return nil, err
 		}
-		if page.Status != pages.StatusActive {
-			continue
-		}
-		if int64(page.Version) != pageVersion || string(page.SourceDigest) != sourceDigest || string(page.CompilerVersion) != compilerVersion {
-			continue
-		}
-		if page.SessionID != q.SessionID {
-			continue
-		}
-		if q.RepoID != "" && page.RepoID != "" && page.RepoID != q.RepoID {
-			continue
-		}
-		if q.TaskID != "" && page.TaskID != "" && page.TaskID != q.TaskID {
-			continue
-		}
-		if q.Branch != "" && page.Branch != "" && page.Branch != q.Branch {
-			continue
-		}
-		if q.Commit != "" && page.Commit != "" && page.Commit != q.Commit {
-			continue
-		}
-		if len(q.Kinds) > 0 && !kindAllowed(page.Kind, q.Kinds) {
-			continue
-		}
-		if len(q.Trust) > 0 && !trustAllowed(page.Trust, q.Trust) {
-			continue
+		if !isFinite(distance) || distance < 0 {
+			return nil, fmt.Errorf("dense search: non-finite distance")
 		}
 		out = append(out, Candidate{
-			Page: page,
-			Rank: distance,
-			Explanation: fmt.Sprintf("channel=vec0 metric=cosine namespace=%s distance=%.6f filters=session,namespace,status=active,page-version page=%s",
-				namespace, distance, page.ID),
+			Page: page, Rank: distance,
+			Tuple:             tupleForPage(page),
+			ServingGeneration: generation,
+			Watermark:         watermark,
+			ScoreKind:         ScoreKindCosineDistance,
+			Explanation: fmt.Sprintf("channel=dense backend=sqlite-vec score_kind=%s namespace=%s filters=%s page=%s",
+				ScoreKindCosineDistance, namespace, strings.Join(plan.filterLabels(), ","), page.ID),
 		})
-		if len(out) >= limit {
-			break
-		}
 	}
-	return out, rows.Err()
-}
-
-func loadPageByID(ctx context.Context, db *sql.DB, pageID string) (pages.WarmPage, error) {
-	row := db.QueryRowContext(ctx, `
-SELECT page_id, page_version, session_id, repo_id, task_id, branch, commit_id,
-       path_scope_json, scope, kind, trust, status, salience, salience_reason,
-       search_text, summary, refs_json, source_digest, source_seq_min, source_seq_max,
-       compiler_version, scope_epoch, created_at, last_verified_at
-FROM warm_pages WHERE page_id = ?`, pageID)
-	return scanPageRow(row)
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// sqlite-vec chooses at most k rows before Go sees them. Sorting here makes
+	// distance ties deterministic by PageID only within that returned set. When
+	// more than k eligible rows tie at the boundary, membership is backend-
+	// defined and may change after projection rebuild; resolving that would
+	// require retrieving the entire boundary tie (which is not safely bounded).
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Rank != out[j].Rank {
+			return out[i].Rank < out[j].Rank
+		}
+		return out[i].Page.ID < out[j].Page.ID
+	})
+	if len(out) > plan.limit {
+		out = out[:plan.limit]
+	}
+	for i := range out {
+		out[i].ChannelOrdinal = i + 1
+	}
+	return out, nil
 }
 
 type scannable interface {
@@ -837,45 +927,119 @@ func scanPageRow(row scannable) (pages.WarmPage, error) {
 	return scanPageFromScanner(row)
 }
 
-func kindAllowed(kind pages.PageKind, allowed []pages.PageKind) bool {
-	for _, a := range allowed {
-		if a == kind {
-			return true
+func canonicalizeVector(vector []float64, dims int) ([]float64, error) {
+	if dims <= 0 {
+		return nil, ErrDenseUnavailable
+	}
+	if len(vector) != dims {
+		return nil, fmt.Errorf("%w: vector dimension %d != %d", pages.ErrInvalidVector, len(vector), dims)
+	}
+	if len(vector) == 0 {
+		return nil, fmt.Errorf("%w: empty vector", pages.ErrInvalidVector)
+	}
+	var maxAbs float64
+	for _, v := range vector {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("%w: non-finite component", pages.ErrInvalidVector)
+		}
+		if absolute := math.Abs(v); absolute > maxAbs {
+			maxAbs = absolute
 		}
 	}
-	return false
-}
-
-func trustAllowed(trust pages.Trust, allowed []pages.Trust) bool {
-	for _, a := range allowed {
-		if a == trust {
-			return true
-		}
+	if maxAbs == 0 {
+		return nil, fmt.Errorf("%w: zero vector", pages.ErrInvalidVector)
 	}
-	return false
+
+	// Scale before Hypot so directions remain representable even when the raw
+	// float64 norm would overflow or underflow. The largest scaled component is
+	// exactly one, so this norm is finite for every supported dimension.
+	var scaledNorm float64
+	for _, v := range vector {
+		scaledNorm = math.Hypot(scaledNorm, v/maxAbs)
+	}
+	if scaledNorm == 0 || !isFinite(scaledNorm) {
+		return nil, fmt.Errorf("%w: unrepresentable vector norm", pages.ErrInvalidVector)
+	}
+
+	canonical := make([]float64, len(vector))
+	var quantizedNorm float64
+	for i, v := range vector {
+		quantized := float32((v / maxAbs) / scaledNorm)
+		if math.IsNaN(float64(quantized)) || math.IsInf(float64(quantized), 0) {
+			return nil, fmt.Errorf("%w: unrepresentable float32 component", pages.ErrInvalidVector)
+		}
+		canonical[i] = float64(quantized)
+		quantizedNorm = math.Hypot(quantizedNorm, canonical[i])
+	}
+	if quantizedNorm == 0 || !isFinite(quantizedNorm) {
+		return nil, fmt.Errorf("%w: vector direction is not float32-representable", pages.ErrInvalidVector)
+	}
+
+	// Renormalize after the first float32 conversion, then quantize once more.
+	// Stored JSON therefore contains only exact float32 values and the same
+	// canonical direction is sent to sqlite-vec on writes and MATCH queries.
+	for i, v := range canonical {
+		canonical[i] = float64(float32(v / quantizedNorm))
+	}
+	if err := validateCanonicalVector(canonical, dims); err != nil {
+		return nil, err
+	}
+	return canonical, nil
 }
 
-func validateVector(vector []float64, dims int) error {
+func validateCanonicalVector(vector []float64, dims int) error {
 	if dims <= 0 {
 		return ErrDenseUnavailable
 	}
 	if len(vector) != dims {
-		return fmt.Errorf("%w: vector dimension %d != %d", pages.ErrInvalidVector, len(vector), dims)
-	}
-	if len(vector) == 0 {
-		return fmt.Errorf("%w: empty vector", pages.ErrInvalidVector)
+		return fmt.Errorf("%w: canonical vector dimension %d != %d", pages.ErrInvalidVector, len(vector), dims)
 	}
 	var norm float64
-	for _, v := range vector {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return fmt.Errorf("%w: non-finite component", pages.ErrInvalidVector)
+	for _, value := range vector {
+		if !isFinite(value) {
+			return fmt.Errorf("%w: non-finite canonical component", pages.ErrInvalidVector)
 		}
-		norm = math.Hypot(norm, v)
+		quantized := float32(value)
+		if !isFinite(float64(quantized)) || float64(quantized) != value {
+			return fmt.Errorf("%w: canonical component is not float32-safe", pages.ErrInvalidVector)
+		}
+		norm = math.Hypot(norm, value)
 	}
-	if norm == 0 || math.IsInf(norm, 0) {
-		return fmt.Errorf("%w: zero or overflowing norm", pages.ErrInvalidVector)
+	if norm == 0 || !isFinite(norm) {
+		return fmt.Errorf("%w: zero or non-finite canonical norm", pages.ErrInvalidVector)
+	}
+	// A unit vector rounded component-wise to float32 stays within this fixed
+	// tolerance for the supported maximum of 4096 dimensions.
+	if math.Abs(norm-1) > 2e-6 {
+		return fmt.Errorf("%w: canonical vector is not unit length", pages.ErrInvalidVector)
 	}
 	return nil
+}
+
+func cosineDistance(a, b []float64) float64 {
+	canonicalA, err := canonicalizeVector(a, len(a))
+	if err != nil {
+		return math.Inf(1)
+	}
+	canonicalB, err := canonicalizeVector(b, len(a))
+	if err != nil {
+		return math.Inf(1)
+	}
+	var normA, normB float64
+	for i := range canonicalA {
+		normA = math.Hypot(normA, canonicalA[i])
+		normB = math.Hypot(normB, canonicalB[i])
+	}
+	var similarity float64
+	for i := range canonicalA {
+		similarity += (canonicalA[i] / normA) * (canonicalB[i] / normB)
+	}
+	if similarity > 1 {
+		similarity = 1
+	} else if similarity < -1 {
+		similarity = -1
+	}
+	return 1 - similarity
 }
 
 func vectorJSON(vector []float64) string {
@@ -922,11 +1086,35 @@ func (idx *Index) vectorNamespace(value string) (string, error) {
 
 func copyCompatibleVectors(ctx context.Context, from *sql.DB, to *Index) (int, error) {
 	rows, err := from.QueryContext(ctx, `
-SELECT m.page_id, m.session_id, m.page_version, m.source_digest,
-       m.compiler_version, m.embedding_namespace, vec_to_json(v.embedding)
-FROM warm_page_vec_map m
-JOIN warm_pages_vec v ON v.rowid = m.rowid
-ORDER BY m.page_id`)
+SELECT page_id, session_id, page_version, source_digest,
+       compiler_version, embedding_namespace, vector_json
+FROM (
+  SELECT m.page_id, m.session_id, m.page_version, m.source_digest,
+         m.compiler_version, m.embedding_namespace, sh.vector_json,
+         0 AS source_priority
+  FROM warm_page_vec_map m
+  JOIN warm_page_vec_shadow sh
+    ON sh.page_id = m.page_id
+   AND sh.session_id = m.session_id
+   AND sh.page_version = m.page_version
+   AND sh.source_digest = m.source_digest
+   AND sh.compiler_version = m.compiler_version
+   AND sh.embedding_namespace = m.embedding_namespace
+
+  UNION ALL
+
+  SELECT m.page_id, m.session_id, m.page_version, m.source_digest,
+         m.compiler_version, m.embedding_namespace, vec_to_json(v.embedding),
+         1 AS source_priority
+  FROM warm_page_vec_map m
+  JOIN warm_pages_vec v ON v.rowid = m.rowid
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM warm_page_vec_shadow sh
+    WHERE sh.page_id = m.page_id
+  )
+)
+ORDER BY page_id, source_priority`)
 	if err != nil {
 		return 0, err
 	}
@@ -970,6 +1158,15 @@ ORDER BY m.page_id`)
 		if err := json.Unmarshal([]byte(encoded), &vector); err != nil {
 			return 0, err
 		}
+		if err := validateCanonicalVector(vector, to.denseDims); err != nil {
+			// Legacy shadow/vec0 rows predate the unit-float32 ABI. Convert them
+			// exactly once at rebuild; current canonical rows are copied byte-for-
+			// byte so repeated rebuilds cannot drift.
+			vector, err = canonicalizeVector(vector, to.denseDims)
+			if err != nil {
+				return 0, err
+			}
+		}
 		compatible = append(compatible, VectorRecord{
 			PageID: pages.PageID(pageID), SessionID: sessionID,
 			PageVersion: pages.PageVersion(pageVersion), SourceDigest: pages.SourceDigest(sourceDigest), CompilerVersion: pages.CompilerVersion(compilerVersion),
@@ -980,7 +1177,7 @@ ORDER BY m.page_id`)
 		return 0, err
 	}
 	if len(compatible) > 0 {
-		if err := to.UpsertVectors(ctx, compatible); err != nil {
+		if err := to.upsertCanonicalVectors(ctx, compatible); err != nil {
 			return 0, err
 		}
 	}

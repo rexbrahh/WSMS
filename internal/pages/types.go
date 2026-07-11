@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"wsms/internal/ledger"
 	"wsms/internal/types"
@@ -255,11 +256,8 @@ func (m PageMutation) Validate() error {
 	if !warmPageIDRE.MatchString(string(p.ID)) || !validToken(p.SessionID, 256) {
 		return fmt.Errorf("%w: malformed page or session id", ErrInvalidPage)
 	}
-	if !validKind(p.Kind) || !validTrust(p.Trust) || !validStatus(p.Status) || !validScope(p.Scope) {
-		return fmt.Errorf("%w: invalid kind/trust/status/scope on %s", ErrInvalidPage, p.ID)
-	}
-	if !validTrustForKind(p.Kind, p.Trust) {
-		return fmt.Errorf("%w: trust %q cannot authorize kind %q", ErrInvalidPage, p.Trust, p.Kind)
+	if !validStatus(p.Status) {
+		return fmt.Errorf("%w: invalid status on %s", ErrInvalidPage, p.ID)
 	}
 	if m.Op == MutationInvalidate && p.Status != StatusInvalidated {
 		return fmt.Errorf("%w: invalidate mutation %s must have invalidated status", ErrInvalidPage, p.ID)
@@ -285,27 +283,8 @@ func (m PageMutation) Validate() error {
 	if strings.TrimSpace(p.SalienceReason) == "" || len(p.SalienceReason) > MaxReasonBytes || hasUnsafeText(p.SalienceReason) {
 		return fmt.Errorf("%w: page %s requires a salience reason", ErrInvalidPage, p.ID)
 	}
-	if err := validatePageScope(p); err != nil {
+	if err := ValidateAuthorityDescriptor(p.Kind, p.Trust, p.Scope, p.RepoID, p.TaskID, p.Branch, p.Commit, p.PathScope, p.Refs); err != nil {
 		return fmt.Errorf("%w: page %s: %v", ErrInvalidPage, p.ID, err)
-	}
-	if len(p.Refs) == 0 || len(p.Refs) > MaxPageRefs {
-		return fmt.Errorf("%w: page %s has %d refs, expected 1..%d", ErrInvalidPage, p.ID, len(p.Refs), MaxPageRefs)
-	}
-	seen := make(map[string]bool, len(p.Refs))
-	previous := ""
-	for i, ref := range p.Refs {
-		if err := ref.validate(); err != nil {
-			return fmt.Errorf("%w: page %s: %v", ErrInvalidPage, p.ID, err)
-		}
-		address := ref.Address()
-		if seen[address] {
-			return fmt.Errorf("%w: duplicate ref %s on %s", ErrInvalidPage, address, p.ID)
-		}
-		if i > 0 && address < previous {
-			return fmt.Errorf("%w: refs on %s are not canonically sorted", ErrInvalidPage, p.ID)
-		}
-		seen[address] = true
-		previous = address
 	}
 	if m.Op == MutationUpsert {
 		if strings.TrimSpace(p.SearchText) == "" || strings.TrimSpace(p.Summary) == "" {
@@ -320,6 +299,59 @@ func (m PageMutation) Validate() error {
 		if hasUnsafeText(p.SearchText) || hasUnsafeText(p.Summary) {
 			return fmt.Errorf("%w: page %s contains control text", ErrInvalidPage, p.ID)
 		}
+	}
+	return nil
+}
+
+// ValidateAuthorityDescriptor validates the non-prose page-table fields used
+// to decide whether a compiled page remains coherent. It is shared by page
+// mutation admission and disposable index snapshot reconstruction so their
+// authority rules cannot drift.
+func ValidateAuthorityDescriptor(
+	kind PageKind,
+	trust Trust,
+	scope types.Scope,
+	repoID, taskID, branch, commit string,
+	pathScope []string,
+	refs []PageRef,
+) error {
+	if !validKind(kind) {
+		return fmt.Errorf("unknown page kind %q", kind)
+	}
+	if !validTrust(trust) {
+		return fmt.Errorf("unknown page trust %q", trust)
+	}
+	if !validTrustForKind(kind, trust) {
+		return fmt.Errorf("trust %q cannot authorize kind %q", trust, kind)
+	}
+	if !validScope(scope) {
+		return fmt.Errorf("unknown scope %q", scope)
+	}
+	page := WarmPage{
+		Scope: scope, RepoID: repoID, TaskID: taskID, Branch: branch, Commit: commit,
+		PathScope: pathScope,
+	}
+	if err := validatePageScope(page); err != nil {
+		return err
+	}
+	if len(refs) == 0 || len(refs) > MaxPageRefs {
+		return fmt.Errorf("descriptor has %d refs, expected 1..%d", len(refs), MaxPageRefs)
+	}
+	seen := make(map[string]bool, len(refs))
+	previous := ""
+	for i, ref := range refs {
+		if err := ref.validate(); err != nil {
+			return err
+		}
+		address := ref.Address()
+		if seen[address] {
+			return fmt.Errorf("duplicate ref %s", address)
+		}
+		if i > 0 && address < previous {
+			return fmt.Errorf("refs are not canonically sorted")
+		}
+		seen[address] = true
+		previous = address
 	}
 	return nil
 }
@@ -363,6 +395,9 @@ func validDigest(digest string) bool {
 }
 
 func normalizeRepoPath(value string) (string, bool) {
+	if !utf8.ValidString(value) {
+		return "", false
+	}
 	cleaned, err := ledger.NormalizeRepoPath(value)
 	if err != nil {
 		return "", false
@@ -472,7 +507,7 @@ func validatePageScope(p WarmPage) error {
 }
 
 func validToken(value string, limit int) bool {
-	if value == "" || len(value) > limit || strings.TrimSpace(value) != value {
+	if value == "" || len(value) > limit || strings.TrimSpace(value) != value || !utf8.ValidString(value) {
 		return false
 	}
 	for _, r := range value {

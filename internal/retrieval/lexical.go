@@ -15,7 +15,9 @@ import (
 // (coherence epoch, invalidation, etc.). Return false to suppress.
 type RecheckFunc func(context.Context, pages.WarmPage) (bool, string)
 
-// LexicalRetriever resolves semantic intents using FTS only.
+// LexicalRetriever resolves semantic intents using FTS only. Inspection and
+// legacy lexical callers may omit an eligibility snapshot; authority-sensitive
+// semantic faults must use HybridRetriever, which requires one.
 type LexicalRetriever struct {
 	Index   *indexer.Index
 	Recheck RecheckFunc
@@ -27,6 +29,7 @@ type Result struct {
 	Materialized []MaterializedPage
 	Explanation  string
 	Degraded     []string // e.g. dense unavailable
+	Trace        RetrievalTrace
 }
 
 // MaterializedPage is bounded exact evidence admitted only after the indexed
@@ -65,17 +68,29 @@ func (r *LexicalRetriever) ResolveSemantic(ctx context.Context, intent QueryInte
 		mode = ModeSemanticFault
 	}
 
+	pageExclusions, refExclusions := splitExclusions(intent.Exclusions)
+	eligibleTuples, err := intent.effectiveEligiblePageTuples()
+	if err != nil {
+		return Result{}, err
+	}
 	q := indexer.SearchQuery{
-		SessionID:  intent.SessionID,
-		RepoID:     intent.RepoID,
-		TaskID:     intent.TaskID,
-		Branch:     intent.Branch,
-		Commit:     intent.Commit,
-		Kinds:      intent.AllowedKinds,
-		Trust:      intent.RequiredTrust,
-		Text:       intent.searchText(),
-		Limit:      limit,
-		ActiveOnly: true,
+		SessionID:           intent.SessionID,
+		RepoID:              intent.RepoID,
+		TaskID:              intent.TaskID,
+		Branch:              intent.Branch,
+		Commit:              intent.Commit,
+		Kinds:               intent.AllowedKinds,
+		Trust:               intent.effectiveTrust(),
+		Text:                intent.searchText(),
+		Limit:               limit,
+		ActiveOnly:          true,
+		Statuses:            []pages.Status{pages.StatusActive},
+		ScopeEpochs:         hybridScopeEpochs(intent, eligibleTuples),
+		EligibilityComplete: intent.EligibilityComplete,
+		EligiblePageTuples:  eligibleTuples,
+		PathHints:           normalizeHints(intent.PathHints),
+		ExcludedPageIDs:     pageExclusions,
+		ExcludedRefIDs:      refExclusions,
 	}
 	candidates, err := r.Index.SearchLexical(ctx, q)
 	if err != nil {
@@ -124,9 +139,7 @@ func (r *LexicalRetriever) ResolveSemantic(ctx context.Context, intent QueryInte
 		if r.Recheck != nil {
 			ok, reason := r.Recheck(ctx, cand.Page)
 			if !ok {
-				if reason == "" {
-					reason = "recheck"
-				}
+				reason = safeSuppressionReason(reason)
 				suppressions = append(suppressions, reason+":"+string(cand.Page.ID))
 				continue
 			}
@@ -136,7 +149,7 @@ func (r *LexicalRetriever) ResolveSemantic(ctx context.Context, intent QueryInte
 			suppressions = append(suppressions, "session_mismatch:"+string(cand.Page.ID))
 			continue
 		}
-		kept = append(kept, cand)
+		kept = append(kept, scrubIndexedProse(cand))
 		if len(kept) >= materialize {
 			break
 		}
@@ -158,6 +171,14 @@ func (r *LexicalRetriever) ResolveSemantic(ctx context.Context, intent QueryInte
 	}, nil
 }
 
+func scrubIndexedProse(candidate indexer.Candidate) indexer.Candidate {
+	candidate.Page.SearchText = ""
+	candidate.Page.Summary = ""
+	candidate.Page.SalienceReason = ""
+	candidate.Page.Refs = nil
+	return candidate
+}
+
 func normalizeHints(hints []string) []string {
 	var out []string
 	for _, h := range hints {
@@ -170,12 +191,19 @@ func normalizeHints(hints []string) []string {
 }
 
 func pathAffinity(page pages.WarmPage, hints []string) bool {
-	for _, path := range page.PathScope {
+	for _, rawPath := range page.PathScope {
+		path := normalizePathAffinity(rawPath)
 		for _, hint := range hints {
-			if path == hint || strings.HasPrefix(path, hint) || strings.Contains(path, hint) {
+			hint = normalizePathAffinity(hint)
+			if path != "" && hint != "" && (path == hint || strings.HasPrefix(path, hint+"/") || strings.HasPrefix(hint, path+"/")) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func normalizePathAffinity(path string) string {
+	path = strings.ReplaceAll(strings.TrimSpace(path), "\\", "/")
+	return strings.Trim(path, "/")
 }

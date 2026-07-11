@@ -66,7 +66,7 @@ func TestResolveSemanticCrossSession(t *testing.T) {
 	pageB := pages.WarmPage{
 		ID: pages.PageID("wp_" + strings.Repeat("9", 32)), Version: 1, SessionID: "iso-b",
 		RepoID: "repo", TaskID: "T1", Scope: types.ScopeTask, Kind: pages.KindConstraint,
-		Trust: pages.TrustUser, Status: pages.StatusActive, Salience: 0.9, SalienceReason: "test",
+		Trust: pages.TrustUser, Status: pages.StatusActive, Salience: 0.9, SalienceReason: "TOP_SECRET derivative salience reason",
 		SearchText: "kind=constraint requirement=do not rewrite transport layer", Summary: "do not rewrite transport layer",
 		Refs:         []pages.PageRef{{Kind: pages.RefEvent, ID: "E0001"}},
 		SourceSeqMin: 1, SourceSeqMax: 1, SourceDigest: pages.SourceDigest(strings.Repeat("b", 64)),
@@ -86,6 +86,16 @@ func TestResolveSemanticCrossSession(t *testing.T) {
 		if c.Page.SessionID != "iso-b" {
 			t.Fatalf("leaked session page %#v", c.Page)
 		}
+		if c.Page.SearchText != "" || c.Page.Summary != "" || c.Page.SalienceReason != "" || len(c.Page.Refs) != 0 {
+			t.Fatalf("legacy result leaked derivative prose: %#v", c.Page)
+		}
+	}
+	encoded, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "TOP_SECRET") || strings.Contains(string(encoded), "do not rewrite transport layer") {
+		t.Fatalf("legacy result JSON leaked derivative prose: %s", encoded)
 	}
 	_ = b
 }

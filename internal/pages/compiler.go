@@ -6,13 +6,17 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"wsms/internal/artifacts"
+	wsmserrors "wsms/internal/errors"
 	"wsms/internal/ledger"
 	"wsms/internal/types"
 	"wsms/internal/wsl"
@@ -626,20 +630,26 @@ func resolveRef(ctx context.Context, change LedgerChange, ref PageRef) (resolved
 		return resolvedEvidence{canonical: canonical, seq: ev.Seq, ts: ev.TS}, nil
 	case RefArtifact:
 		if change.Artifacts == nil {
-			return resolvedEvidence{}, fmt.Errorf("%w: artifact reader unavailable for %s", ErrUnmaterializableRef, ref.ID)
+			return resolvedEvidence{}, fmt.Errorf("artifact reader unavailable for %s", ref.ID)
 		}
 		if err := change.Artifacts.VerifyArtifact(ctx, ref.ID); err != nil {
-			return resolvedEvidence{}, fmt.Errorf("%w: artifact %s: %v", ErrUnmaterializableRef, ref.ID, err)
+			if missingEvidence(err) {
+				return resolvedEvidence{}, fmt.Errorf("%w: missing artifact %s", ErrUnmaterializableRef, ref.ID)
+			}
+			return resolvedEvidence{}, fmt.Errorf("verify artifact %s: %w", ref.ID, err)
 		}
 		// The source digest commits to the verified address, never raw bytes.
 		return resolvedEvidence{canonical: []byte("artifact-sha256:" + ref.ID)}, nil
 	case RefFileSlice:
 		if change.Files == nil {
-			return resolvedEvidence{}, fmt.Errorf("%w: file-slice reader unavailable for %s", ErrUnmaterializableRef, ref.Address())
+			return resolvedEvidence{}, fmt.Errorf("file-slice reader unavailable for %s", ref.Address())
 		}
 		data, err := change.Files.ReadFileSlice(ctx, ref.Path, ref.Commit, ref.StartLine, ref.EndLine)
 		if err != nil {
-			return resolvedEvidence{}, fmt.Errorf("%w: file slice %s: %v", ErrUnmaterializableRef, ref.Address(), err)
+			if missingEvidence(err) {
+				return resolvedEvidence{}, fmt.Errorf("%w: missing file slice %s", ErrUnmaterializableRef, ref.Address())
+			}
+			return resolvedEvidence{}, fmt.Errorf("read file slice %s: %w", ref.Address(), err)
 		}
 		if len(data) > MaxFileSliceBytes {
 			return resolvedEvidence{}, fmt.Errorf("%w: file slice %s exceeds %d bytes", ErrUnmaterializableRef, ref.Address(), MaxFileSliceBytes)
@@ -656,11 +666,14 @@ func eventByID(ctx context.Context, change LedgerChange, id string) (ledger.Even
 		return change.Event, nil
 	}
 	if change.Events == nil {
-		return ledger.Event{}, fmt.Errorf("%w: event reader unavailable for %s", ErrUnmaterializableRef, id)
+		return ledger.Event{}, fmt.Errorf("event reader unavailable for %s", id)
 	}
 	ev, err := change.Events.Get(ctx, id)
 	if err != nil {
-		return ledger.Event{}, fmt.Errorf("%w: event %s: %v", ErrUnmaterializableRef, id, err)
+		if missingEvidence(err) {
+			return ledger.Event{}, fmt.Errorf("%w: missing event %s", ErrUnmaterializableRef, id)
+		}
+		return ledger.Event{}, fmt.Errorf("read event %s: %w", id, err)
 	}
 	if ev.ID != id || ev.SessionID != change.Event.SessionID || ev.Seq <= 0 || ev.TS.IsZero() {
 		return ledger.Event{}, fmt.Errorf("%w: event %s crossed session or lacks durable identity", ErrUnmaterializableRef, id)
@@ -672,6 +685,12 @@ func eventByID(ctx context.Context, change LedgerChange, id string) (ledger.Even
 		return ledger.Event{}, fmt.Errorf("%w: event %s failed validation: %v", ErrUnmaterializableRef, id, err)
 	}
 	return ev, nil
+}
+
+func missingEvidence(err error) bool {
+	return errors.Is(err, wsmserrors.ErrNotFound) ||
+		errors.Is(err, artifacts.ErrArtifactNotFound) ||
+		errors.Is(err, fs.ErrNotExist)
 }
 
 func canonicalEvent(ev ledger.Event) ([]byte, error) {

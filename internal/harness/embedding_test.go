@@ -53,6 +53,13 @@ func TestEmbedderTimeoutDegradesToFTSOnly(t *testing.T) {
 	if !stringSliceContains(result.Degraded, "dense=embedder") {
 		t.Fatalf("missing dense degradation marker: %#v", result.Degraded)
 	}
+	operational, err := s.SemanticSearch(ctx, "zxqv no lexical page contains this phrase")
+	if !errors.Is(err, retrieval.ErrIndexUnavailable) || errors.Is(err, retrieval.ErrSemanticPageMiss) {
+		t.Fatalf("empty FTS plus unavailable query embedding error=%v", err)
+	}
+	if len(operational.Degraded) == 0 || operational.Trace.FusionVersion == "" {
+		t.Fatalf("operational degradation lost categorical trace: %#v", operational)
+	}
 	seq, _, err := s.Index.Watermark(ctx, s.Cfg.SessionID)
 	if err != nil {
 		t.Fatal(err)
@@ -198,6 +205,36 @@ func TestEmbeddingPayloadExcludesRawArtifactOutput(t *testing.T) {
 	}
 }
 
+func TestSemanticSearchUsesDenseChannelThroughHybridRetriever(t *testing.T) {
+	ns := testNamespace(t, 2, "hybrid-query")
+	emb := newControlledEmbedder(ns)
+	s := openEmbeddingSession(t, "embedding-hybrid-query", emb, 0)
+	ctx := context.Background()
+	if err := s.StartTask(ctx, TaskStart{Goal: "hybrid query", Repo: "repo", Branch: "main", Commit: "aaaaaaa"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IngestUser(ctx, "second chance replacement keeps frequently reused pages warm"); err != nil {
+		t.Fatal(err)
+	}
+	waitForVectorCountAtLeast(t, s, 1)
+
+	result, err := s.SemanticSearch(ctx, "second chance replacement keeps frequently reused pages warm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Trace.DenseCandidates == 0 {
+		t.Fatalf("hybrid result did not consume dense candidates: %#v", result.Trace)
+	}
+	if len(result.Materialized) == 0 {
+		t.Fatalf("hybrid result did not materialize exact evidence: %#v", result)
+	}
+	for _, candidate := range result.Candidates {
+		if candidate.Page.SearchText != "" || candidate.Page.Summary != "" || len(candidate.Page.Refs) != 0 {
+			t.Fatalf("hybrid result exposed indexed derivative content: %#v", candidate.Page)
+		}
+	}
+}
+
 func TestBlockingDocumentEmbedderDoesNotDelayAppend(t *testing.T) {
 	ns := testNamespace(t, 2, "blocking")
 	emb := newControlledEmbedder(ns)
@@ -216,6 +253,54 @@ func TestBlockingDocumentEmbedderDoesNotDelayAppend(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
 		t.Fatalf("append waited for blocked embedder: %s", elapsed)
+	}
+}
+
+func TestBlockingQueryEmbedderDoesNotDelayAppend(t *testing.T) {
+	ns := testNamespace(t, 2, "blocking-query")
+	emb := newControlledEmbedder(ns)
+	emb.blockQuery = true
+	emb.queryEntered = make(chan struct{}, 1)
+	s := openEmbeddingSession(t, "embedding-blocking-query", emb, 0)
+	ctx := context.Background()
+	if err := s.StartTask(ctx, TaskStart{Goal: "blocking query", Repo: "repo", Branch: "main", Commit: "aaaaaaa"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IngestUser(ctx, "query embedding must not own the append lock"); err != nil {
+		t.Fatal(err)
+	}
+	waitForVectorCountAtLeast(t, s, 1)
+
+	searchCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.SemanticSearch(searchCtx, "query embedding must not own the append lock")
+		done <- err
+	}()
+	select {
+	case <-emb.queryEntered:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("semantic search did not enter query embedding")
+	}
+
+	start := time.Now()
+	if err := s.IngestAssistant(ctx, "append progresses while the query provider is blocked"); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		cancel()
+		t.Fatalf("append waited for blocked query embedder: %s", elapsed)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SemanticSearch error=%v, want context cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SemanticSearch did not stop after caller cancellation")
 	}
 }
 
@@ -412,10 +497,9 @@ func TestSemanticSearchConcurrentCloseIsRaceFree(t *testing.T) {
 	}
 	waitForVectorCountAtLeast(t, s, 1)
 
-	searchCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.SemanticSearch(searchCtx, "semantic search can overlap close")
+		_, err := s.SemanticSearch(context.Background(), "semantic search can overlap close")
 		done <- err
 	}()
 	select {
@@ -431,7 +515,6 @@ func TestSemanticSearchConcurrentCloseIsRaceFree(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("Close waited for semantic dense query: %s", elapsed)
 	}
-	cancel()
 	select {
 	case <-emb.queryCanceled:
 	case <-time.After(2 * time.Second):
@@ -443,7 +526,7 @@ func TestSemanticSearchConcurrentCloseIsRaceFree(t *testing.T) {
 			t.Fatalf("SemanticSearch error after close = %v, want ErrSessionClosed or context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("SemanticSearch did not finish after close and context cancellation")
+		t.Fatal("SemanticSearch did not finish after session close cancellation")
 	}
 	if _, err := s.SemanticSearch(context.Background(), "after close"); !errors.Is(err, ErrSessionClosed) {
 		t.Fatalf("SemanticSearch after close error=%v, want ErrSessionClosed", err)

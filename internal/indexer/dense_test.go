@@ -3,6 +3,7 @@ package indexer_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -13,6 +14,7 @@ import (
 
 	"wsms/internal/indexer"
 	"wsms/internal/pages"
+	"wsms/internal/types"
 )
 
 func TestDenseUnavailableByDefault(t *testing.T) {
@@ -74,7 +76,10 @@ func TestDenseKNNAndFilters(t *testing.T) {
 	if hits[0].Rank > hits[1].Rank {
 		t.Fatalf("rank order inverted: %v then %v", hits[0].Rank, hits[1].Rank)
 	}
-	if !strings.Contains(hits[0].Explanation, "vec0") {
+	if hits[0].ScoreKind != indexer.ScoreKindCosineDistance || hits[0].ChannelOrdinal != 1 || hits[0].ServingGeneration <= 0 {
+		t.Fatalf("dense metadata missing: %#v", hits[0])
+	}
+	if !strings.Contains(hits[0].Explanation, "channel=dense") {
 		t.Fatalf("explanation=%q", hits[0].Explanation)
 	}
 
@@ -85,6 +90,347 @@ func TestDenseKNNAndFilters(t *testing.T) {
 	}
 	if len(hits) != 1 || hits[0].Page.SessionID != "sess-b" {
 		t.Fatalf("session isolation: %#v", hits)
+	}
+}
+
+func TestDenseIdenticalVectorProducesZeroDistance(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+	page := samplePage("same-vector", "wp_"+strings.Repeat("9", 32), pages.KindFailureEpisode, "same vector", "main")
+	vector := []float64{0.7324419258045132, -1.0731798210887524}
+	if err := idx.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{denseRecord(page, "", vector)}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := idx.SearchDense(ctx, indexer.SearchQuery{SessionID: page.SessionID, Limit: 1}, vector)
+	if err != nil {
+		t.Fatalf("identical valid query and stored vector failed: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Page.ID != page.ID || hits[0].Rank < 0 || hits[0].Rank > 1e-12 {
+		t.Fatalf("hits=%#v", hits)
+	}
+}
+
+func TestDenseCanonicalizesExtremeFiniteVectorsAcrossRestartAndRebuild(t *testing.T) {
+	tests := []struct {
+		name   string
+		vector []float64
+	}{
+		{name: "overflowing raw norm", vector: []float64{math.MaxFloat64, math.MaxFloat64}},
+		{name: "smallest subnormals", vector: []float64{math.SmallestNonzeroFloat64, math.SmallestNonzeroFloat64}},
+		{name: "mixed magnitude and sign", vector: []float64{math.MaxFloat64, -math.SmallestNonzeroFloat64}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "index")
+			idx, err := indexer.Open(dir, indexer.Options{DenseDimensions: len(tc.vector)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			page := samplePage("canonical-extreme", "wp_"+strings.Repeat("7", 32), pages.KindFailureEpisode, tc.name, "main")
+			mutations := indexer.MutationList{{Op: pages.MutationUpsert, Page: page}}
+			if err := idx.Apply(ctx, mutations); err != nil {
+				t.Fatal(err)
+			}
+			if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{denseRecord(page, "", tc.vector)}); err != nil {
+				t.Fatalf("upsert finite vector: %v", err)
+			}
+			assertExtremeDenseHit(t, idx, page, tc.vector)
+			beforeJSON := shadowVectorJSON(t, dir, page.ID)
+			assertCanonicalShadowVector(t, beforeJSON, len(tc.vector))
+
+			if err := idx.Close(); err != nil {
+				t.Fatal(err)
+			}
+			idx, err = indexer.Open(dir, indexer.Options{DenseDimensions: len(tc.vector)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = idx.Close() })
+			assertExtremeDenseHit(t, idx, page, tc.vector)
+			if err := idx.Rebuild(ctx, mutations); err != nil {
+				t.Fatal(err)
+			}
+			assertExtremeDenseHit(t, idx, page, tc.vector)
+			afterJSON := shadowVectorJSON(t, dir, page.ID)
+			if afterJSON != beforeJSON {
+				t.Fatalf("canonical shadow drifted across rebuild: before=%q after=%q", beforeJSON, afterJSON)
+			}
+		})
+	}
+}
+
+func TestDenseTieOrderingIsStableWithinReturnedSetOnly(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+	ids := []string{
+		"wp_" + strings.Repeat("c", 32),
+		"wp_" + strings.Repeat("a", 32),
+		"wp_" + strings.Repeat("b", 32),
+	}
+	mutations := make(indexer.MutationList, 0, len(ids))
+	vectors := make([]indexer.VectorRecord, 0, len(ids))
+	for i, id := range ids {
+		page := samplePage("boundary-tie", id, pages.KindFailureEpisode, fmt.Sprintf("tie %d", i), "main")
+		page.Version = pages.PageVersion(i + 1)
+		page.SourceSeqMin, page.SourceSeqMax = int64(i+1), int64(i+1)
+		page.SourceDigest = pages.SourceDigest(fmt.Sprintf("%064x", i+1))
+		mutations = append(mutations, pages.PageMutation{Op: pages.MutationUpsert, Page: page})
+		vectors = append(vectors, denseRecord(page, "", []float64{1, 0}))
+	}
+	if err := idx.Apply(ctx, mutations); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, vectors); err != nil {
+		t.Fatal(err)
+	}
+	assertReturnedTieOrder := func(stage string) {
+		hits, err := idx.SearchDense(ctx, indexer.SearchQuery{SessionID: "boundary-tie", Limit: 2}, []float64{1, 0})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(hits) != 2 || hits[0].Rank != hits[1].Rank || hits[0].Page.ID > hits[1].Page.ID {
+			t.Fatalf("%s returned tie order=%#v", stage, hits)
+		}
+		// Deliberately do not compare membership across rebuild: sqlite-vec owns
+		// selection when three equal-distance rows compete for k=2.
+	}
+	assertReturnedTieOrder("before rebuild")
+	if err := idx.Rebuild(ctx, mutations); err != nil {
+		t.Fatal(err)
+	}
+	assertReturnedTieOrder("after rebuild")
+}
+
+func TestSearchFiltersApplyBeforeChannelLimitWithChaff(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+
+	const (
+		session       = "sess-filter"
+		targetPath    = "src/target/file.go"
+		pathHint      = "src/target"
+		excludedRefID = "WExcluded"
+	)
+
+	var muts []pages.PageMutation
+	var vecs []indexer.VectorRecord
+	var excludedPages []pages.PageID
+	add := func(seq int, sessionID string, paths []string, refs []pages.PageRef, vector []float64) pages.WarmPage {
+		page := indexedSearchPage(t, seq, sessionID, "phase7e needle semantic retrieval", paths, refs)
+		muts = append(muts, pages.PageMutation{Op: pages.MutationUpsert, Page: page})
+		vecs = append(vecs, denseRecord(page, "", vector))
+		return page
+	}
+
+	for i := 1; i <= 80; i++ {
+		add(i, "other-session", []string{targetPath}, []pages.PageRef{{Kind: pages.RefEvent, ID: "EWrongSession"}}, []float64{1, 0})
+	}
+	for i := 81; i <= 160; i++ {
+		add(i, session, []string{"src/targeted/file.go"}, []pages.PageRef{{Kind: pages.RefEvent, ID: "EWrongPath"}}, []float64{1, 0})
+	}
+	for i := 161; i <= 220; i++ {
+		page := add(i, session, []string{targetPath}, []pages.PageRef{{Kind: pages.RefEvent, ID: "EExcludedPage"}}, []float64{1, 0})
+		excludedPages = append(excludedPages, page.ID)
+	}
+	for i := 221; i <= 260; i++ {
+		add(i, session, []string{targetPath}, []pages.PageRef{{Kind: pages.RefWSLRecord, ID: excludedRefID}}, []float64{1, 0})
+	}
+	target := add(261, session, []string{targetPath}, []pages.PageRef{{Kind: pages.RefEvent, ID: "ETarget"}}, []float64{0, 1})
+
+	if err := idx.Apply(ctx, muts); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, vecs); err != nil {
+		t.Fatal(err)
+	}
+
+	q := indexer.SearchQuery{
+		SessionID:       session,
+		Text:            "phase7e needle semantic retrieval",
+		Limit:           1,
+		PathHints:       []string{pathHint},
+		ExcludedPageIDs: excludedPages,
+		ExcludedRefIDs:  []string{excludedRefID},
+	}
+	lexical, err := idx.SearchLexical(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lexical) != 1 || lexical[0].Page.ID != target.ID {
+		t.Fatalf("lexical target=%s hits=%#v", target.ID, lexical)
+	}
+	assertCandidateMetadata(t, lexical[0], target, indexer.ScoreKindFTS5BM25, 1)
+	if strings.Contains(lexical[0].Explanation, "phase7e needle") {
+		t.Fatalf("lexical explanation leaked query text: %q", lexical[0].Explanation)
+	}
+
+	dense, err := idx.SearchDense(ctx, q, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dense) != 1 || dense[0].Page.ID != target.ID {
+		t.Fatalf("dense target=%s hits=%#v", target.ID, dense)
+	}
+	assertCandidateMetadata(t, dense[0], target, indexer.ScoreKindCosineDistance, 1)
+	if strings.Contains(dense[0].Explanation, "phase7e needle") {
+		t.Fatalf("dense explanation leaked query text: %q", dense[0].Explanation)
+	}
+}
+
+func TestSearchScopeEpochFilterAppliesBeforeChannelLimit(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+	const (
+		session      = "scope-epoch-filter"
+		currentEpoch = pages.ScopeEpoch(42)
+		staleEpoch   = pages.ScopeEpoch(41)
+	)
+
+	mutations := make([]pages.PageMutation, 0, 222)
+	vectors := make([]indexer.VectorRecord, 0, 222)
+	for i := 1; i <= 221; i++ {
+		page := indexedSearchPage(t, i, session, "epoch starvation needle", []string{"src/current/file.go"}, []pages.PageRef{{Kind: pages.RefEvent, ID: fmt.Sprintf("EStale%d", i)}})
+		page.ScopeEpoch = staleEpoch
+		mutations = append(mutations, pages.PageMutation{Op: pages.MutationUpsert, Page: page})
+		vectors = append(vectors, denseRecord(page, "", []float64{1, 0}))
+	}
+	target := indexedSearchPage(t, 222, session, "epoch starvation needle", []string{"src/current/file.go"}, []pages.PageRef{{Kind: pages.RefEvent, ID: "ECurrent"}})
+	target.ScopeEpoch = currentEpoch
+	mutations = append(mutations, pages.PageMutation{Op: pages.MutationUpsert, Page: target})
+	vectors = append(vectors, denseRecord(target, "", []float64{0, 1}))
+	if err := idx.Apply(ctx, mutations); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, vectors); err != nil {
+		t.Fatal(err)
+	}
+
+	query := indexer.SearchQuery{
+		SessionID: session, Text: "epoch starvation needle", Limit: 1,
+		ScopeEpochs: []pages.ScopeEpoch{currentEpoch, currentEpoch},
+	}
+	lexical, err := idx.SearchLexical(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lexical) != 1 || lexical[0].Page.ID != target.ID {
+		t.Fatalf("lexical epoch target=%s hits=%#v", target.ID, lexical)
+	}
+	if !strings.Contains(lexical[0].Explanation, "scope-epoch") {
+		t.Fatalf("lexical trace missing scope epoch: %q", lexical[0].Explanation)
+	}
+	dense, err := idx.SearchDense(ctx, query, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dense) != 1 || dense[0].Page.ID != target.ID {
+		t.Fatalf("dense epoch target=%s hits=%#v", target.ID, dense)
+	}
+	if !strings.Contains(dense[0].Explanation, "scope-epoch") {
+		t.Fatalf("dense trace missing scope epoch: %q", dense[0].Explanation)
+	}
+}
+
+func TestSearchScopeEpochFilterBounds(t *testing.T) {
+	idx := openTestIndex(t)
+	epochs := make([]pages.ScopeEpoch, 513)
+	for i := range epochs {
+		epochs[i] = pages.ScopeEpoch(i)
+	}
+	if _, err := idx.SearchLexical(context.Background(), indexer.SearchQuery{
+		SessionID: "scope-epoch-bounds", Text: "needle", ScopeEpochs: epochs,
+	}); err == nil || !strings.Contains(err.Error(), "filters exceed bound") {
+		t.Fatalf("oversized epoch filter error=%v", err)
+	}
+	if _, err := idx.SearchLexical(context.Background(), indexer.SearchQuery{
+		SessionID: "scope-epoch-bounds", Text: "needle",
+		ScopeEpochs: []pages.ScopeEpoch{pages.ScopeEpoch(math.MaxInt64) + 1},
+	}); err == nil || !strings.Contains(err.Error(), "SQLite integer range") {
+		t.Fatalf("unrepresentable epoch error=%v", err)
+	}
+}
+
+func TestSearchCandidateMetadataTracksCurrentTupleAndWatermark(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+	const session = "sess-meta"
+
+	page := indexedSearchPage(t, 1, session, "metadata tuple phase", []string{"src/current/file.go"}, []pages.PageRef{{Kind: pages.RefEvent, ID: "EMetaOne"}})
+	if err := idx.ApplyWithWatermark(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}, session, 1, int64(page.Version)); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{denseRecord(page, "", []float64{1, 0})}); err != nil {
+		t.Fatal(err)
+	}
+	health, err := idx.Health(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := indexer.SearchQuery{SessionID: session, Text: "metadata tuple phase", Limit: 1, PathHints: []string{"src/current"}}
+	lexical, err := idx.SearchLexical(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lexical) != 1 {
+		t.Fatalf("lexical=%#v", lexical)
+	}
+	assertCandidateMetadata(t, lexical[0], page, indexer.ScoreKindFTS5BM25, health.Generation)
+	if lexical[0].Watermark != (indexer.SearchWatermark{SessionID: session, LastSourceSeq: 1, LastPageVersion: page.Version}) {
+		t.Fatalf("lexical watermark=%#v", lexical[0].Watermark)
+	}
+	dense, err := idx.SearchDense(ctx, q, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dense) != 1 {
+		t.Fatalf("dense=%#v", dense)
+	}
+	assertCandidateMetadata(t, dense[0], page, indexer.ScoreKindCosineDistance, health.Generation)
+
+	page2 := page
+	page2.Version = 2
+	page2.SourceSeqMin = 2
+	page2.SourceSeqMax = 2
+	page2.SourceDigest = pages.SourceDigest(fmt.Sprintf("%064x", 2002))
+	page2.SearchText = "kind=" + string(page2.Kind) + " metadata tuple phase updated"
+	page2.Summary = "metadata tuple phase updated"
+	if err := (pages.PageMutation{Op: pages.MutationUpsert, Page: page2}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.ApplyWithWatermark(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page2}}, session, 2, int64(page2.Version)); err != nil {
+		t.Fatal(err)
+	}
+	dense, err = idx.SearchDense(ctx, q, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dense) != 0 {
+		t.Fatalf("stale dense tuple surfaced after page update: %#v", dense)
+	}
+	lexical, err = idx.SearchLexical(ctx, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lexical) != 1 || lexical[0].Tuple.PageVersion != page2.Version {
+		t.Fatalf("lexical current tuple not surfaced: %#v", lexical)
+	}
+	if lexical[0].Watermark != (indexer.SearchWatermark{SessionID: session, LastSourceSeq: 2, LastPageVersion: page2.Version}) {
+		t.Fatalf("updated watermark=%#v", lexical[0].Watermark)
+	}
+	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{denseRecord(page2, "", []float64{1, 0})}); err != nil {
+		t.Fatal(err)
+	}
+	dense, err = idx.SearchDense(ctx, q, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dense) != 1 || dense[0].Tuple.PageVersion != page2.Version {
+		t.Fatalf("dense current tuple not surfaced: %#v", dense)
 	}
 }
 
@@ -450,6 +796,116 @@ func TestDenseRebuildPreservesOnlyCompatibleVectors(t *testing.T) {
 	}
 	if len(hits) != 1 || hits[0].Page.ID != pageA.ID {
 		t.Fatalf("rebuilt dense hits=%#v", hits)
+	}
+}
+
+func TestDenseRebuildPreservesCanonicalShadowAcrossRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "index")
+	idx, err := indexer.Open(dir, indexer.Options{DenseDimensions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	first := samplePage("canonical-rebuild", "wp_"+strings.Repeat("a", 32), pages.KindFailureEpisode, "first", "main")
+	second := samplePage("canonical-rebuild", "wp_"+strings.Repeat("f", 32), pages.KindFailureEpisode, "second", "main")
+	second.Version = 2
+	second.SourceSeqMin, second.SourceSeqMax = 2, 2
+	second.SourceDigest = pages.SourceDigest(strings.Repeat("b", 64))
+	mutations := indexer.MutationList{{Op: pages.MutationUpsert, Page: first}, {Op: pages.MutationUpsert, Page: second}}
+	if err := idx.Apply(ctx, mutations); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{
+		denseRecord(first, "", []float64{1, 0.10000000001}),
+		denseRecord(second, "", []float64{1, 0.1}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeJSON := shadowVectorJSON(t, dir, first.ID)
+	before, err := idx.SearchDense(ctx, indexer.SearchQuery{SessionID: first.SessionID, Limit: 2}, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	idx, err = indexer.Open(dir, indexer.Options{DenseDimensions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = idx.Close() })
+	restarted, err := idx.SearchDense(ctx, indexer.SearchQuery{SessionID: first.SessionID, Limit: 2}, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameCandidateOrderAndRanks(before, restarted) {
+		t.Fatalf("ranking changed across restart: before=%#v restarted=%#v", before, restarted)
+	}
+	if err := idx.Rebuild(ctx, mutations); err != nil {
+		t.Fatal(err)
+	}
+	afterJSON := shadowVectorJSON(t, dir, first.ID)
+	if afterJSON != beforeJSON {
+		t.Fatalf("canonical vector changed across rebuild: before=%q after=%q", beforeJSON, afterJSON)
+	}
+	after, err := idx.SearchDense(ctx, indexer.SearchQuery{SessionID: first.SessionID, Limit: 2}, []float64{1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameCandidateOrderAndRanks(before, after) {
+		t.Fatalf("ranking changed across rebuild: before=%#v after=%#v", before, after)
+	}
+}
+
+func TestDenseRebuildLegacyVec0FallbackAndMalformedCanonicalFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		shadowSQL string
+		wantError bool
+	}{
+		{name: "legacy missing shadow", shadowSQL: `DELETE FROM warm_page_vec_shadow WHERE page_id = ?`},
+		{name: "malformed canonical shadow", shadowSQL: `UPDATE warm_page_vec_shadow SET vector_json = '{broken' WHERE page_id = ?`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := openDenseIndex(t, 2)
+			ctx := context.Background()
+			page := samplePage("rebuild-source", "wp_"+strings.Repeat("8", 32), pages.KindFailureEpisode, "rebuild source", "main")
+			mutation := pages.PageMutation{Op: pages.MutationUpsert, Page: page}
+			if err := idx.Apply(ctx, []pages.PageMutation{mutation}); err != nil {
+				t.Fatal(err)
+			}
+			if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{denseRecord(page, "", []float64{1, 0})}); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", filepath.Join(idx.Dir(), "warm.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, tc.shadowSQL, string(page.ID)); err != nil {
+				_ = db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			err = idx.Rebuild(ctx, indexer.MutationList{mutation})
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("malformed canonical shadow unexpectedly rebuilt")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			hits, err := idx.SearchDense(ctx, indexer.SearchQuery{SessionID: page.SessionID, Limit: 1}, []float64{1, 0})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(hits) != 1 || hits[0].Page.ID != page.ID {
+				t.Fatalf("legacy fallback hits=%#v", hits)
+			}
+		})
 	}
 }
 
@@ -1071,5 +1527,108 @@ func denseSuppression(page pages.WarmPage, namespace, reason string) indexer.Vec
 		CompilerVersion:    page.CompilerVersion,
 		EmbeddingNamespace: namespace,
 		Reason:             reason,
+	}
+}
+
+func indexedSearchPage(t *testing.T, seq int, session, search string, paths []string, refs []pages.PageRef) pages.WarmPage {
+	t.Helper()
+	page := samplePage(session, fmt.Sprintf("wp_%032x", seq), pages.KindFailureEpisode, search, "main")
+	page.Version = pages.PageVersion(seq)
+	page.SourceSeqMin = int64(seq)
+	page.SourceSeqMax = int64(seq)
+	page.SourceDigest = pages.SourceDigest(fmt.Sprintf("%064x", seq))
+	page.Scope = types.ScopeFile
+	page.Kind = pages.KindFileContext
+	page.Trust = pages.TrustRepo
+	page.PathScope = paths
+	page.Refs = refs
+	page.SearchText = "kind=" + string(page.Kind) + " " + search
+	if err := (pages.PageMutation{Op: pages.MutationUpsert, Page: page}).Validate(); err != nil {
+		t.Fatalf("fixture page %d invalid: %v", seq, err)
+	}
+	return page
+}
+
+func assertCandidateMetadata(t *testing.T, cand indexer.Candidate, page pages.WarmPage, scoreKind indexer.ScoreKind, generation int64) {
+	t.Helper()
+	if cand.Tuple != (indexer.PageTuple{
+		PageID: page.ID, PageVersion: page.Version, SessionID: page.SessionID,
+		SourceDigest: page.SourceDigest, CompilerVersion: page.CompilerVersion,
+		ScopeEpoch: page.ScopeEpoch,
+	}) {
+		t.Fatalf("tuple=%#v want page=%#v", cand.Tuple, page)
+	}
+	if cand.ServingGeneration <= 0 {
+		t.Fatalf("missing serving generation: %#v", cand)
+	}
+	if generation > 0 && cand.ServingGeneration != generation {
+		t.Fatalf("generation=%d want %d", cand.ServingGeneration, generation)
+	}
+	if cand.Watermark.SessionID != page.SessionID {
+		t.Fatalf("watermark session=%#v page session=%s", cand.Watermark, page.SessionID)
+	}
+	if cand.ChannelOrdinal <= 0 {
+		t.Fatalf("missing channel ordinal: %#v", cand)
+	}
+	if cand.ScoreKind != scoreKind {
+		t.Fatalf("score kind=%q want %q", cand.ScoreKind, scoreKind)
+	}
+}
+
+func shadowVectorJSON(t *testing.T, dir string, pageID pages.PageID) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "warm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var encoded string
+	if err := db.QueryRow(`SELECT vector_json FROM warm_page_vec_shadow WHERE page_id = ?`, string(pageID)).Scan(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	return encoded
+}
+
+func sameCandidateOrderAndRanks(a, b []indexer.Candidate) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Page.ID != b[i].Page.ID || a[i].Rank != b[i].Rank {
+			return false
+		}
+	}
+	return true
+}
+
+func assertExtremeDenseHit(t *testing.T, idx *indexer.Index, page pages.WarmPage, vector []float64) {
+	t.Helper()
+	hits, err := idx.SearchDense(context.Background(), indexer.SearchQuery{SessionID: page.SessionID, Limit: 1}, vector)
+	if err != nil {
+		t.Fatalf("search finite vector: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Page.ID != page.ID || math.IsNaN(hits[0].Rank) || math.IsInf(hits[0].Rank, 0) || hits[0].Rank < 0 || hits[0].Rank > 1e-6 {
+		t.Fatalf("finite vector hits=%#v", hits)
+	}
+}
+
+func assertCanonicalShadowVector(t *testing.T, encoded string, dims int) {
+	t.Helper()
+	var vector []float64
+	if err := json.Unmarshal([]byte(encoded), &vector); err != nil {
+		t.Fatal(err)
+	}
+	if len(vector) != dims {
+		t.Fatalf("canonical dimensions=%d want %d", len(vector), dims)
+	}
+	var norm float64
+	for _, value := range vector {
+		if math.IsNaN(value) || math.IsInf(value, 0) || float64(float32(value)) != value {
+			t.Fatalf("non-canonical float32 component %v in %v", value, vector)
+		}
+		norm = math.Hypot(norm, value)
+	}
+	if norm == 0 || math.Abs(norm-1) > 2e-6 {
+		t.Fatalf("canonical norm=%v vector=%v", norm, vector)
 	}
 }

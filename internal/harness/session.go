@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"wsms/internal/memory"
 	"wsms/internal/observers"
 	"wsms/internal/pages"
+	"wsms/internal/renderer"
 	"wsms/internal/retrieval"
 	"wsms/internal/scheduler"
 	"wsms/internal/types"
@@ -32,8 +34,46 @@ var (
 	// committed but whose derived mapping failed.
 	ErrSessionUnavailable = errors.New("session unavailable after derivation failure")
 	// ErrSessionClosed reports an operation attempted after Session.Close.
-	ErrSessionClosed = errors.New("session closed")
+	ErrSessionClosed          = errors.New("session closed")
+	errSemanticAttemptChanged = errors.New("semantic scope changed during index freshness check")
 )
+
+const (
+	semanticCoherenceAttempts           = 2
+	semanticCandidateLimit              = 20
+	semanticMaterializeLimit            = 3
+	semanticMaterializationAttemptLimit = 20
+	semanticMaterializationRefLimit     = 12
+	semanticMaterializationByteLimit    = 64 * 1024
+	semanticDefaultTokenBudget          = 256
+	semanticMaxTokenBudget              = 64 * 1024
+	semanticMaxScopeEpochs              = 64
+)
+
+type semanticMaterializationBudget struct {
+	attemptsRemaining int
+	pagesRemaining    int
+	refsRemaining     int
+	tokensRemaining   int
+	bytesRemaining    int
+}
+
+func newSemanticMaterializationBudget(configuredTokens int) *semanticMaterializationBudget {
+	tokens := configuredTokens
+	if tokens <= 0 {
+		tokens = semanticDefaultTokenBudget
+	}
+	if tokens > semanticMaxTokenBudget {
+		tokens = semanticMaxTokenBudget
+	}
+	return &semanticMaterializationBudget{
+		attemptsRemaining: semanticMaterializationAttemptLimit,
+		pagesRemaining:    semanticMaterializeLimit,
+		refsRemaining:     semanticMaterializationRefLimit,
+		tokensRemaining:   tokens,
+		bytesRemaining:    semanticMaterializationByteLimit,
+	}
+}
 
 // TaskStart is the explicit payload for a durable task_started event.
 type TaskStart struct {
@@ -134,6 +174,9 @@ type Session struct {
 	embeddingCancel   context.CancelFunc
 	embeddingDone     chan struct{}
 	embeddingWake     chan struct{}
+	semanticContext   context.Context
+	semanticCancel    context.CancelFunc
+	semanticWG        sync.WaitGroup
 	// IndexErr is the last non-fatal warm-index error (indexing never fails L4).
 	IndexErr   error
 	Cfg        config.Config
@@ -197,17 +240,20 @@ func OpenSession(cfg config.Config) (*Session, error) {
 		Coherence: coherent,
 	}
 	sched := scheduler.New(cfg, st, h, disp, res, coherent)
+	semanticContext, semanticCancel := context.WithCancel(context.Background())
 	s := &Session{
-		Cfg:        cfg,
-		Ledger:     led,
-		Artifacts:  arts,
-		State:      st,
-		Coherence:  coherent,
-		Hierarchy:  h,
-		Dispatcher: disp,
-		Scheduler:  sched,
-		Tools:      faults.NewTools(res, sched.PageFault),
-		Embedder:   cfg.Embedder,
+		Cfg:             cfg,
+		Ledger:          led,
+		Artifacts:       arts,
+		State:           st,
+		Coherence:       coherent,
+		Hierarchy:       h,
+		Dispatcher:      disp,
+		Scheduler:       sched,
+		Tools:           faults.NewTools(res, sched.PageFault),
+		Embedder:        cfg.Embedder,
+		semanticContext: semanticContext,
+		semanticCancel:  semanticCancel,
 	}
 	// Warm index is disposable and optional. Open failures leave Index nil.
 	// Dense projection is off by default (cfg.DenseDimensions == 0).
@@ -274,6 +320,12 @@ func (s *Session) replay(ctx context.Context) error {
 // Close releases resources.
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
+		// Semantic work can be outside appendMu while embedding and searching.
+		// Cancel it before waiting for the lock so a materializer holding appendMu
+		// receives cancellation and cannot deadlock Close.
+		if s.semanticCancel != nil {
+			s.semanticCancel()
+		}
 		s.appendMu.Lock()
 		s.closed = true
 		cancel := s.embeddingCancel
@@ -285,6 +337,7 @@ func (s *Session) Close() error {
 		if done != nil {
 			<-done
 		}
+		s.semanticWG.Wait()
 		s.appendMu.Lock()
 		defer s.appendMu.Unlock()
 		var indexErr error
@@ -294,6 +347,29 @@ func (s *Session) Close() error {
 		s.closeErr = errors.Join(s.Ledger.Close(), s.Artifacts.Close(), indexErr)
 	})
 	return s.closeErr
+}
+
+func (s *Session) beginSemanticOperation(ctx context.Context) (context.Context, func(), error) {
+	if ctx == nil {
+		return nil, nil, fmt.Errorf("nil context")
+	}
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+	if err := s.operationErrorLocked(); err != nil {
+		return nil, nil, err
+	}
+	if s.semanticContext == nil || s.semanticContext.Err() != nil {
+		return nil, nil, ErrSessionClosed
+	}
+	s.semanticWG.Add(1)
+	semanticCtx, cancel := context.WithCancel(ctx)
+	stopLifecycleCancel := context.AfterFunc(s.semanticContext, cancel)
+	done := func() {
+		stopLifecycleCancel()
+		cancel()
+		s.semanticWG.Done()
+	}
+	return semanticCtx, done, nil
 }
 
 // Append records an event, optionally offloads large output, then runs AfterEvent.
@@ -731,15 +807,31 @@ func (s *Session) repairIndexFromLedger(ctx context.Context) error {
 	return nil
 }
 
-// SemanticSearch runs a lexical warm-index query for the current session.
+// SemanticSearch resolves an unknown semantic address through the disposable
+// warm index, then admits only exact evidence revalidated against current L4.
 // Known-ID page faults must continue to use PageFault instead.
 func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Result, error) {
+	return s.semanticSearch(ctx, text, nil)
+}
+
+// beforeResolve is an internal deterministic concurrency-test seam. Production
+// callers always enter through SemanticSearch with no hook.
+func (s *Session) semanticSearch(ctx context.Context, text string, beforeResolve func(int)) (retrieval.Result, error) {
+	semanticCtx, finishSemantic, err := s.beginSemanticOperation(ctx)
+	if err != nil {
+		return retrieval.Result{}, err
+	}
+	defer finishSemantic()
+	ctx = semanticCtx
+
 	s.appendMu.Lock()
 	if err := s.operationErrorLocked(); err != nil {
 		s.appendMu.Unlock()
 		return retrieval.Result{}, err
 	}
-	if s.Index == nil {
+	index := s.Index
+	emb := s.Embedder
+	if index == nil {
 		s.appendMu.Unlock()
 		return retrieval.Result{}, retrieval.ErrIndexUnavailable
 	}
@@ -747,132 +839,410 @@ func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Re
 		s.appendMu.Unlock()
 		return retrieval.Result{}, retrieval.ErrSemanticPageMiss
 	}
-	probeSnap := s.Coherence.Snapshot()
 	s.appendMu.Unlock()
 
-	degraded := s.denseSemanticProbe(ctx, text, probeSnap)
+	// Provider work is deliberately outside appendMu. Session.Close owns the
+	// cancellation and joins this operation before closing the index or L4.
+	dense, err := s.semanticDenseQuery(ctx, index, emb, text)
+	if err != nil {
+		return retrieval.Result{}, err
+	}
+	budget := newSemanticMaterializationBudget(s.Cfg.PageFaultTokenBudget)
 
+	for attempt := 0; attempt < semanticCoherenceAttempts; attempt++ {
+		index, intent, attemptState, err := s.captureSemanticAttempt(ctx, text, budget.tokensRemaining)
+		if errors.Is(err, errSemanticAttemptChanged) {
+			if attempt+1 < semanticCoherenceAttempts {
+				continue
+			}
+			return retrieval.Result{}, semanticScopeMiss(retrieval.RetrievalTrace{})
+		}
+		if err != nil {
+			return retrieval.Result{}, err
+		}
+		revision := attemptState.revision
+		materialized := make(map[pages.PageID][]string)
+		scopeChanged := false
+		ret := &retrieval.HybridRetriever{
+			Index: index,
+			Dense: dense,
+			DetailedRecheck: func(checkCtx context.Context, page pages.WarmPage, remainingTokens int) (retrieval.RecheckResult, error) {
+				s.appendMu.Lock()
+				defer s.appendMu.Unlock()
+				if err := checkCtx.Err(); err != nil {
+					return retrieval.RecheckResult{}, err
+				}
+				if err := s.operationErrorLocked(); err != nil {
+					return retrieval.RecheckResult{}, err
+				}
+				snap := s.Coherence.Snapshot()
+				if snap.Revision != revision {
+					scopeChanged = true
+					return retrieval.RecheckResult{Reason: "scope"}, nil
+				}
+				change := pages.LedgerChange{
+					Event: s.lastEvent, State: s.State.Clone(), Events: s.Ledger, Artifacts: s.Artifacts,
+					Coherence: s.Coherence, RepoID: snap.Current.Repo, TaskID: snap.Current.TaskID,
+					Branch: snap.Current.Branch, Commit: snap.Current.Commit,
+				}
+				if err := pages.ValidateMaterializable(checkCtx, page, change); err != nil {
+					if checkCtx.Err() != nil {
+						return retrieval.RecheckResult{}, checkCtx.Err()
+					}
+					if errors.Is(err, pages.ErrUnmaterializableRef) || errors.Is(err, pages.ErrInvalidPage) {
+						return retrieval.RecheckResult{Reason: "authority"}, nil
+					}
+					return retrieval.RecheckResult{}, err
+				}
+				evidence, tokensUsed, reason, err := s.materializeSemanticPage(checkCtx, page, budget, remainingTokens)
+				if err != nil {
+					return retrieval.RecheckResult{}, err
+				}
+				if reason != "" {
+					return retrieval.RecheckResult{Reason: reason}, nil
+				}
+				materialized[page.ID] = evidence
+				return retrieval.RecheckResult{Eligible: true, TokensUsed: tokensUsed}, nil
+			},
+		}
+
+		if beforeResolve != nil {
+			beforeResolve(attempt)
+		}
+		result, resolveErr := ret.ResolveSemantic(ctx, intent)
+		if err := ctx.Err(); err != nil {
+			return retrieval.Result{}, err
+		}
+		changed, checkErr := s.validateSemanticAttemptFreshness(ctx, attemptState)
+		if checkErr != nil {
+			return retrieval.Result{}, checkErr
+		}
+		scopeChanged = scopeChanged || changed
+		if scopeChanged {
+			if attempt+1 < semanticCoherenceAttempts {
+				continue
+			}
+			if resolveErr != nil && !errors.Is(resolveErr, retrieval.ErrSemanticPageMiss) {
+				return result, resolveErr
+			}
+			trace := semanticTraceFrom(resolveErr, result.Trace)
+			return retrieval.Result{}, semanticScopeMiss(trace)
+		}
+		if resolveErr != nil {
+			if errors.Is(resolveErr, retrieval.ErrSemanticPageMiss) {
+				return retrieval.Result{}, resolveErr
+			}
+			return result, resolveErr
+		}
+
+		for _, candidate := range result.Candidates {
+			evidence, ok := materialized[candidate.Page.ID]
+			if !ok {
+				return retrieval.Result{}, fmt.Errorf("%w: selected page lacks exact evidence", retrieval.ErrIndexUnavailable)
+			}
+			result.Materialized = append(result.Materialized, retrieval.MaterializedPage{
+				PageID: candidate.Page.ID, Evidence: append([]string(nil), evidence...),
+			})
+		}
+		return result, nil
+	}
+	return retrieval.Result{}, retrieval.ErrSemanticPageMiss
+}
+
+type semanticProjectionSnapshot struct {
+	generation  int64
+	sourceSeq   int64
+	pageVersion int64
+}
+
+type semanticAttemptSnapshot struct {
+	index      *indexer.Index
+	revision   uint64
+	sourceSeq  int64
+	projection semanticProjectionSnapshot
+}
+
+func (s *Session) captureSemanticAttempt(ctx context.Context, text string, tokenBudget int) (*indexer.Index, retrieval.QueryIntent, semanticAttemptSnapshot, error) {
+	s.appendMu.Lock()
+	if err := s.operationErrorLocked(); err != nil {
+		s.appendMu.Unlock()
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, err
+	}
+	if s.Index == nil {
+		s.appendMu.Unlock()
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, retrieval.ErrIndexUnavailable
+	}
+	if s.lastEvent.ID == "" {
+		s.appendMu.Unlock()
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, retrieval.ErrSemanticPageMiss
+	}
+	index := s.Index
+	indexErr := s.IndexErr
+	lastSourceSeq := s.lastEvent.Seq
+	snap := s.Coherence.Snapshot()
+	scopeEpochs, err := semanticScopeEpochs(snap)
+	if err != nil {
+		s.appendMu.Unlock()
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, err
+	}
+	intent := retrieval.QueryIntent{
+		Mode:             retrieval.ModeSemanticFault,
+		SessionID:        s.Cfg.SessionID,
+		RepoID:           snap.Current.Repo,
+		TaskID:           snap.Current.TaskID,
+		Branch:           snap.Current.Branch,
+		Commit:           snap.Current.Commit,
+		ScopeEpochs:      scopeEpochs,
+		UserText:         text,
+		CandidateLimit:   semanticCandidateLimit,
+		MaterializeLimit: semanticMaterializeLimit,
+		TokenBudget:      tokenBudget,
+	}
+	s.appendMu.Unlock()
+
+	if indexErr != nil {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, semanticIndexUnavailable("documented source projection failure")
+	}
+	beforeProjection, err := readSemanticProjection(ctx, index, intent.SessionID)
+	if err != nil {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, err
+	}
+	authority, err := index.ActivePageSnapshot(ctx, intent.SessionID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, ctx.Err()
+		}
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, semanticIndexUnavailable("eligible page snapshot unavailable")
+	}
+	eligible := make([]indexer.PageTuple, 0, len(authority.Pages))
+	for _, descriptor := range authority.Pages {
+		if descriptor.Tuple.CompilerVersion != pages.CurrentCompilerVersion {
+			continue
+		}
+		if !s.Coherence.PageDescriptorEligible(
+			string(descriptor.Tuple.PageID), descriptor.RefIDs, descriptor.Scope,
+			descriptor.Branch, descriptor.Commit, descriptor.PathScope,
+			string(descriptor.Tuple.SourceDigest), uint64(descriptor.Tuple.ScopeEpoch),
+		) {
+			continue
+		}
+		eligible = append(eligible, descriptor.Tuple)
+	}
+	afterProjection, err := readSemanticProjection(ctx, index, intent.SessionID)
+	if err != nil {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, err
+	}
+	s.appendMu.Lock()
+	if err := s.operationErrorLocked(); err != nil {
+		s.appendMu.Unlock()
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, err
+	}
+	currentIndex := s.Index
+	currentRevision := s.Coherence.Snapshot().Revision
+	currentSourceSeq := s.lastEvent.Seq
+	currentIndexErr := s.IndexErr
+	s.appendMu.Unlock()
+	if currentRevision != snap.Revision || currentSourceSeq != lastSourceSeq {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, errSemanticAttemptChanged
+	}
+	if currentIndex != index {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, semanticIndexUnavailable("source projection changed")
+	}
+	if currentIndexErr != nil {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, semanticIndexUnavailable("documented source projection failure")
+	}
+	authorityProjection := semanticProjectionSnapshot{
+		generation:  authority.ServingGeneration,
+		sourceSeq:   authority.Watermark.LastSourceSeq,
+		pageVersion: int64(authority.Watermark.LastPageVersion),
+	}
+	if beforeProjection != authorityProjection || authorityProjection != afterProjection {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, semanticIndexUnavailable("source projection changed during eligibility snapshot")
+	}
+	if afterProjection.sourceSeq != lastSourceSeq {
+		return nil, retrieval.QueryIntent{}, semanticAttemptSnapshot{}, semanticIndexUnavailable("source watermark is not current")
+	}
+	intent.EligibilityComplete = true
+	intent.EligiblePageTuples = eligible
+	return index, intent, semanticAttemptSnapshot{
+		index: index, revision: snap.Revision, sourceSeq: lastSourceSeq, projection: afterProjection,
+	}, nil
+}
+
+func readSemanticProjection(ctx context.Context, index *indexer.Index, sessionID string) (semanticProjectionSnapshot, error) {
+	health, err := index.Health(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return semanticProjectionSnapshot{}, ctx.Err()
+		}
+		return semanticProjectionSnapshot{}, semanticIndexUnavailable("source generation unavailable")
+	}
+	if !health.Ready || health.Generation <= 0 {
+		return semanticProjectionSnapshot{}, semanticIndexUnavailable("source generation unavailable")
+	}
+	sourceSeq, pageVersion, err := index.Watermark(ctx, sessionID)
+	if err != nil {
+		if ctx.Err() != nil {
+			return semanticProjectionSnapshot{}, ctx.Err()
+		}
+		return semanticProjectionSnapshot{}, semanticIndexUnavailable("source watermark unavailable")
+	}
+	return semanticProjectionSnapshot{
+		generation: health.Generation, sourceSeq: sourceSeq, pageVersion: pageVersion,
+	}, nil
+}
+
+func (s *Session) validateSemanticAttemptFreshness(ctx context.Context, attempt semanticAttemptSnapshot) (bool, error) {
+	changed, err := s.semanticAuthorityChanged(attempt)
+	if err != nil || changed {
+		return changed, err
+	}
+	projection, err := readSemanticProjection(ctx, attempt.index, s.Cfg.SessionID)
+	if err != nil {
+		return false, err
+	}
+	changed, err = s.semanticAuthorityChanged(attempt)
+	if err != nil || changed {
+		return changed, err
+	}
+	if projection != attempt.projection || projection.sourceSeq != attempt.sourceSeq {
+		return false, semanticIndexUnavailable("source projection changed during semantic resolution")
+	}
+	return false, nil
+}
+
+func (s *Session) semanticAuthorityChanged(attempt semanticAttemptSnapshot) (bool, error) {
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 	if err := s.operationErrorLocked(); err != nil {
-		return retrieval.Result{}, err
+		return false, err
 	}
-	if s.Index == nil {
-		return retrieval.Result{}, retrieval.ErrIndexUnavailable
+	if s.Index != attempt.index {
+		return false, semanticIndexUnavailable("source projection changed")
 	}
-	if s.lastEvent.ID == "" {
-		return retrieval.Result{}, retrieval.ErrSemanticPageMiss
+	if s.IndexErr != nil {
+		return false, semanticIndexUnavailable("documented source projection failure")
 	}
-	snap := s.Coherence.Snapshot()
-	change := pages.LedgerChange{
-		Event: s.lastEvent, State: s.State.Clone(), Events: s.Ledger, Artifacts: s.Artifacts,
-		Coherence: s.Coherence, RepoID: snap.Current.Repo, TaskID: snap.Current.TaskID,
-		Branch: snap.Current.Branch, Commit: snap.Current.Commit,
-	}
-	materialized := map[pages.PageID][]string{}
-	ret := &retrieval.LexicalRetriever{
-		Index: s.Index,
-		Recheck: func(checkCtx context.Context, page pages.WarmPage) (bool, string) {
-			if err := pages.ValidateMaterializable(checkCtx, page, change); err != nil {
-				return false, "authority"
-			}
-			evidence, err := s.materializeSemanticPage(checkCtx, page)
-			if err != nil {
-				return false, "fault"
-			}
-			materialized[page.ID] = evidence
-			return true, ""
-		},
-	}
-	result, err := ret.ResolveSemantic(ctx, retrieval.QueryIntent{
-		Mode:      retrieval.ModeSemanticFault,
-		SessionID: s.Cfg.SessionID,
-		RepoID:    snap.Current.Repo,
-		TaskID:    snap.Current.TaskID,
-		Branch:    snap.Current.Branch,
-		Commit:    snap.Current.Commit,
-		UserText:  text,
-	})
-	if err != nil {
-		return retrieval.Result{}, err
-	}
-	result.Degraded = append(result.Degraded, degraded...)
-	for _, candidate := range result.Candidates {
-		result.Materialized = append(result.Materialized, retrieval.MaterializedPage{
-			PageID: candidate.Page.ID, Evidence: append([]string(nil), materialized[candidate.Page.ID]...),
-		})
-	}
-	return result, nil
+	return s.Coherence.Snapshot().Revision != attempt.revision || s.lastEvent.Seq != attempt.sourceSeq, nil
 }
 
-func (s *Session) denseSemanticProbe(ctx context.Context, text string, snap coherence.Snapshot) []string {
-	if s.Embedder == nil || s.Index == nil || !s.Index.DenseEnabled() {
-		return nil
+func semanticIndexUnavailable(category string) error {
+	return fmt.Errorf("%w: %s", retrieval.ErrIndexUnavailable, category)
+}
+
+func semanticScopeEpochs(snap coherence.Snapshot) ([]pages.ScopeEpoch, error) {
+	epochs := map[pages.ScopeEpoch]struct{}{0: {}}
+	repo, branch, commit := snap.Current.Repo, snap.Current.Branch, snap.Current.Commit
+	branchEpoch := snap.BranchEpochs[repo+"\x00"+branch]
+	baseEpoch := branchEpoch
+	if commitEpoch := snap.CommitEpochs[repo+"\x00"+branch+"\x00"+commit]; commitEpoch > baseEpoch {
+		baseEpoch = commitEpoch
 	}
-	ns := s.Embedder.Namespace()
-	namespace := ns.ID
+	epochs[pages.ScopeEpoch(branchEpoch)] = struct{}{}
+	epochs[pages.ScopeEpoch(baseEpoch)] = struct{}{}
+	pathPrefix := repo + "\x00" + branch + "\x00"
+	for key, pathEpoch := range snap.PathEpochs {
+		if !strings.HasPrefix(key, pathPrefix) {
+			continue
+		}
+		generation := baseEpoch
+		if pathEpoch > generation {
+			generation = pathEpoch
+		}
+		epochs[pages.ScopeEpoch(generation)] = struct{}{}
+		if len(epochs) > semanticMaxScopeEpochs {
+			return nil, semanticIndexUnavailable("scope epoch set exceeds bound")
+		}
+	}
+	out := make([]pages.ScopeEpoch, 0, len(epochs))
+	for epoch := range epochs {
+		out = append(out, epoch)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+func (s *Session) semanticDenseQuery(ctx context.Context, index *indexer.Index, emb embedder.Embedder, text string) (*retrieval.DenseQuery, error) {
+	if emb == nil || index == nil || !index.DenseEnabled() {
+		return nil, nil
+	}
+	ns := emb.Namespace()
 	if err := ns.Validate(); err != nil {
 		s.recordEmbeddingError(indexer.EmbeddingStatusNamespace, err)
-		return []string{"dense=namespace"}
+		return &retrieval.DenseQuery{UnavailableReason: retrieval.DenseUnavailableNamespace}, nil
 	}
-	if dims := s.Index.DenseDimensions(); dims != ns.Profile.Dimensions {
+	if dims := index.DenseDimensions(); dims != ns.Profile.Dimensions {
 		err := fmt.Errorf("%w: index dimensions %d do not match namespace dimensions %d",
 			embedder.ErrInvalidNamespace, dims, ns.Profile.Dimensions)
 		s.recordEmbeddingError(indexer.EmbeddingStatusNamespace, err)
-		return []string{"dense=namespace"}
+		return &retrieval.DenseQuery{UnavailableReason: retrieval.DenseUnavailableNamespace}, nil
 	}
-	query, err := s.Embedder.EmbedQuery(ctx, text)
+	query, err := emb.EmbedQuery(ctx, text)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		category := embeddingFailureCategory(indexer.EmbeddingStatusEmbedder, err)
 		s.recordEmbeddingError(category, err)
-		return []string{denseProbeDegradationMarker(category, "dense=embedder")}
+		return &retrieval.DenseQuery{UnavailableReason: denseUnavailableReason(category)}, nil
 	}
 	if err := query.Validate(ns, embedder.RoleQuery); err != nil {
 		s.recordEmbeddingError(indexer.EmbeddingStatusVector, err)
-		return []string{"dense=query-vector"}
+		return &retrieval.DenseQuery{UnavailableReason: retrieval.DenseUnavailableQueryVector}, nil
 	}
-	// Phase 7D keeps semantic resolution FTS-first. The dense probe verifies the
-	// query/document ABI, namespace, and vec0 availability without letting a
-	// vector score become authority; Phase 7E owns fusion/reranking.
-	if _, err := s.Index.SearchDense(ctx, indexer.SearchQuery{
-		SessionID:          s.Cfg.SessionID,
-		RepoID:             snap.Current.Repo,
-		TaskID:             snap.Current.TaskID,
-		Branch:             snap.Current.Branch,
-		Commit:             snap.Current.Commit,
-		EmbeddingNamespace: namespace,
-		Limit:              3,
-		ActiveOnly:         true,
-	}, embeddingVector64(query.Vector)); err != nil {
-		category := embeddingFailureCategory(indexer.EmbeddingStatusSearch, err)
-		s.recordEmbeddingError(category, err)
-		return []string{denseProbeDegradationMarker(category, "dense=search")}
-	}
-	return nil
+	return &retrieval.DenseQuery{Namespace: ns.ID, Vector: embeddingVector64(query.Vector)}, nil
 }
 
-func denseProbeDegradationMarker(category, fallback string) string {
+func denseUnavailableReason(category string) retrieval.DenseUnavailableReason {
 	switch category {
 	case indexer.EmbeddingStatusNamespace:
-		return "dense=namespace"
+		return retrieval.DenseUnavailableNamespace
 	case indexer.EmbeddingStatusVector:
-		return "dense=query-vector"
+		return retrieval.DenseUnavailableQueryVector
 	case indexer.EmbeddingStatusAdmissionDenied:
-		return "dense=admission-denied"
+		return retrieval.DenseUnavailableAdmission
 	case indexer.EmbeddingStatusDenseUnavailable:
-		return "dense=unavailable"
+		return retrieval.DenseUnavailableSearch
 	default:
-		return fallback
+		return retrieval.DenseUnavailableEmbedder
 	}
 }
 
-func (s *Session) materializeSemanticPage(ctx context.Context, page pages.WarmPage) ([]string, error) {
+func semanticTraceFrom(err error, fallback retrieval.RetrievalTrace) retrieval.RetrievalTrace {
+	var miss *retrieval.SemanticMissError
+	if errors.As(err, &miss) {
+		return miss.Trace
+	}
+	return fallback
+}
+
+func semanticScopeMiss(trace retrieval.RetrievalTrace) error {
+	trace.Abstention = "scope"
+	return &retrieval.SemanticMissError{
+		Explanation: "mode=semantic_fault abstention=scope",
+		Trace:       trace,
+	}
+}
+
+func (s *Session) materializeSemanticPage(ctx context.Context, page pages.WarmPage, budget *semanticMaterializationBudget, retrievalTokens int) ([]string, int, string, error) {
 	const maxRenderedRefs = 4
+	if err := ctx.Err(); err != nil {
+		return nil, 0, "", err
+	}
+	if budget == nil {
+		return nil, 0, "", fmt.Errorf("nil semantic materialization budget")
+	}
+	if budget.attemptsRemaining <= 0 || budget.pagesRemaining <= 0 || budget.refsRemaining <= 0 ||
+		budget.tokensRemaining <= 0 || budget.bytesRemaining <= 0 || retrievalTokens <= 0 {
+		return nil, 0, "budget", nil
+	}
+	budget.attemptsRemaining--
+
 	refs := make([]pages.PageRef, 0, maxRenderedRefs)
 	for _, ref := range page.Refs {
 		if ref.Kind == pages.RefWSLRecord {
 			refs = append(refs, ref)
-			if len(refs) == maxRenderedRefs {
+			if len(refs) == maxRenderedRefs || len(refs) == budget.refsRemaining {
 				break
 			}
 		}
@@ -886,37 +1256,64 @@ func (s *Session) materializeSemanticPage(ctx context.Context, page pages.WarmPa
 		}
 	}
 	if len(refs) == 0 {
-		return nil, fmt.Errorf("page %s has no renderable exact ref", page.ID)
+		return nil, 0, "fault", nil
 	}
-	budget := s.Cfg.PageFaultTokenBudget
-	if budget <= 0 {
-		budget = 256
-	}
-	perRef := budget / len(refs)
-	if perRef < 32 {
-		perRef = 32
+	availableTokens := budget.tokensRemaining
+	if retrievalTokens < availableTokens {
+		availableTokens = retrievalTokens
 	}
 	evidence := make([]string, 0, len(refs))
-	for _, ref := range refs {
+	tokensUsed := 0
+	for i, ref := range refs {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, "", err
+		}
+		if budget.refsRemaining <= 0 || availableTokens <= 0 || budget.bytesRemaining <= 0 {
+			return nil, 0, "budget", nil
+		}
+		refsLeft := len(refs) - i
+		perRef := availableTokens / refsLeft
+		if perRef <= 0 {
+			return nil, 0, "budget", nil
+		}
+		// Resolver truncation appends an ellipsis token, so leave one token of
+		// headroom when possible instead of silently exceeding the shared cap.
+		requestTokens := perRef
+		if requestTokens > 1 {
+			requestTokens--
+		}
+		budget.refsRemaining--
 		var (
 			body string
 			err  error
 		)
 		switch ref.Kind {
 		case pages.RefWSLRecord:
-			body, err = s.Tools.ReadPage(ctx, ref.ID, perRef)
+			body, err = s.Tools.ReadPage(ctx, ref.ID, requestTokens)
 		case pages.RefEvent:
-			body, err = s.Tools.ReadEvent(ctx, ref.ID, perRef)
+			body, err = s.Tools.ReadEvent(ctx, ref.ID, requestTokens)
 		}
 		if err != nil {
-			return nil, err
+			return nil, 0, "", err
 		}
+		bodyTokens := renderer.EstimateTokens(body)
+		bodyBytes := len(body)
+		if bodyTokens > availableTokens || bodyTokens > budget.tokensRemaining || bodyBytes > budget.bytesRemaining {
+			budget.tokensRemaining = max(0, budget.tokensRemaining-bodyTokens)
+			budget.bytesRemaining = max(0, budget.bytesRemaining-bodyBytes)
+			return nil, 0, "budget", nil
+		}
+		budget.tokensRemaining -= bodyTokens
+		budget.bytesRemaining -= bodyBytes
+		availableTokens -= bodyTokens
+		tokensUsed += bodyTokens
 		if body == "" || body == faults.PageMiss {
-			return nil, fmt.Errorf("page %s ref %s did not materialize", page.ID, ref.Address())
+			return nil, 0, "fault", nil
 		}
 		evidence = append(evidence, body)
 	}
-	return evidence, nil
+	budget.pagesRemaining--
+	return evidence, tokensUsed, "", nil
 }
 
 func firstNonEmpty(values ...string) string {
