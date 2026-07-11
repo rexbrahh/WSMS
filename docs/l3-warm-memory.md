@@ -892,6 +892,15 @@ current committed event or startup catch-up
   -> non-blocking wake of the dense writeback worker
 ```
 
+Page compilation always runs synchronously on the append thread against
+as-of-event state, so replay stays equivalent (A3). The transactional write is
+synchronous by default; behind the default-off `AsyncMaintenance` flag (Phase 8)
+it is deferred to a bounded per-session worker under the same watermark/idempotency
+contract. Deferral never blocks the durable append (NFR-010): a full queue or a
+gap flags a ledger-watermark reconciliation, and the freshness gate abstains
+while the index trails the ledger, so an asynchronous cache still never beats
+exact evidence.
+
 The independent dense path is:
 
 ```text

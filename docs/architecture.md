@@ -1001,7 +1001,11 @@ operation lock before it is supported.
 7. **Residency:** bounded L2 cold/hot/pinned policy, bodyless ghosts, budget
    telemetry, and metadata-only semantic shadow; actual speculative prefetch
    remains gated.
-8. **Async maintenance:** ordered, bounded background indexing/observer workers.
+8. **Async maintenance:** bounded per-session index-apply worker behind a
+   default-off flag — page compilation stays synchronous (as-of-event, so replay
+   stays equivalent), only the SQLite apply defers; overflow/gaps reconcile from
+   the ledger watermark and never block the durable append. Unified
+   compile+embed substrate and observer-async remain deferred.
 9. **Adapters:** hosted/local model integrations behind `harness.Client` and
    optional hosted embeddings behind `Embedder`.
 10. **Evaluation:** forced-reset benchmark against strong baselines; enable

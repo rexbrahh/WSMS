@@ -1068,9 +1068,81 @@ Verification/gates:
 
 ### Phase 8 - Async maintenance
 
-- Introduce bounded per-session queues and ordered commit coordination.
-- Add idempotency keys, watermarks, retries, backpressure, drain/cancel, and
-  dead-letter inspection.
+**Entry gate:** the synchronous slice through Phase 7F is verified, and async
+stays behind a default-off flag (`config.AsyncMaintenance`) until a race+parity
+suite is green. This phase does not make async the default and does not touch the
+durable append's derivation order.
+
+**Objective:** move best-effort L3 index I/O off the durable append path without
+letting the disposable index ever beat exact evidence (A1) or diverge from replay
+derivation (A3), and never block a ledger write on index maintenance (NFR-010).
+
+**Status:** implemented and verified on the development platform (darwin), behind
+a default-off flag. The bounded per-session index-apply worker below is complete,
+and the root final verification matrix — `go test ./...`, `go test -race ./...`
+(10x on the maintenance path plus the full harness suite), `go vet`, build, live
+`wsms demo`, and `git diff --check` — passes; with the flag off the existing
+harness behavior and tests are byte-identical. A multi-lens adversarial review
+(replay-equivalence, non-blocking, concurrency, cache-vs-truth, inspection,
+resource) with per-finding refutation confirmed two findings, both fixed and
+regression-tested: (1) the inspection surface reported "caught up" while a repair
+was pending or a rebuild-from-behind was running; (2) a persistent non-gap apply
+error retried the identical unit forever instead of reconciling from the ledger
+like the synchronous path, and left `IndexErr` unset. A follow-up adversarial
+pass confirmed both fixes close their findings with no regression. This is not an
+enablement claim: async remains opt-in, and the single-substrate and
+observer-async items below stay deferred.
+
+Implementation:
+
+1. [x] Keep page compilation synchronous inside `appendMu`. The compiler reads
+   live WSL and coherence state (descriptor generation, page eligibility,
+   scope-epoch stamping) that cannot be reconstructed as-of-event off-thread, so
+   deferring it would stamp a later epoch and break A3. Only the SQLite apply is
+   deferred; compiled mutations are self-contained immutable data.
+2. [x] Add a bounded per-session apply queue keyed by ledger `append_seq`,
+   applied in sequence via the existing `ApplyWithWatermark` idempotency and
+   watermark contiguity. A gap (`ErrWatermarkGap`) reconciles from the ledger
+   rather than applying out of order.
+3. [x] Never block the durable append (NFR-010): on a full queue or a compile
+   failure, `Append` records lag and flags a ledger-watermark reconciliation
+   instead of waiting. Overflow is counted; the worker rebuilds from the ledger.
+4. [x] Supervise the worker like the embedding worker: coalescing wake, transient
+   retry with bounded backoff, park on a terminal closed index. Any non-gap apply
+   error reconciles from the ledger (mirroring the synchronous path) rather than
+   re-applying the same unit, and documents the stall on `IndexErr`.
+5. [x] Cancel-and-discard on `Close`: pending applies are dropped, the worker is
+   joined before the index is closed, and the next `OpenSession` replays them
+   from the ledger watermark. Replay itself stays synchronous.
+6. [x] Expose a synchronized, redacted `MaintenanceStatus` (async/degraded/
+   parked/reconciling/category/pending/dropped) for operator inspection. It never
+   carries raw error text, is never authoritative, and never gates L4 or exact
+   faults.
+7. [ ] Generalize the separate embedding and index-apply workers into one shared
+   idempotency/watermark/retry/dead-letter substrate; today the index-apply
+   worker wakes the existing embedding worker after applies rather than sharing
+   its queue.
+8. [ ] Add ordered-commit observer-async and a durable dead-letter store behind
+   that substrate; the current inspection surface is park + `IndexErr` + status,
+   not a persisted dead-letter queue.
+9. [ ] Promote async to the default only after a broader real-workload bake.
+
+Verification/gates:
+
+- [x] Async lag never returns a stale semantic result: the existing
+      watermark-freshness gate abstains (`ErrIndexUnavailable`) whenever the
+      index watermark trails the live ledger head, and a documented failure sets
+      `IndexErr` so the semantic path treats the index as unavailable; exact page
+      faults read L4 directly and are unaffected.
+- [x] Drained async maintenance produces the same exact-evidence materialization
+      as the synchronous path (quiescent A3 equivalence), including after
+      bounded-queue overflow reconciled from the ledger and after a
+      close-discard/reopen catch-up.
+- [x] The durable append never fails or blocks under a depth-1 queue driven to
+      sustained overflow; concurrent appends and searches stay race-clean, with a
+      lagging index legitimately abstaining rather than erroring.
+- [x] Root final matrix passes normal, race (incl. repeated maintenance runs),
+      build, demo, and diff checks; the flag-off path is unchanged.
 
 ### Phase 9 - Provider adapters and operator UX
 
