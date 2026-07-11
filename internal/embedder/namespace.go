@@ -106,7 +106,7 @@ func Qwen3Embedding06BProfile(modelRevision, tokenizerRevision, pageSchemaVersio
 		Dimensions:        1024,
 		DistanceMetric:    MetricCosine,
 		Normalization:     NormalizationL2,
-		QueryInstruction:  "Represent this query for retrieving relevant WSMS working-state pages.",
+		QueryInstruction:  "Instruct: Represent this query for retrieving relevant WSMS working-state pages.\nQuery:",
 		DocumentTemplate:  "{{.SearchText}}",
 		TokenizerRevision: tokenizerRevision,
 		PageSchemaVersion: pageSchemaVersion,

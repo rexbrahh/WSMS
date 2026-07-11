@@ -92,7 +92,13 @@ func NewLocalClient(opts LocalClientOptions) (*LocalClient, error) {
 			return nil, err
 		}
 		base = parsed
-		client.Transport = &http.Transport{Proxy: nil}
+		var dialer net.Dialer
+		client.Transport = &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return dialLoopbackContext(ctx, network, address, dialer.DialContext)
+			},
+		}
 	}
 
 	return &LocalClient{
@@ -105,6 +111,65 @@ func NewLocalClient(opts LocalClientOptions) (*LocalClient, error) {
 
 func rejectLocalRedirect(_ *http.Request, _ []*http.Request) error {
 	return fmt.Errorf("%w: local embedder redirects are not allowed", ErrDegraded)
+}
+
+type contextDialFunc func(context.Context, string, string) (net.Conn, error)
+
+// dialLoopbackContext revalidates locality at connection time. In particular,
+// localhost never passes through the ambient hosts file or DNS resolver: the
+// only candidates handed to the kernel are literal loopback addresses.
+func dialLoopbackContext(
+	ctx context.Context,
+	network string,
+	address string,
+	dial contextDialFunc,
+) (net.Conn, error) {
+	if dial == nil {
+		return nil, fmt.Errorf("local embedder dialer is required")
+	}
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("local embedder dial network must be tcp")
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("invalid local embedder dial address")
+	}
+
+	var candidates []netip.Addr
+	if strings.EqualFold(host, "localhost") {
+		candidates = []netip.Addr{
+			netip.MustParseAddr("127.0.0.1"),
+			netip.IPv6Loopback(),
+		}
+	} else {
+		addr, err := netip.ParseAddr(host)
+		if err != nil || !addr.IsLoopback() {
+			return nil, fmt.Errorf("local embedder dial target must be loopback")
+		}
+		candidates = []netip.Addr{addr}
+	}
+
+	var lastErr error
+	for _, candidate := range candidates {
+		if network == "tcp4" && !candidate.Is4() {
+			continue
+		}
+		if network == "tcp6" && !candidate.Is6() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := dial(ctx, network, net.JoinHostPort(candidate.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("local embedder dial target has no address for network %s", network)
 }
 
 // EmbedDocuments embeds an ordered document batch through the local sidecar.

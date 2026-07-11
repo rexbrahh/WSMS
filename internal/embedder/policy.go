@@ -217,5 +217,9 @@ func documentPayload(profile NamespaceProfile, canonical string) string {
 }
 
 func queryPayload(profile NamespaceProfile, canonical string) string {
-	return strings.TrimSpace(profile.QueryInstruction) + "\n" + canonical
+	instruction := strings.TrimSpace(profile.QueryInstruction)
+	if strings.HasSuffix(instruction, "\nQuery:") {
+		return instruction + " " + canonical
+	}
+	return instruction + "\n" + canonical
 }

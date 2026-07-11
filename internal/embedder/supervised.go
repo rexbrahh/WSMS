@@ -22,6 +22,11 @@ const (
 	selfCheckQueryText      = "wsms self check query page fault"
 	selfCheckFailureReason  = "self_check_failed"
 	selfCheckRequiredReason = "self_check_required"
+	backendFailureReason    = "backend_error"
+	timeoutFailureReason    = "timeout_or_cancelled"
+	invalidEmbeddingReason  = "invalid_embedding"
+	invalidNamespaceReason  = "invalid_namespace"
+	admissionDeniedReason   = "admission_denied"
 )
 
 // Backend is the supervised local inference seam. It is intentionally narrower
@@ -98,6 +103,10 @@ type Supervised struct {
 	maxDimensions int
 	timeout       time.Duration
 	now           func() time.Time
+
+	// flightClaimed is a package-private synchronization seam used by
+	// concurrency tests. Production instances leave it nil.
+	flightClaimed func(string)
 
 	mu                  sync.Mutex
 	breaker             BreakerOptions
@@ -233,106 +242,118 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 		misses = append(misses, m)
 	}
 	leaders := make([]*miss, 0, len(misses))
+	followers := make([]*miss, 0, len(misses))
+	finishLeaders := func(err error) {
+		for _, leader := range leaders {
+			e.cache.finishFlight(leader.key, leader.flight, Embedding{}, err)
+		}
+	}
 	for _, miss := range misses {
 		cached, ok, flight, leader := e.cache.getOrBegin(miss.key)
+		if e.flightClaimed != nil {
+			e.flightClaimed(miss.key)
+		}
 		switch {
 		case ok:
 			if err := cached.Validate(e.namespace, RoleDocument); err != nil {
+				finishLeaders(err)
 				return EmbeddingBatch{}, err
 			}
 			for _, index := range miss.indexes {
-				result.Embeddings[index] = cached
+				resultEmbedding := cached
+				resultEmbedding.Vector = copyVector(cached.Vector)
+				result.Embeddings[index] = resultEmbedding
 			}
 			result.CacheHits += len(miss.indexes)
-		case !leader:
-			embedding, err := e.cache.waitFlight(ctx, flight)
-			if err != nil {
-				return EmbeddingBatch{}, err
+		case leader:
+			miss.indexes = append([]int(nil), miss.indexes...)
+			miss.flight = flight
+			leaders = append(leaders, miss)
+		default:
+			miss.flight = flight
+			followers = append(followers, miss)
+		}
+	}
+
+	if len(leaders) > 0 {
+		result.CacheMisses = len(leaders)
+		if err := e.allowBackend(); err != nil {
+			finishLeaders(err)
+			return EmbeddingBatch{}, err
+		}
+		backendTexts := make([]string, len(leaders))
+		for i, leader := range leaders {
+			backendTexts[i] = leader.payload
+		}
+		callCtx, cancel := e.callContext(ctx)
+		vectors, err := e.backend.EmbedDocuments(callCtx, backendTexts)
+		if err != nil {
+			e.recordFailure(classifyFailure(callCtx, err))
+			err = degradeError(callCtx, err)
+			cancel()
+			finishLeaders(err)
+			return EmbeddingBatch{}, err
+		}
+		if err := callCtx.Err(); err != nil {
+			e.recordFailure(classifyFailure(callCtx, err))
+			err = degradeError(callCtx, err)
+			cancel()
+			finishLeaders(err)
+			return EmbeddingBatch{}, err
+		}
+		cancel()
+		if len(vectors) != len(leaders) {
+			e.recordFailure("malformed_batch")
+			err := fmt.Errorf("%w: backend returned %d vectors for %d documents", ErrInvalidEmbedding, len(vectors), len(leaders))
+			finishLeaders(err)
+			return EmbeddingBatch{}, err
+		}
+		embeddings := make([]Embedding, len(leaders))
+		for i, vector := range vectors {
+			embedding := Embedding{
+				Namespace:     e.namespace,
+				Role:          RoleDocument,
+				Vector:        copyVector(vector),
+				CanonicalText: leaders[i].canonical,
+				CacheKey:      leaders[i].key,
 			}
 			if err := embedding.Validate(e.namespace, RoleDocument); err != nil {
+				e.recordFailure("malformed_vector")
+				finishLeaders(err)
 				return EmbeddingBatch{}, err
 			}
-			for _, index := range miss.indexes {
+			embeddings[i] = embedding
+		}
+		for i, embedding := range embeddings {
+			leader := leaders[i]
+			e.cache.finishFlight(leader.key, leader.flight, embedding, nil)
+			for _, index := range leader.indexes {
 				resultEmbedding := embedding
 				resultEmbedding.Vector = copyVector(embedding.Vector)
 				result.Embeddings[index] = resultEmbedding
 			}
-			result.CacheHits += len(miss.indexes)
-		default:
-			miss.indexes = append([]int(nil), miss.indexes...)
-			miss.flight = flight
-			leaders = append(leaders, miss)
 		}
+		e.recordSuccess()
 	}
-	if len(leaders) == 0 {
-		return result, result.Validate(e.namespace, len(texts))
-	}
-	result.CacheMisses = len(leaders)
-	if err := e.allowBackend(); err != nil {
-		for _, miss := range leaders {
-			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
-		}
-		return EmbeddingBatch{}, err
-	}
-	backendTexts := make([]string, len(leaders))
-	for i, miss := range leaders {
-		backendTexts[i] = miss.payload
-	}
-	callCtx, cancel := e.callContext(ctx)
-	defer cancel()
-	vectors, err := e.backend.EmbedDocuments(callCtx, backendTexts)
-	if err != nil {
-		e.recordFailure(classifyFailure(callCtx, err))
-		err = degradeError(callCtx, err)
-		for _, miss := range leaders {
-			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
-		}
-		return EmbeddingBatch{}, err
-	}
-	if err := callCtx.Err(); err != nil {
-		e.recordFailure(classifyFailure(callCtx, err))
-		err = degradeError(callCtx, err)
-		for _, miss := range leaders {
-			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
-		}
-		return EmbeddingBatch{}, err
-	}
-	if len(vectors) != len(leaders) {
-		e.recordFailure("malformed_batch")
-		err := fmt.Errorf("%w: backend returned %d vectors for %d documents", ErrInvalidEmbedding, len(vectors), len(leaders))
-		for _, miss := range leaders {
-			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
-		}
-		return EmbeddingBatch{}, err
-	}
-	embeddings := make([]Embedding, len(leaders))
-	for i, vector := range vectors {
-		embedding := Embedding{
-			Namespace:     e.namespace,
-			Role:          RoleDocument,
-			Vector:        copyVector(vector),
-			CanonicalText: leaders[i].canonical,
-			CacheKey:      leaders[i].key,
-		}
-		if err := embedding.Validate(e.namespace, RoleDocument); err != nil {
-			e.recordFailure("malformed_vector")
-			for _, miss := range leaders {
-				e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
-			}
+
+	// Never wait on another caller while this call owns an unfinished flight.
+	// Completing leaders first prevents reversed batches [A,B] and [B,A] from
+	// each holding one key while waiting forever for the other.
+	for _, follower := range followers {
+		embedding, err := e.cache.waitFlight(ctx, follower.flight)
+		if err != nil {
 			return EmbeddingBatch{}, err
 		}
-		embeddings[i] = embedding
-	}
-	for i, embedding := range embeddings {
-		miss := leaders[i]
-		e.cache.finishFlight(miss.key, miss.flight, embedding, nil)
-		for _, index := range miss.indexes {
+		if err := embedding.Validate(e.namespace, RoleDocument); err != nil {
+			return EmbeddingBatch{}, err
+		}
+		for _, index := range follower.indexes {
 			resultEmbedding := embedding
 			resultEmbedding.Vector = copyVector(embedding.Vector)
 			result.Embeddings[index] = resultEmbedding
 		}
+		result.CacheHits += len(follower.indexes)
 	}
-	e.recordSuccess()
 	return result, result.Validate(e.namespace, len(texts))
 }
 
@@ -440,13 +461,8 @@ func (e *Supervised) SelfCheck(ctx context.Context) error {
 	defer cancel()
 	if checker, ok := e.backend.(backendSelfChecker); ok {
 		if err := checker.SelfCheck(callCtx, e.namespace); err != nil {
-			reason := selfCheckFailureReason
-			if callCtx.Err() != nil {
-				reason = classifyFailure(callCtx, err)
-				err = degradeError(callCtx, err)
-			} else {
-				err = fmt.Errorf("%w: backend profile self-check failed", ErrDegraded)
-			}
+			reason := classifySelfCheckFailure(callCtx, err)
+			err = degradeError(callCtx, err)
 			e.recordSelfCheckFailure(reason)
 			return err
 		}
@@ -585,14 +601,41 @@ func (e *Supervised) recordSelfCheckFailure(reason string) {
 
 func classifyFailure(ctx context.Context, err error) string {
 	if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return "timeout_or_cancelled"
+		return timeoutFailureReason
 	}
-	return "backend_error"
+	_, reason := safeBackendFailure(err)
+	return reason
+}
+
+func classifySelfCheckFailure(ctx context.Context, err error) string {
+	reason := classifyFailure(ctx, err)
+	if reason == backendFailureReason {
+		return selfCheckFailureReason
+	}
+	return reason
 }
 
 func degradeError(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("%w: %w", ErrDegraded, ctx.Err())
 	}
+	if sentinel, _ := safeBackendFailure(err); sentinel != nil {
+		// Preserve only package-owned categorical sentinels. Backend detail may
+		// contain secrets or payload fragments and must never cross this boundary.
+		return fmt.Errorf("%w: backend rejected request: %w", ErrDegraded, sentinel)
+	}
 	return fmt.Errorf("%w: backend unavailable", ErrDegraded)
+}
+
+func safeBackendFailure(err error) (error, string) {
+	switch {
+	case errors.Is(err, ErrInvalidNamespace):
+		return ErrInvalidNamespace, invalidNamespaceReason
+	case errors.Is(err, ErrInvalidEmbedding):
+		return ErrInvalidEmbedding, invalidEmbeddingReason
+	case errors.Is(err, ErrAdmissionDenied):
+		return ErrAdmissionDenied, admissionDeniedReason
+	default:
+		return nil, backendFailureReason
+	}
 }

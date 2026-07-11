@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -104,6 +105,59 @@ func TestLocalClientUnixSocketQuery(t *testing.T) {
 	}
 	if len(seen) != 1 || seen[0].Role != RoleQuery {
 		t.Fatalf("seen unix requests = %#v, want one query", seen)
+	}
+}
+
+func TestLocalClientUnixSocketRejectsRedirect(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	redirectedBodies := make(chan string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc(localEmbedPath, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://redirect.invalid/capture")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("/capture", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		redirectedBodies <- string(body)
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	socket := filepath.Join(t.TempDir(), "redirect.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("listen unix: %v", err)
+	}
+	server := &http.Server{Handler: mux}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		err := <-serveDone
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("unix redirect server: %v", err)
+		}
+	})
+
+	client, err := NewLocalClient(LocalClientOptions{
+		Namespace:        ns,
+		SocketPath:       socket,
+		MaxResponseBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("new unix local client: %v", err)
+	}
+	_, err = client.EmbedQuery(context.Background(), "unix-redirect-secret")
+	if !errors.Is(err, ErrDegraded) {
+		t.Fatalf("unix redirect error = %v, want degraded", err)
+	}
+	select {
+	case body := <-redirectedBodies:
+		t.Fatalf("unix redirect replayed POST body %q", body)
+	default:
 	}
 }
 
@@ -240,6 +294,93 @@ func TestLocalClientRejectsRedirectsWithoutProxyExfiltration(t *testing.T) {
 	case body := <-proxyBodies:
 		t.Fatalf("redirect reached proxy with body %q", body)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestLocalClientRejectsRedirectToReachableTarget(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	const sensitive = "reachable-redirect-secret"
+	targetBodies := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		targetBodies <- string(body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", target.URL+"/capture")
+		w.WriteHeader(http.StatusPermanentRedirect)
+	}))
+	defer sidecar.Close()
+	client, err := NewLocalClient(LocalClientOptions{
+		Namespace:        ns,
+		Endpoint:         sidecar.URL,
+		MaxResponseBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("new local client: %v", err)
+	}
+	_, err = client.EmbedQuery(context.Background(), sensitive)
+	if !errors.Is(err, ErrDegraded) {
+		t.Fatalf("redirect error = %v, want degraded", err)
+	}
+	if errStringContains(err, sensitive) {
+		t.Fatalf("redirect error leaked request payload: %v", err)
+	}
+	select {
+	case body := <-targetBodies:
+		t.Fatalf("redirect target received replayed POST body %q", body)
+	default:
+	}
+}
+
+func TestDialLoopbackContextUsesOnlyLiteralLoopbackAddresses(t *testing.T) {
+	tests := []struct {
+		name         string
+		network      string
+		address      string
+		wantDials    int
+		wantLoopback bool
+	}{
+		{name: "localhost", network: "tcp", address: "localhost:8080", wantDials: 2, wantLoopback: true},
+		{name: "ipv4", network: "tcp", address: "127.23.45.67:8080", wantDials: 1, wantLoopback: true},
+		{name: "ipv6", network: "tcp", address: "[::1]:8080", wantDials: 1, wantLoopback: true},
+		{name: "non_loopback", network: "tcp", address: "203.0.113.10:8080", wantDials: 0},
+		{name: "ambient_hostname", network: "tcp", address: "embedder.example:8080", wantDials: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var attempts []string
+			_, err := dialLoopbackContext(
+				context.Background(),
+				tt.network,
+				tt.address,
+				func(_ context.Context, _ string, address string) (net.Conn, error) {
+					attempts = append(attempts, address)
+					return nil, errors.New("injected dial stop")
+				},
+			)
+			if err == nil {
+				t.Fatal("dial error = nil, want injected or locality error")
+			}
+			if len(attempts) != tt.wantDials {
+				t.Fatalf("dial attempts = %v, want %d", attempts, tt.wantDials)
+			}
+			for _, attempt := range attempts {
+				host, _, splitErr := net.SplitHostPort(attempt)
+				if splitErr != nil {
+					t.Fatalf("split attempted address %q: %v", attempt, splitErr)
+				}
+				addr, parseErr := netip.ParseAddr(host)
+				if parseErr != nil {
+					t.Fatalf("attempted host %q is not an IP literal: %v", host, parseErr)
+				}
+				if addr.IsLoopback() != tt.wantLoopback {
+					t.Fatalf("attempted address %s loopback = %v, want %v", addr, addr.IsLoopback(), tt.wantLoopback)
+				}
+			}
+		})
 	}
 }
 
