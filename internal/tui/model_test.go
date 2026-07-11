@@ -17,11 +17,11 @@ type fakeAgent struct {
 
 func newFakeAgent() *fakeAgent { return &fakeAgent{events: make(chan pirpc.Event, 8)} }
 
-func (f *fakeAgent) Prompt(s string) error            { f.prompts = append(f.prompts, s); return nil }
-func (f *fakeAgent) Steer(string) error               { return nil }
-func (f *fakeAgent) Abort() error                     { return nil }
-func (f *fakeAgent) Events() <-chan pirpc.Event       { return f.events }
-func (f *fakeAgent) Close() error                     { return nil }
+func (f *fakeAgent) Prompt(s string) error      { f.prompts = append(f.prompts, s); return nil }
+func (f *fakeAgent) Steer(string) error         { return nil }
+func (f *fakeAgent) Abort() error               { return nil }
+func (f *fakeAgent) Events() <-chan pirpc.Event { return f.events }
+func (f *fakeAgent) Close() error               { return nil }
 
 func step(m Model, msg tea.Msg) (Model, tea.Cmd) {
 	next, cmd := m.Update(msg)
@@ -60,14 +60,37 @@ func TestSubmitWithoutAgent(t *testing.T) {
 	}
 }
 
+// Envelopes below mirror live pi RPC output captured against the real harness:
+// incremental text arrives as message_update.assistantMessageEvent deltas, and
+// message_end carries the authoritative finalized message.
 func TestApplyEventStreamsAndFlushes(t *testing.T) {
 	m := newModel(newFakeAgent(), newCoreClient("http://127.0.0.1:1", ""))
-	m.streaming = true
 
-	update := json.RawMessage(`{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"Hello "}]}}`)
-	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_update", Raw: update}})
-	if m.stream.String() != "Hello " {
-		t.Fatalf("stream = %q", m.stream.String())
+	start := json.RawMessage(`{"type":"message_start","message":{"role":"assistant","content":[]}}`)
+	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_start", Raw: start}})
+	if !m.streaming {
+		t.Fatal("assistant message_start should begin streaming")
+	}
+
+	for _, delta := range []string{"Hello ", "world"} {
+		raw := json.RawMessage(`{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"` + delta + `"}}`)
+		m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_update", Raw: raw}})
+	}
+	if m.stream.String() != "Hello world" {
+		t.Fatalf("stream = %q, want accumulated deltas", m.stream.String())
+	}
+
+	// text_start / text_end updates carry no delta and must not corrupt the buffer.
+	nonDelta := json.RawMessage(`{"type":"message_update","assistantMessageEvent":{"type":"text_end","content":"Hello world"}}`)
+	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_update", Raw: nonDelta}})
+	if m.stream.String() != "Hello world" {
+		t.Fatalf("non-delta update changed stream: %q", m.stream.String())
+	}
+
+	end := json.RawMessage(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello world"}]}}`)
+	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_end", Raw: end}})
+	if len(m.lines) != 1 || m.lines[0].who != "pi" || m.lines[0].text != "Hello world" {
+		t.Fatalf("expected flushed pi line, got %+v", m.lines)
 	}
 
 	settled := json.RawMessage(`{"type":"agent_settled"}`)
@@ -75,8 +98,23 @@ func TestApplyEventStreamsAndFlushes(t *testing.T) {
 	if m.streaming {
 		t.Fatal("agent_settled should stop streaming")
 	}
-	if len(m.lines) != 1 || m.lines[0].who != "pi" || m.lines[0].text != "Hello " {
-		t.Fatalf("expected flushed pi line, got %+v", m.lines)
+	if len(m.lines) != 1 {
+		t.Fatalf("agent_settled must not duplicate the flushed line, got %+v", m.lines)
+	}
+}
+
+func TestDeltaText(t *testing.T) {
+	cases := map[string]string{
+		`{"assistantMessageEvent":{"type":"text_delta","delta":"hi"}}`:      "hi",
+		`{"assistantMessageEvent":{"type":"thinking_delta","delta":"hmm"}}`: "", // reasoning, not chat
+		`{"assistantMessageEvent":{"type":"text_start"}}`:                   "",
+		`{"assistantMessageEvent":{"type":"text_end","content":"hi"}}`:      "",
+		`{"type":"agent_settled"}`:                                          "",
+	}
+	for raw, want := range cases {
+		if got := deltaText(json.RawMessage(raw)); got != want {
+			t.Errorf("deltaText(%s) = %q, want %q", raw, got, want)
+		}
 	}
 }
 
@@ -95,10 +133,10 @@ func TestVizMsgUpdatesPanels(t *testing.T) {
 func TestAssistantTextShapes(t *testing.T) {
 	cases := map[string]string{
 		`{"message":{"content":[{"type":"text","text":"ab"},{"type":"thinking"},{"type":"text","text":"cd"}]}}`: "abcd",
-		`{"message":{"content":"bare string"}}`:                                                                  "bare string",
-		`{"text":"flat"}`:                                                                                        "flat",
-		`{"delta":"tok"}`:                                                                                        "tok",
-		`{"type":"noise"}`:                                                                                       "",
+		`{"message":{"content":"bare string"}}`: "bare string",
+		`{"text":"flat"}`:                       "flat",
+		`{"delta":"tok"}`:                       "tok",
+		`{"type":"noise"}`:                      "",
 	}
 	for raw, want := range cases {
 		if got := assistantText(json.RawMessage(raw)); got != want {

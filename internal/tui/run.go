@@ -16,6 +16,8 @@ type Options struct {
 	Token     string // optional bearer token for the core
 	PiCommand string // pi launch command (space-split); empty runs viz-only
 	Extension string // bridge extension path to load into pi via -e
+	Provider  string // optional pi --provider (e.g. the offline mock)
+	Model     string // optional pi --model
 }
 
 // Run starts the TUI. If PiCommand is set it spawns that command in pi RPC mode;
@@ -30,6 +32,12 @@ func Run(opts Options) error {
 		args := append([]string{}, fields[1:]...)
 		if opts.Extension != "" {
 			args = append(args, "-e", opts.Extension)
+		}
+		if opts.Provider != "" {
+			args = append(args, "--provider", opts.Provider)
+		}
+		if opts.Model != "" {
+			args = append(args, "--model", opts.Model)
 		}
 		args = append(args, "--mode", "rpc")
 		client, err := pirpc.Spawn(context.Background(), fields[0], args...)

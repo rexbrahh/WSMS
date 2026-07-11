@@ -40,20 +40,20 @@ type Model struct {
 	stream    strings.Builder // in-progress assistant text for the current turn
 	streaming bool
 
-	viz       vizState
-	vizErr    bool
-	agent     agent
-	core      *coreClient
-	vizCtx    context.Context
+	viz    vizState
+	vizErr bool
+	agent  agent
+	core   *coreClient
+	vizCtx context.Context
 }
 
 // message types
 type (
-	agentEventMsg  struct{ ev pirpc.Event }
-	agentClosedMsg struct{}
-	vizMsg         struct{ state vizState }
-	vizErrMsg      struct{}
-	vizTickMsg     struct{}
+	agentEventMsg   struct{ ev pirpc.Event }
+	agentClosedMsg  struct{}
+	vizMsg          struct{ state vizState }
+	vizErrMsg       struct{}
+	vizTickMsg      struct{}
 	promptResultMsg struct{ err error }
 )
 
@@ -143,18 +143,29 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 	return m, promptCmd(m.agent, text)
 }
 
-// applyEvent folds a streamed pi event into the chat. Field extraction is
-// tolerant across event shapes; the flush points (assistant message_end,
-// agent_settled) are what commit a turn's text to the transcript.
+// applyEvent folds a streamed pi event into the chat.
+//
+// Streaming text is accumulated from message_update deltas
+// (assistantMessageEvent.delta, gated on type "text_delta") — the only reliable
+// incremental signal, since pi's in-place-mutated `message.content` snapshot is
+// timing-dependent on the wire. message_end carries the finalized message, whose
+// content is authoritative: we adopt it (repairing any deltas lost to
+// backpressure) before flushing the turn. agent_settled is the final safety net.
 func (m *Model) applyEvent(ev pirpc.Event) {
 	switch ev.Type {
-	case "message_update":
-		if txt := assistantText(ev.Raw); txt != "" {
+	case "message_start":
+		if role(ev.Raw) == "assistant" {
 			m.stream.Reset()
-			m.stream.WriteString(txt)
+			m.streaming = true
 		}
+	case "message_update":
+		m.stream.WriteString(deltaText(ev.Raw))
 	case "message_end":
 		if role(ev.Raw) == "assistant" {
+			if full := assistantText(ev.Raw); full != "" {
+				m.stream.Reset()
+				m.stream.WriteString(full)
+			}
 			m.flushStream()
 		}
 	case "agent_settled":
@@ -202,11 +213,31 @@ func scheduleViz() tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg { return vizTickMsg{} })
 }
 
-// --- tolerant event field extraction ---
+// --- event field extraction, verified against live pi RPC output ---
 
-// assistantText pulls the assistant's text out of a streamed event. pi's
-// message events carry the whole message under "message"; fall back to flatter
-// shapes so a schema drift degrades to less text rather than none.
+// deltaText pulls one incremental text token from a message_update event. pi
+// nests the streaming delta under assistantMessageEvent and gates it by type;
+// only "text_delta" is chat text ("thinking_delta" is reasoning, deliberately
+// not surfaced here). Anything else yields "".
+func deltaText(raw json.RawMessage) string {
+	var env struct {
+		AME struct {
+			Type  string `json:"type"`
+			Delta string `json:"delta"`
+		} `json:"assistantMessageEvent"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return ""
+	}
+	if env.AME.Type != "text_delta" {
+		return ""
+	}
+	return env.AME.Delta
+}
+
+// assistantText pulls the assistant's finalized text out of a message_end event.
+// pi carries the whole message under "message"; fall back to flatter shapes so a
+// schema drift degrades to less text rather than none.
 func assistantText(raw json.RawMessage) string {
 	var env struct {
 		Message json.RawMessage `json:"message"`

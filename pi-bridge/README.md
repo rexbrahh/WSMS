@@ -40,12 +40,34 @@ pi -e ./pi-bridge/src/index.ts          # or symlink into .pi/extensions/
 
 TypeScript loads directly via jiti — no build step.
 
+## Offline end-to-end demo (no API key)
+
+`WSMS_MOCK_MODEL=1` registers a keyless echo provider (`wsms-mock/wsms-echo`)
+that drives pi's real streaming path with canned tokens — so the whole
+three-process pipeline runs with no credential and no network, which is the
+default demo path. It is strictly opt-in and never masquerades as a real model.
+
+```bash
+export WSMS_MOCK_MODEL=1
+wsms serve --data-dir .wsms &
+wsms-tui \
+  --pi "$(pwd)/third_party/pi/pi-test.sh" \
+  --extension "$(pwd)/pi-bridge/src/index.ts" \
+  --provider wsms-mock --model wsms-echo
+```
+
+The streamed `message_update` envelopes this produces are shape-identical to a
+real model's, which is how the TUI's event extraction was verified against live
+pi output (`internal/tui`: incremental text is read from
+`assistantMessageEvent.delta`, gated on `type == "text_delta"`).
+
 ## Configuration (env only)
 
 | Var | Purpose | Default |
 |---|---|---|
 | `WSMS_CORE_URL` | Core service base URL | `http://127.0.0.1:7673` |
 | `WSMS_SERVE_TOKEN` | Bearer token, if the core requires one | unset |
+| `WSMS_MOCK_MODEL` | Register the keyless offline echo model (`=1`) | unset (no mock) |
 | `WSMS_LLAMA_BASE_URL` | Register a local llama-server provider | unset (offline default registers none) |
 | `WSMS_LLAMA_MODEL` / `WSMS_LLAMA_CONTEXT` | Local model id / context window | `local-model` / `32768` |
 | `OPENAI_API_KEY` | Enable the hosted OpenAI provider | unset (hosted off) |
@@ -63,5 +85,9 @@ WSMS_BIN=/tmp/wsms node pi-bridge/test/client.smoke.mjs
 ```
 
 Exercises the `WsmsClient` ↔ live core seam (including the core's CSRF
-hardening). The pi-facing handlers are integration-tested once the TUI stands up
-a real pi runtime (build step 3).
+hardening).
+
+The pi-facing handlers are verified end-to-end against a real pi runtime: with
+`WSMS_MOCK_MODEL=1` the bridge loads, injects the capsule (the model observes
+`<working_state>` in its context), and ingests the finalized user/assistant
+turn into the durable ledger — all with no API key.

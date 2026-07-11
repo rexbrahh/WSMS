@@ -22,6 +22,7 @@ import type { AgentMessage, ExtensionAPI } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import { WsmsClient } from "./wsms-client.ts";
 import { maybeRegisterProviders } from "./providers.ts";
+import { maybeRegisterMockModel } from "./mock-provider.ts";
 
 const OWN_TOOLS = new Set(["wsms_read_page", "wsms_recall"]);
 
@@ -29,6 +30,7 @@ export default function (pi: ExtensionAPI): void {
 	const client = new WsmsClient();
 
 	maybeRegisterProviders(pi);
+	maybeRegisterMockModel(pi);
 
 	// Inject the WSMS capsule ahead of the real conversation on every model call.
 	pi.on("context", async (event) => {
