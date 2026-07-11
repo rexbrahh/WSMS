@@ -91,36 +91,50 @@ func renderLine(ln line, w int) []string {
 }
 
 func (m Model) renderMemory(w, h int) string {
-	rows := []string{titleStyle.Render("memory")}
+	title := titleStyle.Render("memory")
 
 	if !m.viz.reachable {
-		note := "core unreachable"
+		note := "waiting for core…"
 		if m.vizErr {
 			note = "core unreachable (retrying)"
-		} else {
-			note = "waiting for core…"
 		}
-		rows = append(rows, "", sysStyle.Render(note))
-		return fitHeight(rows, h)
+		return fitHeight([]string{title, "", sysStyle.Render(note)}, h)
 	}
 
-	rows = append(rows, labelStyle.Render("CAPSULE"))
+	// Residency + status are compact and always relevant, so pin them to the
+	// bottom; the capsule scrolls in the region above, shown from its HEAD (the
+	// task/constraint/failure that matter most) with an ellipsis when it
+	// overflows — the full body is always a page-fault away.
+	pinned := []string{
+		labelStyle.Render("RESIDENCY"),
+		fmt.Sprintf("resident %d/%d", m.viz.residentPages, m.viz.maxPages),
+		gauge(m.viz.residentPages, m.viz.maxPages, w),
+		fmt.Sprintf("hot %d · cold %d · pin %d · ghost %d",
+			m.viz.hotPages, m.viz.coldPages, m.viz.pinnedPages, m.viz.ghostPages),
+		"",
+		labelStyle.Render("STATUS"),
+		"index " + statusWord(m.viz.maintDegraded, m.viz.maintCategory, m.viz.maintPending),
+		"embed " + statusWord(m.viz.embedDegraded, m.viz.embedCategory, 0),
+	}
+
 	capsule := strings.TrimSpace(m.viz.capsule)
 	if capsule == "" {
 		capsule = "(empty)"
 	}
-	rows = append(rows, wordWrap(capsule, w)...)
+	capsuleRows := append([]string{labelStyle.Render("CAPSULE")}, wordWrap(capsule, w)...)
 
-	rows = append(rows, "", labelStyle.Render("RESIDENCY"))
-	rows = append(rows, fmt.Sprintf("resident %d/%d", m.viz.residentPages, m.viz.maxPages))
-	rows = append(rows, gauge(m.viz.residentPages, m.viz.maxPages, w))
-	rows = append(rows, fmt.Sprintf("hot %d · cold %d · pin %d · ghost %d",
-		m.viz.hotPages, m.viz.coldPages, m.viz.pinnedPages, m.viz.ghostPages))
-
-	rows = append(rows, "", labelStyle.Render("STATUS"))
-	rows = append(rows, "index "+statusWord(m.viz.maintDegraded, m.viz.maintCategory, m.viz.maintPending))
-	rows = append(rows, "embed "+statusWord(m.viz.embedDegraded, m.viz.embedCategory, 0))
-
+	rows := []string{title}
+	avail := h - len(rows) - 1 - len(pinned) // title + one spacer + pinned block
+	if avail >= 1 {
+		if len(capsuleRows) > avail {
+			capsuleRows = append(capsuleRows[:avail-1:avail-1], sysStyle.Render("…"))
+		}
+		rows = append(rows, capsuleRows...)
+	}
+	for len(rows) < h-len(pinned) { // push the pinned block to the bottom
+		rows = append(rows, "")
+	}
+	rows = append(rows, pinned...)
 	return fitHeight(rows, h)
 }
 
