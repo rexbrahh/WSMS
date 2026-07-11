@@ -219,10 +219,14 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 			existing.indexes = append(existing.indexes, i)
 			continue
 		}
+		payload := documentPayload(e.namespace.Profile, canonical)
+		if err := e.policy.validatePayload(payload, RoleDocument); err != nil {
+			return EmbeddingBatch{}, err
+		}
 		m := &miss{
 			key:       key,
 			canonical: canonical,
-			payload:   documentPayload(e.namespace.Profile, canonical),
+			payload:   payload,
 			indexes:   []int{i},
 		}
 		missesByKey[key] = m
@@ -239,7 +243,7 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 			for _, index := range miss.indexes {
 				result.Embeddings[index] = cached
 			}
-			result.CacheHits++
+			result.CacheHits += len(miss.indexes)
 		case !leader:
 			embedding, err := e.cache.waitFlight(ctx, flight)
 			if err != nil {
@@ -253,14 +257,9 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 				resultEmbedding.Vector = copyVector(embedding.Vector)
 				result.Embeddings[index] = resultEmbedding
 			}
-			result.CacheHits++
+			result.CacheHits += len(miss.indexes)
 		default:
 			miss.indexes = append([]int(nil), miss.indexes...)
-			miss.payload = documentPayload(e.namespace.Profile, miss.canonical)
-			if err := e.policy.validatePayload(miss.payload, RoleDocument); err != nil {
-				e.cache.finishFlight(miss.key, flight, Embedding{}, err)
-				return EmbeddingBatch{}, err
-			}
 			miss.flight = flight
 			leaders = append(leaders, miss)
 		}
@@ -284,26 +283,50 @@ func (e *Supervised) EmbedDocuments(ctx context.Context, texts []string) (Embedd
 	vectors, err := e.backend.EmbedDocuments(callCtx, backendTexts)
 	if err != nil {
 		e.recordFailure(classifyFailure(callCtx, err))
-		return EmbeddingBatch{}, degradeError(callCtx, err)
+		err = degradeError(callCtx, err)
+		for _, miss := range leaders {
+			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
+		}
+		return EmbeddingBatch{}, err
 	}
-	if len(vectors) != len(misses) {
+	if err := callCtx.Err(); err != nil {
+		e.recordFailure(classifyFailure(callCtx, err))
+		err = degradeError(callCtx, err)
+		for _, miss := range leaders {
+			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
+		}
+		return EmbeddingBatch{}, err
+	}
+	if len(vectors) != len(leaders) {
 		e.recordFailure("malformed_batch")
-		return EmbeddingBatch{}, fmt.Errorf("%w: backend returned %d vectors for %d documents", ErrInvalidEmbedding, len(vectors), len(misses))
+		err := fmt.Errorf("%w: backend returned %d vectors for %d documents", ErrInvalidEmbedding, len(vectors), len(leaders))
+		for _, miss := range leaders {
+			e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
+		}
+		return EmbeddingBatch{}, err
 	}
+	embeddings := make([]Embedding, len(leaders))
 	for i, vector := range vectors {
 		embedding := Embedding{
 			Namespace:     e.namespace,
 			Role:          RoleDocument,
 			Vector:        copyVector(vector),
-			CanonicalText: misses[i].canonical,
-			CacheKey:      misses[i].key,
+			CanonicalText: leaders[i].canonical,
+			CacheKey:      leaders[i].key,
 		}
 		if err := embedding.Validate(e.namespace, RoleDocument); err != nil {
 			e.recordFailure("malformed_vector")
+			for _, miss := range leaders {
+				e.cache.finishFlight(miss.key, miss.flight, Embedding{}, err)
+			}
 			return EmbeddingBatch{}, err
 		}
-		e.cache.put(misses[i].key, embedding)
-		for _, index := range misses[i].indexes {
+		embeddings[i] = embedding
+	}
+	for i, embedding := range embeddings {
+		miss := leaders[i]
+		e.cache.finishFlight(miss.key, miss.flight, embedding, nil)
+		for _, index := range miss.indexes {
 			resultEmbedding := embedding
 			resultEmbedding.Vector = copyVector(embedding.Vector)
 			result.Embeddings[index] = resultEmbedding
@@ -325,13 +348,21 @@ func (e *Supervised) EmbedQuery(ctx context.Context, text string) (Embedding, er
 	if err != nil {
 		return Embedding{}, err
 	}
+	payload := queryPayload(e.namespace.Profile, canonical)
+	if err := e.policy.validatePayload(payload, RoleQuery); err != nil {
+		return Embedding{}, err
+	}
 	if err := e.allowBackend(); err != nil {
 		return Embedding{}, err
 	}
 	callCtx, cancel := e.callContext(ctx)
 	defer cancel()
-	vector, err := e.backend.EmbedQuery(callCtx, queryPayload(e.namespace.Profile, canonical))
+	vector, err := e.backend.EmbedQuery(callCtx, payload)
 	if err != nil {
+		e.recordFailure(classifyFailure(callCtx, err))
+		return Embedding{}, degradeError(callCtx, err)
+	}
+	if err := callCtx.Err(); err != nil {
 		e.recordFailure(classifyFailure(callCtx, err))
 		return Embedding{}, degradeError(callCtx, err)
 	}
@@ -364,15 +395,108 @@ func (e *Supervised) Health(ctx context.Context) Health {
 		ConsecutiveFailures: e.consecutiveFailures,
 		LastFailureAt:       e.lastFailureAt,
 		LastSuccessAt:       e.lastSuccessAt,
+		Checked:             e.checked,
+		LastCheckedAt:       e.lastCheckedAt,
 		Reason:              e.reason,
 		CacheEntries:        e.cache.Len(),
 		MaxBatchSize:        e.maxBatchSize,
 		MaxDocumentBytes:    e.policy.withDefaults().MaxDocumentBytes,
 		MaxQueryBytes:       e.policy.withDefaults().MaxQueryBytes,
 	}
-	h.Degraded = h.BreakerState == BreakerOpen || h.Reason != ""
-	h.Ready = !h.Degraded
+	if !h.Checked && h.Reason == "" {
+		h.Reason = selfCheckRequiredReason
+	}
+	h.Degraded = h.BreakerState == BreakerOpen || h.Reason != "" || !h.Checked
+	h.Ready = h.Checked && !h.Degraded
 	return h
+}
+
+// SelfCheck performs the supervised readiness probe without changing the
+// public embedding ABI. It optionally asks the backend to verify its loaded
+// profile, then runs fixed document and query probes through the role-specific
+// payload contracts.
+func (e *Supervised) SelfCheck(ctx context.Context) error {
+	if e == nil {
+		return fmt.Errorf("%w: nil embedder", ErrDegraded)
+	}
+	if err := ctx.Err(); err != nil {
+		e.recordSelfCheckFailure(classifyFailure(ctx, err))
+		return err
+	}
+	documentProbe := documentPayload(e.namespace.Profile, selfCheckDocumentText)
+	if err := e.policy.validatePayload(documentProbe, RoleDocument); err != nil {
+		e.recordSelfCheckFailure(selfCheckFailureReason)
+		return err
+	}
+	queryProbe := queryPayload(e.namespace.Profile, selfCheckQueryText)
+	if err := e.policy.validatePayload(queryProbe, RoleQuery); err != nil {
+		e.recordSelfCheckFailure(selfCheckFailureReason)
+		return err
+	}
+	if err := e.allowBackend(); err != nil {
+		return err
+	}
+	callCtx, cancel := e.callContext(ctx)
+	defer cancel()
+	if checker, ok := e.backend.(backendSelfChecker); ok {
+		if err := checker.SelfCheck(callCtx, e.namespace); err != nil {
+			reason := selfCheckFailureReason
+			if callCtx.Err() != nil {
+				reason = classifyFailure(callCtx, err)
+				err = degradeError(callCtx, err)
+			} else {
+				err = fmt.Errorf("%w: backend profile self-check failed", ErrDegraded)
+			}
+			e.recordSelfCheckFailure(reason)
+			return err
+		}
+	}
+	documentVectors, err := e.backend.EmbedDocuments(callCtx, []string{documentProbe})
+	if err != nil {
+		e.recordSelfCheckFailure(classifyFailure(callCtx, err))
+		return degradeError(callCtx, err)
+	}
+	if err := callCtx.Err(); err != nil {
+		e.recordSelfCheckFailure(classifyFailure(callCtx, err))
+		return degradeError(callCtx, err)
+	}
+	if len(documentVectors) != 1 {
+		err := fmt.Errorf("%w: self-check document batch returned %d vectors", ErrInvalidEmbedding, len(documentVectors))
+		e.recordSelfCheckFailure("malformed_batch")
+		return err
+	}
+	document := Embedding{
+		Namespace:     e.namespace,
+		Role:          RoleDocument,
+		Vector:        copyVector(documentVectors[0]),
+		CanonicalText: selfCheckDocumentText,
+		CacheKey:      cacheKey(e.namespace, selfCheckDocumentText),
+	}
+	if err := document.Validate(e.namespace, RoleDocument); err != nil {
+		e.recordSelfCheckFailure("malformed_vector")
+		return err
+	}
+	queryVector, err := e.backend.EmbedQuery(callCtx, queryProbe)
+	if err != nil {
+		e.recordSelfCheckFailure(classifyFailure(callCtx, err))
+		return degradeError(callCtx, err)
+	}
+	if err := callCtx.Err(); err != nil {
+		e.recordSelfCheckFailure(classifyFailure(callCtx, err))
+		return degradeError(callCtx, err)
+	}
+	query := Embedding{
+		Namespace:     e.namespace,
+		Role:          RoleQuery,
+		Vector:        copyVector(queryVector),
+		CanonicalText: selfCheckQueryText,
+	}
+	if err := query.Validate(e.namespace, RoleQuery); err != nil {
+		e.recordSelfCheckFailure("malformed_vector")
+		return err
+	}
+	e.recordSelfCheckSuccess()
+	return nil
 }
 
 func (e *Supervised) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -391,7 +515,21 @@ func (e *Supervised) allowBackend() error {
 			e.reason = "circuit_open"
 			return fmt.Errorf("%w: %w", ErrDegraded, ErrCircuitOpen)
 		}
+		if e.halfOpenProbe {
+			e.reason = "half_open_probe"
+			return fmt.Errorf("%w: %w", ErrDegraded, ErrCircuitOpen)
+		}
 		e.breakerState = BreakerHalfOpen
+		e.halfOpenProbe = true
+		e.reason = "half_open_probe"
+		return nil
+	}
+	if e.breakerState == BreakerHalfOpen {
+		if e.halfOpenProbe {
+			e.reason = "half_open_probe"
+			return fmt.Errorf("%w: %w", ErrDegraded, ErrCircuitOpen)
+		}
+		e.halfOpenProbe = true
 		e.reason = "half_open_probe"
 	}
 	return nil
@@ -402,6 +540,7 @@ func (e *Supervised) recordSuccess() {
 	defer e.mu.Unlock()
 	e.consecutiveFailures = 0
 	e.breakerState = BreakerClosed
+	e.halfOpenProbe = false
 	e.lastSuccessAt = e.now().UTC()
 	e.reason = ""
 }
@@ -412,6 +551,33 @@ func (e *Supervised) recordFailure(reason string) {
 	e.consecutiveFailures++
 	e.lastFailureAt = e.now().UTC()
 	e.reason = reason
+	e.halfOpenProbe = false
+	if e.consecutiveFailures >= e.breaker.FailureThreshold {
+		e.breakerState = BreakerOpen
+	}
+}
+
+func (e *Supervised) recordSelfCheckSuccess() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.checked = true
+	e.lastCheckedAt = e.now().UTC()
+	e.consecutiveFailures = 0
+	e.breakerState = BreakerClosed
+	e.halfOpenProbe = false
+	e.lastSuccessAt = e.lastCheckedAt
+	e.reason = ""
+}
+
+func (e *Supervised) recordSelfCheckFailure(reason string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.checked = true
+	e.lastCheckedAt = e.now().UTC()
+	e.consecutiveFailures++
+	e.lastFailureAt = e.lastCheckedAt
+	e.reason = reason
+	e.halfOpenProbe = false
 	if e.consecutiveFailures >= e.breaker.FailureThreshold {
 		e.breakerState = BreakerOpen
 	}

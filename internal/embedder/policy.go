@@ -41,14 +41,14 @@ type AdmissionPolicy struct {
 	MaxQueryBytes           int
 	MaxDocumentPayloadBytes int
 	MaxQueryPayloadBytes    int
-	DeniedPathMarkers      []string
+	DeniedPathMarkers       []string
 }
 
 // DefaultAdmissionPolicy returns the conservative local-first Phase 7D policy.
 func DefaultAdmissionPolicy() AdmissionPolicy {
 	return AdmissionPolicy{
-		MaxDocumentBytes: DefaultMaxDocumentBytes,
-		MaxQueryBytes:    DefaultMaxQueryBytes,
+		MaxDocumentBytes:        DefaultMaxDocumentBytes,
+		MaxQueryBytes:           DefaultMaxQueryBytes,
 		MaxDocumentPayloadBytes: DefaultMaxDocumentPayloadBytes,
 		MaxQueryPayloadBytes:    DefaultMaxQueryPayloadBytes,
 		DeniedPathMarkers: []string{

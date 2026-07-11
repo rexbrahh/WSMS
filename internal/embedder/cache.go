@@ -37,6 +37,7 @@ type CacheEntry struct {
 }
 
 type cacheFlight struct {
+	once      sync.Once
 	done      chan struct{}
 	embedding Embedding
 	err       error
@@ -99,17 +100,19 @@ func (c *DocumentCache) finishFlight(key string, flight *cacheFlight, embedding 
 	if c == nil || flight == nil {
 		return
 	}
-	c.mu.Lock()
-	if current := c.flights[key]; current == flight {
-		delete(c.flights, key)
-	}
-	if err == nil {
-		c.putLocked(key, embedding)
-	}
-	flight.embedding = embedding
-	flight.err = err
-	close(flight.done)
-	c.mu.Unlock()
+	flight.once.Do(func() {
+		c.mu.Lock()
+		if current := c.flights[key]; current == flight {
+			delete(c.flights, key)
+		}
+		if err == nil {
+			c.putLocked(key, embedding)
+		}
+		flight.embedding = embedding
+		flight.err = err
+		close(flight.done)
+		c.mu.Unlock()
+	})
 }
 
 func (c *DocumentCache) waitFlight(ctx context.Context, flight *cacheFlight) (Embedding, error) {

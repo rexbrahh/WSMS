@@ -324,6 +324,472 @@ func TestConcurrentEmbedDocumentsQueryHealthAndCache(t *testing.T) {
 	}
 }
 
+func TestDocumentBatchUsesLeadersWhenMissBecomesWaiter(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	cache := NewDocumentCache()
+	emb, err := New(Options{Namespace: ns, Backend: backend, Cache: cache})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+
+	externalCanonical, err := emb.policy.canonicalDocument("external leader")
+	if err != nil {
+		t.Fatalf("canonical external: %v", err)
+	}
+	externalKey := cacheKey(ns, externalCanonical)
+	_, _, externalFlight, leader := cache.getOrBegin(externalKey)
+	if !leader {
+		t.Fatalf("expected to own external flight")
+	}
+
+	done := make(chan struct {
+		batch EmbeddingBatch
+		err   error
+	}, 1)
+	go func() {
+		batch, err := emb.EmbedDocuments(context.Background(), []string{"external leader", "local leader"})
+		done <- struct {
+			batch EmbeddingBatch
+			err   error
+		}{batch: batch, err: err}
+	}()
+
+	waitForFlightCount(t, cache, 1)
+	external := Embedding{
+		Namespace:     ns,
+		Role:          RoleDocument,
+		Vector:        vectorFromText("external", ns.Profile.Dimensions),
+		CanonicalText: externalCanonical,
+		CacheKey:      externalKey,
+	}
+	cache.finishFlight(externalKey, externalFlight, external, nil)
+
+	got := waitBatchResult(t, done)
+	if got.err != nil {
+		t.Fatalf("embed documents: %v", got.err)
+	}
+	if err := got.batch.Validate(ns, 2); err != nil {
+		t.Fatalf("validate batch: %v", err)
+	}
+	if got.batch.CacheHits != 1 || got.batch.CacheMisses != 1 {
+		t.Fatalf("stats = hits %d misses %d, want 1/1", got.batch.CacheHits, got.batch.CacheMisses)
+	}
+	if got := backend.docCalls(); got != 1 {
+		t.Fatalf("backend document calls = %d, want only the local leader", got)
+	}
+	if got.batch.Embeddings[0].CanonicalText != externalCanonical {
+		t.Fatalf("external waiter not placed at index 0: %#v", got.batch.Embeddings[0])
+	}
+	if got := flightCount(cache); got != 0 {
+		t.Fatalf("cache flights = %d, want 0", got)
+	}
+}
+
+func TestDocumentFlightsCompleteForMixedHitsWaitersAndAllLeaderExitBranches(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	tests := []struct {
+		name      string
+		configure func(*testingBackend)
+		timeout   time.Duration
+		release   bool
+		wantErr   error
+	}{
+		{
+			name:    "success",
+			release: true,
+		},
+		{
+			name:    "backend_error",
+			release: true,
+			configure: func(b *testingBackend) {
+				b.setErr(errors.New("backend down"))
+			},
+			wantErr: ErrDegraded,
+		},
+		{
+			name:    "batch_mismatch",
+			release: true,
+			configure: func(b *testingBackend) {
+				b.setDocumentVectors([][]float32{})
+			},
+			wantErr: ErrInvalidEmbedding,
+		},
+		{
+			name:    "vector_validation",
+			release: true,
+			configure: func(b *testingBackend) {
+				b.setDocumentVectors([][]float32{
+					vectorFromText("one", b.dims),
+					{1, 2},
+				})
+			},
+			wantErr: ErrInvalidEmbedding,
+		},
+		{
+			name:    "context_timeout",
+			timeout: 20 * time.Millisecond,
+			wantErr: ErrDegraded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := newTestingBackend(ns.Profile.Dimensions)
+			if tt.configure != nil {
+				tt.configure(backend)
+			}
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			backend.setDocumentGate(entered, release)
+			cache := NewDocumentCache()
+			opts := Options{Namespace: ns, Backend: backend, Cache: cache}
+			if tt.timeout > 0 {
+				opts.Timeout = tt.timeout
+			}
+			emb, err := New(opts)
+			if err != nil {
+				t.Fatalf("new embedder: %v", err)
+			}
+			putCachedDocument(t, emb, cache, "cached page")
+
+			leaderDone := make(chan struct {
+				batch EmbeddingBatch
+				err   error
+			}, 1)
+			go func() {
+				batch, err := emb.EmbedDocuments(context.Background(), []string{"cached page", "leader one", "leader two"})
+				leaderDone <- struct {
+					batch EmbeddingBatch
+					err   error
+				}{batch: batch, err: err}
+			}()
+
+			waitSignal(t, entered, "document backend entry")
+			waitForFlightCount(t, cache, 2)
+
+			waiterStarted := make(chan struct{})
+			waiterDone := make(chan error, 1)
+			go func() {
+				close(waiterStarted)
+				_, err := emb.EmbedDocuments(context.Background(), []string{"leader one"})
+				waiterDone <- err
+			}()
+			waitSignal(t, waiterStarted, "waiter start")
+			if tt.release {
+				close(release)
+			}
+
+			leader := waitBatchResult(t, leaderDone)
+			waiterErr := waitErrorResult(t, waiterDone)
+			if tt.wantErr == nil {
+				if leader.err != nil {
+					t.Fatalf("leader error: %v", leader.err)
+				}
+				if waiterErr != nil {
+					t.Fatalf("waiter error: %v", waiterErr)
+				}
+				if leader.batch.CacheHits != 1 || leader.batch.CacheMisses != 2 {
+					t.Fatalf("leader stats = hits %d misses %d, want 1/2", leader.batch.CacheHits, leader.batch.CacheMisses)
+				}
+				if got := len(cache.Snapshot()); got != 3 {
+					t.Fatalf("cache entries = %d, want cached hit plus two leaders", got)
+				}
+			} else {
+				if !errors.Is(leader.err, tt.wantErr) {
+					t.Fatalf("leader error = %v, want %v", leader.err, tt.wantErr)
+				}
+				if !errors.Is(waiterErr, tt.wantErr) {
+					t.Fatalf("waiter error = %v, want %v", waiterErr, tt.wantErr)
+				}
+				if got := len(cache.Snapshot()); got != 1 {
+					t.Fatalf("cache entries = %d, want only pre-existing hit", got)
+				}
+			}
+			if !tt.release {
+				close(release)
+			}
+			if got := flightCount(cache); got != 0 {
+				t.Fatalf("cache flights = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestDocumentFlightsCompleteWhenBreakerRejectsLeaders(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	emb, err := New(Options{
+		Namespace: ns,
+		Backend:   backend,
+		Breaker:   BreakerOptions{FailureThreshold: 1, Cooldown: time.Hour},
+	})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+	backend.setErr(errors.New("backend down"))
+	if _, err := emb.EmbedQuery(context.Background(), "open circuit"); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("open circuit query error = %v, want degraded", err)
+	}
+	backend.setErr(nil)
+	if _, err := emb.EmbedDocuments(context.Background(), []string{"uncached rejected page"}); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("breaker rejected document error = %v, want circuit open", err)
+	}
+	if got := flightCount(emb.cache); got != 0 {
+		t.Fatalf("cache flights = %d, want 0 after breaker rejection", got)
+	}
+}
+
+func TestSelfCheckSuccessMarksHealthReady(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	emb, err := New(Options{Namespace: ns, Backend: backend})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+	if emb.timeout <= 0 {
+		t.Fatalf("default timeout = %v, want non-zero", emb.timeout)
+	}
+	initial := emb.Health(context.Background())
+	if initial.Ready || !initial.Degraded || initial.Checked || initial.Reason != selfCheckRequiredReason {
+		t.Fatalf("initial health = %#v, want self-check-required degraded", initial)
+	}
+	if err := emb.SelfCheck(context.Background()); err != nil {
+		t.Fatalf("self check: %v", err)
+	}
+	health := emb.Health(context.Background())
+	if !health.Ready || health.Degraded || !health.Checked || health.LastCheckedAt.IsZero() || health.Reason != "" {
+		t.Fatalf("health after self-check = %#v, want ready", health)
+	}
+	if got := backend.selfCheckCalls(); got != 1 {
+		t.Fatalf("backend profile checks = %d, want 1", got)
+	}
+	if got := backend.docCalls(); got != 1 {
+		t.Fatalf("document probes = %d, want 1", got)
+	}
+	if got := backend.queryCalls(); got != 1 {
+		t.Fatalf("query probes = %d, want 1", got)
+	}
+	if got, want := backend.lastDocumentPayload(), documentPayload(ns.Profile, selfCheckDocumentText); got != want {
+		t.Fatalf("document self-check payload = %q, want %q", got, want)
+	}
+	if got, want := backend.lastQueryPayload(), queryPayload(ns.Profile, selfCheckQueryText); got != want {
+		t.Fatalf("query self-check payload = %q, want %q", got, want)
+	}
+}
+
+func TestSelfCheckProfileFailureStaysCategorizedDegraded(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	backend.setSelfCheckErr(errors.New("wrong model revision TOP_SECRET_SELF_CHECK"))
+	emb, err := New(Options{Namespace: ns, Backend: backend})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+	if err := emb.SelfCheck(context.Background()); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("self-check error = %v, want degraded", err)
+	} else if strings.Contains(err.Error(), "TOP_SECRET_SELF_CHECK") || strings.Contains(err.Error(), "wrong model revision") {
+		t.Fatalf("self-check returned raw backend detail: %v", err)
+	}
+	health := emb.Health(context.Background())
+	if health.Ready || !health.Degraded || !health.Checked || health.Reason != selfCheckFailureReason || health.LastCheckedAt.IsZero() {
+		t.Fatalf("health after profile failure = %#v", health)
+	}
+	if got := backend.docCalls(); got != 0 {
+		t.Fatalf("document probes = %d, want 0 after profile failure", got)
+	}
+	if got := backend.queryCalls(); got != 0 {
+		t.Fatalf("query probes = %d, want 0 after profile failure", got)
+	}
+}
+
+func TestSelfCheckTimeoutStaysCategorizedDegraded(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	backend.setDelay(100 * time.Millisecond)
+	emb, err := New(Options{
+		Namespace: ns,
+		Backend:   backend,
+		Timeout:   10 * time.Millisecond,
+		Breaker:   BreakerOptions{FailureThreshold: 1, Cooldown: time.Hour},
+	})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+	if err := emb.SelfCheck(context.Background()); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("self-check error = %v, want degraded timeout", err)
+	}
+	health := emb.Health(context.Background())
+	if health.Ready || !health.Degraded || !health.Checked || health.Reason != "timeout_or_cancelled" || health.BreakerState != BreakerOpen {
+		t.Fatalf("health after timeout = %#v", health)
+	}
+}
+
+func TestHalfOpenAllowsExactlyOneConcurrentProbe(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	now := time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC)
+	emb, err := New(Options{
+		Namespace: ns,
+		Backend:   backend,
+		Breaker:   BreakerOptions{FailureThreshold: 1, Cooldown: time.Second},
+		Now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+	backend.setErr(errors.New("backend down"))
+	if _, err := emb.EmbedQuery(context.Background(), "open circuit"); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("open circuit query error = %v, want degraded", err)
+	}
+	backend.setErr(nil)
+	now = now.Add(2 * time.Second)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	backend.setQueryGate(entered, release)
+
+	probeDone := make(chan error, 1)
+	go func() {
+		_, err := emb.EmbedQuery(context.Background(), "half open probe")
+		probeDone <- err
+	}()
+	waitSignal(t, entered, "half-open backend probe")
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 64)
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := emb.EmbedQuery(context.Background(), fmt.Sprintf("concurrent half-open %d", i))
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if !errors.Is(err, ErrCircuitOpen) || !errors.Is(err, ErrDegraded) {
+			t.Fatalf("concurrent half-open error = %v, want circuit-open degraded", err)
+		}
+	}
+	close(release)
+	if err := waitErrorResult(t, probeDone); err != nil {
+		t.Fatalf("probe error: %v", err)
+	}
+	if got := backend.queryCalls(); got != 1 {
+		t.Fatalf("backend query probes = %d, want 1", got)
+	}
+}
+
+func TestHalfOpenProbeSlotIsReleasedAfterFailure(t *testing.T) {
+	ns := MustNamespace(testProfile())
+	backend := newTestingBackend(ns.Profile.Dimensions)
+	now := time.Date(2026, 7, 10, 20, 0, 0, 0, time.UTC)
+	emb, err := New(Options{
+		Namespace: ns,
+		Backend:   backend,
+		Breaker:   BreakerOptions{FailureThreshold: 1, Cooldown: time.Second},
+		Now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new embedder: %v", err)
+	}
+	backend.setErr(errors.New("backend down"))
+	if _, err := emb.EmbedQuery(context.Background(), "open circuit"); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("open circuit query error = %v, want degraded", err)
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := emb.EmbedQuery(context.Background(), "failed half-open"); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("failed half-open error = %v, want degraded", err)
+	}
+	backend.setErr(nil)
+	now = now.Add(2 * time.Second)
+	if _, err := emb.EmbedQuery(context.Background(), "second half-open"); err != nil {
+		t.Fatalf("second half-open should acquire released probe slot: %v", err)
+	}
+}
+
+func putCachedDocument(t *testing.T, emb *Supervised, cache *DocumentCache, text string) {
+	t.Helper()
+	canonical, err := emb.policy.canonicalDocument(text)
+	if err != nil {
+		t.Fatalf("canonical cached document: %v", err)
+	}
+	key := cacheKey(emb.namespace, canonical)
+	cache.put(key, Embedding{
+		Namespace:     emb.namespace,
+		Role:          RoleDocument,
+		Vector:        vectorFromText("cached:"+canonical, emb.namespace.Profile.Dimensions),
+		CanonicalText: canonical,
+		CacheKey:      key,
+	})
+}
+
+func flightCount(cache *DocumentCache) int {
+	if cache == nil {
+		return 0
+	}
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
+	return len(cache.flights)
+}
+
+func waitForFlightCount(t *testing.T, cache *DocumentCache, want int) {
+	t.Helper()
+	deadline := time.After(500 * time.Millisecond)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if got := flightCount(cache); got == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("cache flights did not reach %d; got %d", want, flightCount(cache))
+		case <-tick.C:
+		}
+	}
+}
+
+func waitSignal(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func waitBatchResult(t *testing.T, ch <-chan struct {
+	batch EmbeddingBatch
+	err   error
+}) struct {
+	batch EmbeddingBatch
+	err   error
+} {
+	t.Helper()
+	select {
+	case got := <-ch:
+		return got
+	case <-time.After(750 * time.Millisecond):
+		t.Fatalf("timed out waiting for embedding batch")
+		return struct {
+			batch EmbeddingBatch
+			err   error
+		}{}
+	}
+}
+
+func waitErrorResult(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(750 * time.Millisecond):
+		t.Fatalf("timed out waiting for error result")
+		return nil
+	}
+}
+
 func testProfile() NamespaceProfile {
 	return NamespaceProfile{
 		Provider:          "local",
@@ -341,16 +807,23 @@ func testProfile() NamespaceProfile {
 }
 
 type testingBackend struct {
-	mu              sync.Mutex
-	dims            int
-	documentCallCnt int
-	queryCallCnt    int
-	documentPayload []string
-	queryPayload    []string
-	documentVectors [][]float32
-	queryVector     []float32
-	err             error
-	delay           time.Duration
+	mu               sync.Mutex
+	dims             int
+	documentCallCnt  int
+	queryCallCnt     int
+	selfCheckCallCnt int
+	documentPayload  []string
+	queryPayload     []string
+	documentVectors  [][]float32
+	queryVector      []float32
+	err              error
+	selfCheckErr     error
+	delay            time.Duration
+	selfCheckDelay   time.Duration
+	documentEntered  chan struct{}
+	documentGate     <-chan struct{}
+	queryEntered     chan struct{}
+	queryGate        <-chan struct{}
 }
 
 func newTestingBackend(dims int) *testingBackend {
@@ -359,6 +832,9 @@ func newTestingBackend(dims int) *testingBackend {
 
 func (b *testingBackend) EmbedDocuments(ctx context.Context, texts []string) ([][]float32, error) {
 	if err := b.wait(ctx); err != nil {
+		return nil, err
+	}
+	if err := b.waitDocumentGate(ctx); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
@@ -386,6 +862,9 @@ func (b *testingBackend) EmbedQuery(ctx context.Context, text string) ([]float32
 	if err := b.wait(ctx); err != nil {
 		return nil, err
 	}
+	if err := b.waitQueryGate(ctx); err != nil {
+		return nil, err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.err != nil {
@@ -397,6 +876,31 @@ func (b *testingBackend) EmbedQuery(ctx context.Context, text string) ([]float32
 		return copyVector(b.queryVector), nil
 	}
 	return vectorFromText(text, b.dims), nil
+}
+
+func (b *testingBackend) SelfCheck(ctx context.Context, namespace EmbeddingNamespace) error {
+	b.mu.Lock()
+	delay := b.selfCheckDelay
+	b.mu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.selfCheckCallCnt++
+	if b.selfCheckErr != nil {
+		return b.selfCheckErr
+	}
+	if namespace.ID == "" {
+		return errors.New("empty namespace")
+	}
+	return nil
 }
 
 func (b *testingBackend) wait(ctx context.Context) error {
@@ -422,10 +926,36 @@ func (b *testingBackend) setDocumentVectors(vectors [][]float32) {
 	b.documentVectors = vectors
 }
 
+func (b *testingBackend) setErr(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.err = err
+}
+
+func (b *testingBackend) setSelfCheckErr(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.selfCheckErr = err
+}
+
 func (b *testingBackend) setDelay(delay time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.delay = delay
+}
+
+func (b *testingBackend) setDocumentGate(entered chan struct{}, gate <-chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.documentEntered = entered
+	b.documentGate = gate
+}
+
+func (b *testingBackend) setQueryGate(entered chan struct{}, gate <-chan struct{}) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.queryEntered = entered
+	b.queryGate = gate
 }
 
 func (b *testingBackend) docCalls() int {
@@ -438,6 +968,12 @@ func (b *testingBackend) queryCalls() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.queryCallCnt
+}
+
+func (b *testingBackend) selfCheckCalls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.selfCheckCallCnt
 }
 
 func (b *testingBackend) lastDocumentPayload() string {
@@ -458,11 +994,54 @@ func (b *testingBackend) lastQueryPayload() string {
 	return b.queryPayload[len(b.queryPayload)-1]
 }
 
+func (b *testingBackend) waitDocumentGate(ctx context.Context) error {
+	b.mu.Lock()
+	entered := b.documentEntered
+	gate := b.documentGate
+	b.mu.Unlock()
+	return waitBackendGate(ctx, entered, gate)
+}
+
+func (b *testingBackend) waitQueryGate(ctx context.Context) error {
+	b.mu.Lock()
+	entered := b.queryEntered
+	gate := b.queryGate
+	b.mu.Unlock()
+	return waitBackendGate(ctx, entered, gate)
+}
+
+func waitBackendGate(ctx context.Context, entered chan struct{}, gate <-chan struct{}) error {
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if gate == nil {
+		return ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		return nil
+	}
+}
+
 func vectorFromText(text string, dims int) []float32 {
 	sum := sha256.Sum256([]byte(text))
 	out := make([]float32, dims)
+	var norm float64
 	for i := range out {
 		out[i] = float32(int(sum[i%len(sum)])+1) / 255
+		norm += float64(out[i] * out[i])
+	}
+	if norm == 0 {
+		return out
+	}
+	scale := float32(math.Sqrt(norm))
+	for i := range out {
+		out[i] /= scale
 	}
 	return out
 }
