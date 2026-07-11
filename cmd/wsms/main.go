@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"wsms/internal/demo"
+	"wsms/internal/operator"
 	"wsms/internal/renderer"
 	"wsms/internal/serve"
 	"wsms/internal/wsl"
@@ -31,6 +33,26 @@ func main() {
 	case "serve":
 		if err := runServe(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "serve:", err)
+			os.Exit(1)
+		}
+	case "inspect":
+		if err := runInspect(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "inspect:", err)
+			os.Exit(1)
+		}
+	case "export":
+		if err := runExport(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "export:", err)
+			os.Exit(1)
+		}
+	case "delete":
+		if err := runDelete(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "delete:", err)
+			os.Exit(1)
+		}
+	case "purge":
+		if err := runPurge(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "purge:", err)
 			os.Exit(1)
 		}
 	case "parse":
@@ -154,6 +176,129 @@ func runServe(args []string) error {
 	})
 }
 
+func runInspect(args []string) error {
+	flags := flag.NewFlagSet("wsms inspect", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	dataDir := flags.String("data-dir", "", "data directory holding the ledger")
+	sessionID := flags.String("session", "", "session id scoping the ledger")
+	flags.Usage = func() {
+		fmt.Fprintf(flags.Output(), "usage: wsms inspect <%s> [id] [--data-dir dir] [--session id]\n",
+			strings.Join(operator.InspectViews, "|"))
+		flags.PrintDefaults()
+	}
+	// Positionals (view, id) may appear before or after flags; the stdlib flag
+	// package stops at the first positional, so re-parse past each one.
+	pos, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) < 1 {
+		flags.Usage()
+		return fmt.Errorf("a view is required")
+	}
+	arg := ""
+	if len(pos) > 1 {
+		arg = pos[1]
+	}
+	return operator.Inspect(context.Background(), operator.Options{DataDir: *dataDir, SessionID: *sessionID}, pos[0], arg, os.Stdout)
+}
+
+func runExport(args []string) error {
+	flags := flag.NewFlagSet("wsms export", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	dataDir := flags.String("data-dir", "", "data directory holding the ledger")
+	sessionID := flags.String("session", "", "session id scoping the ledger")
+	out := flags.String("out", "", "write JSONL to this file instead of stdout")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "usage: wsms export [--data-dir dir] [--session id] [--out file]")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", flags.Arg(0))
+	}
+
+	w := os.Stdout
+	if *out != "" {
+		f, err := os.Create(*out)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.Close() }()
+		w = f
+	}
+	n, err := operator.Export(context.Background(), operator.Options{DataDir: *dataDir, SessionID: *sessionID}, w)
+	if err != nil {
+		return err
+	}
+	if *out != "" {
+		fmt.Fprintf(os.Stderr, "exported %d events to %s\n", n, *out)
+	}
+	return nil
+}
+
+func runDelete(args []string) error {
+	flags := flag.NewFlagSet("wsms delete", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	dataDir := flags.String("data-dir", "", "data directory holding the ledger")
+	sessionID := flags.String("session", "", "session id scoping the ledger")
+	kind := flags.String("kind", "", "target kind: record | event | page | path")
+	target := flags.String("target", "", "target id or path to invalidate")
+	reason := flags.String("reason", "", "reason: superseded | user_rejected | source_deleted | policy_changed | security_revoked")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "usage: wsms delete --kind K --target T --reason R [--data-dir dir] [--session id]")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", flags.Arg(0))
+	}
+	return operator.Delete(context.Background(),
+		operator.Options{DataDir: *dataDir, SessionID: *sessionID},
+		operator.DeleteSpec{Kind: *kind, Target: *target, Reason: *reason},
+		os.Stdout)
+}
+
+func runPurge(args []string) error {
+	flags := flag.NewFlagSet("wsms purge", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	dataDir := flags.String("data-dir", "", "data directory holding the ledger")
+	sessionID := flags.String("session", "", "session id scoping the ledger")
+	yes := flags.Bool("yes", false, "confirm the irreversible erasure (omit for a dry run)")
+	flags.Usage = func() {
+		fmt.Fprintln(flags.Output(), "usage: wsms purge --session id [--data-dir dir] [--yes]")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", flags.Arg(0))
+	}
+	return operator.Purge(context.Background(), operator.Options{DataDir: *dataDir, SessionID: *sessionID}, *yes, os.Stdout)
+}
+
+// parseInterspersed parses a flag set that also takes positional arguments,
+// allowing flags and positionals in any order (stdlib flag stops at the first
+// positional). Returns the positionals in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	for fs.NArg() > 0 {
+		pos = append(pos, fs.Arg(0))
+		if err := fs.Parse(fs.Args()[1:]); err != nil {
+			return nil, err
+		}
+	}
+	return pos, nil
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `wsms — Working State Management System CLI
 
@@ -161,6 +306,10 @@ Usage:
   wsms version
   wsms demo [--data-dir <directory>]
   wsms serve [--addr host:port] [--data-dir dir] [--session id] [--async-maintenance]
+  wsms inspect <sessions|events|event|state|capsule|page|residency> [id] [--data-dir dir] [--session id]
+  wsms export [--data-dir dir] [--session id] [--out file]
+  wsms delete --kind K --target T --reason R [--data-dir dir] [--session id]
+  wsms purge --session id [--data-dir dir] [--yes]
   wsms parse <file.wsl>
   wsms lint <file.wsl>
   wsms capsule <file.wsl>`)
