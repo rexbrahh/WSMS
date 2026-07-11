@@ -44,13 +44,17 @@ export default function (pi: ExtensionAPI): void {
 		return { messages: [message, ...event.messages] };
 	});
 
-	// Observe finalized messages and record them in the durable ledger.
+	// Observe finalized messages and record them in the durable ledger. A turn
+	// carrying only a tool call has no text, and empty text is not durable
+	// evidence, so skip it (the tool_result handler records the tool activity).
 	pi.on("message_end", async (event) => {
 		const message = event.message;
+		const text = textOf(message.content).trim();
+		if (!text) return;
 		if (message.role === "user") {
-			await safe(() => client.ingestUser(textOf(message.content)));
+			await safe(() => client.ingestUser(text));
 		} else if (message.role === "assistant") {
-			await safe(() => client.ingestAssistant(textOf(message.content)));
+			await safe(() => client.ingestAssistant(text));
 		}
 	});
 
