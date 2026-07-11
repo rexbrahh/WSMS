@@ -2,8 +2,10 @@ package pirpc
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +64,64 @@ func mockPi(t *testing.T) (*Client, func()) {
 func writeLine(w io.Writer, v any) {
 	line, _ := json.Marshal(v)
 	_, _ = w.Write(append(line, '\n'))
+}
+
+// TestPirpcMockHelper is not a real test: when PIRPC_BE_MOCK=1 the process acts
+// as a mock pi (used by TestSpawnRealSubprocess via re-exec).
+func TestPirpcMockHelper(t *testing.T) {
+	if os.Getenv("PIRPC_BE_MOCK") != "1" {
+		t.Skip("helper process only")
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		var cmd struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &cmd) != nil {
+			continue
+		}
+		if cmd.Type == "prompt" {
+			writeLine(os.Stdout, map[string]any{"type": "response", "command": "prompt", "success": true, "id": cmd.ID})
+			writeLine(os.Stdout, map[string]any{"type": "message_update", "delta": "ok"})
+			writeLine(os.Stdout, map[string]any{"type": "agent_settled"})
+			continue
+		}
+		writeLine(os.Stdout, map[string]any{"type": "response", "command": cmd.Type, "success": true, "id": cmd.ID})
+	}
+}
+
+// TestSpawnRealSubprocess exercises the real exec/pipe path by re-executing this
+// test binary as a mock pi — the seam the in-memory mock cannot cover.
+func TestSpawnRealSubprocess(t *testing.T) {
+	if os.Getenv("PIRPC_BE_MOCK") == "1" {
+		return // we are the child; the helper test does the work
+	}
+	t.Setenv("PIRPC_BE_MOCK", "1") // inherited by the spawned child
+
+	client, err := Spawn(context.Background(), os.Args[0], "-test.run=TestPirpcMockHelper")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Prompt("hi"); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case ev, ok := <-client.Events():
+			if !ok {
+				t.Fatal("events closed before agent_settled")
+			}
+			if ev.Type == "agent_settled" {
+				return
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for agent_settled from real subprocess")
+		}
+	}
 }
 
 func TestPromptResponseAndEvents(t *testing.T) {
