@@ -423,8 +423,12 @@ Acceptance:
   cannot be hidden by later progress.
 - Schema, compiler, redaction, or embedding incompatibility creates a new index
   generation rather than silently mixing representations.
-- Metadata/FTS/vector projections expose the same active page version after a
-  batch commits.
+- Metadata and FTS expose the same active page version after a page batch
+  commits. The source watermark covers that deterministic commit, not later
+  embedding completion.
+- A vector is either absent or bound by compare-and-swap to the exact active
+  page version, source digest, compiler version, session, and configured
+  embedding namespace. A stale inference result never acquires a newer tuple.
 - A rebuild is validated before atomic generation cutover and can be
   interrupted without corrupting the serving generation.
 - Within the single-process MVP, all handles for one physical index directory
@@ -446,8 +450,17 @@ Acceptance:
 - Query/document preprocessing asymmetry is explicit and tested.
 - Secrets, denied files, and unrestricted artifact bytes are excluded before
   any embedding call.
+- Admission inspects the final rendered query/document payload, including the
+  instruction/template, before cache-flight or backend admission.
+- A permanently denied page is recorded only as disposable, tuple-scoped
+  lexical-only state. That transition atomically removes dense residency,
+  cannot suppress a later page version, and cannot starve later safe backlog.
 - The exact inspectable search text used for a document embedding is retained
   locally with its source digest.
+- The default local client ignores ambient proxies, rejects redirects, bounds
+  responses, and connects only to a literal loopback target or explicit Unix
+  socket. A real model-serving process is a separately verified deployment
+  component.
 - A hosted provider requires explicit configuration, bounded/redacted payloads,
   deadlines, cost/error telemetry, and a separate namespace.
 
@@ -534,6 +547,11 @@ deterministic state application.
 The L3 index and embedding adapter are optional derivative services. Their
 timeout, lag, corruption, rebuild, or absence must not block ledger writes,
 session replay, current L1/L2 state, or direct page/raw-log faults.
+
+Transient backend/readiness failures may retry with bounded cancelable backoff.
+Terminal namespace, ABI, malformed-vector, or corruption failures must park
+until a new wake, configuration, rebuild, or reopen instead of polling a
+poisoned head-of-line item indefinitely.
 
 ## 10. Normative data contracts
 

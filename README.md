@@ -11,7 +11,7 @@ The research framing in `docs/` describes this as *working-state virtual memory*
 | Role | Language |
 |------|----------|
 | Runtime (ledger, WSL, observers, scheduler, renderer, harness) | **Go** (default) |
-| Optional measured ANN scale-out / local inference glue | **Rust** sidecar or supervised service (not in scaffold) |
+| Optional measured ANN scale-out / local inference service | **Rust** sidecar or supervised service (client boundary exists; service binary is not bundled) |
 | Eval stats, plots, HF/torch research | **Python** under `research/` only |
 
 Python must never own ledger truth, WSL authority, or capsule rendering.
@@ -29,19 +29,20 @@ Python must never own ledger truth, WSL authority, or capsule rendering.
 
 The L3 design uses vector retrieval as a disposable working-set estimator, not
 as the source of truth: known IDs always page directly from exact evidence;
-semantic queries use FTS plus dense retrieval to discover candidate page refs,
-then rejoin the same validated L4-to-L2 page-in path. The first demo remains a
-deterministic vector-free proof of the paging mechanism. Phase 7A adds an
-offline deterministic page compiler and exact cosine oracle. Phase 7B adds a
-disposable FTS5 warm index under `<data-dir>/index/` (safe to delete). Phase 7C
-adds an optional sqlite-vec dense projection (config `DenseDimensions`; off by
-default), with session + embedding namespace as pre-KNN partition keys. Phase
-7D adds the supervised private embedder ABI, Qwen3-compatible local profile,
-loopback/Unix-socket sidecar client, self-checks, circuit breaking, bounded
-document cache, and async vector backfill. Every semantic hit is revalidated
-and faulted back through current L4 evidence before it can be returned. The
-demo path remains a vector-free mechanism proof and does not require the index,
-dense search, or an embedding sidecar.
+the Phase 7E target uses lexical and dense channels only to discover candidate
+page refs, then rejoins the same validated L4-to-L2 page-in path. The first demo
+remains a deterministic vector-free proof of the paging mechanism. Phase 7A
+adds an offline deterministic page compiler and exact cosine oracle. Phase 7B
+adds a disposable FTS5 warm index under `<data-dir>/index/` (safe to delete).
+Phase 7C adds an optional sqlite-vec dense projection (config
+`DenseDimensions`; off by default), with session + embedding namespace as
+pre-KNN partition keys. Phase 7D adds the supervised private embedder ABI,
+Qwen3-compatible local profile, fail-closed loopback/Unix-socket sidecar client,
+and asynchronous tuple-validated vector backfill. Dense search is still a
+shadow probe in Phase 7D: lexical retrieval selects candidates, and every
+returned page is revalidated and faulted through current L4 evidence. The repo
+does not bundle or claim a running Qwen service; the model-serving integration
+gate remains explicit. The demo path requires neither an index nor embeddings.
 
 ## Layout
 

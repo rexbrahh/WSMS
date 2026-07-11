@@ -497,12 +497,16 @@ Ownership rules:
 - `ledger` owns immutable events and sequence order.
 - `artifacts` owns exact large bytes.
 - `observers` and the page compiler own reproducible logical page mutations.
-- `indexer` owns embedding calls, lexical/vector rows, and watermarks.
+- `embedder` owns namespace/profile validation, role-specific payloads,
+  admission, supervision, and the local backend client.
+- `indexer` owns lexical/vector rows, tuple CAS, generations, and watermarks; it
+  never calls an embedding backend.
 - `retrieval` owns filters, fusion, reranking, abstention, and explanations.
 - `memory` owns L2 residency/access state.
 - `scheduler` owns L1 admission and eviction policy.
 - `faults` owns exact materialization and the external fault ABI.
-- `harness` owns lifecycle integration and cancellation.
+- `harness` owns lifecycle integration, asynchronous embedding calls/writeback,
+  and cancellation.
 
 No backend client type crosses the `WarmIndex` boundary.
 
@@ -541,12 +545,27 @@ warm_pages_fts
   FTS5 projection of selected search fields
 
 warm_pages_vec
-  sqlite-vec vec0 projection keyed to page version and embedding namespace
+  sqlite-vec vec0 KNN projection with session/namespace partition keys
+
+warm_page_vec_map
+  page_id, vec0 rowid, session_id, page_version, source_digest,
+  compiler_version, embedding_namespace
+
+warm_page_vec_rows
+  ordinary-table vec0 residency shadow; serving code never performs an
+  ordinary point/LEFT-JOIN scan against vec0
+
+warm_page_vec_suppressed
+  current page tuple, embedding_namespace, fixed lexical-only reason
 
 access_stats
   page_id, access_count, last_accessed_at,
   prefetched_count, useful_prefetch_count
 ```
+
+`access_stats` remains a Phase 7F target. The vector map, residency shadow, and
+suppression table are implemented Phase 7C/7D state. They are all disposable;
+none belongs in `ledger.db`.
 
 The actual migration must reflect the APIs available in the pinned SQLite and
 `sqlite-vec` versions. It must use prepared statements, explicit transactions,
@@ -656,6 +675,15 @@ The reference profile is `Qwen/Qwen3-Embedding-0.6B` with its documented
 supports code and multilingual retrieval, and is small enough to evaluate as a
 local sidecar while still being a serious retrieval model.
 
+The reference serializer follows the model card's asymmetric retrieval shape:
+documents remain unprefixed, while queries are rendered as
+`Instruct: <WSMS retrieval task>\nQuery: <query>`. The complete literal prefix,
+normalization, model/tokenizer revisions, page schema, and redaction version are
+part of the namespace digest. The Hub revision observed during the 2026-07-10
+research pass was `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`; it is a candidate
+for a reproducibility run, not a mutable default or a claim that those weights
+were downloaded and executed.
+
 The model runtime is behind `Embedder`; model ownership never leaks into ledger
 or retrieval interfaces. A Rust or local inference sidecar may expose a bounded
 Unix-domain-socket or loopback API. Startup performs a known-vector/profile
@@ -686,10 +714,10 @@ Document embeddings are keyed by:
 SHA256(embedding_namespace || canonical_search_text)
 ```
 
-Identical content reuses a vector. Page mutations are idempotent on
-`(page_id, page_version, source_digest, namespace)`. Query embeddings may use a
-small bounded TTL cache only after stripping session-specific identifiers from
-the cache key where safe.
+Identical content reuses a vector. Page-vector mutations compare-and-swap
+`(page_id, page_version, source_digest, compiler_version, namespace)`. Query
+embeddings may use a small bounded TTL cache only after stripping
+session-specific identifiers from the cache key where safe.
 
 ## 14. Indexing and consistency
 
@@ -703,19 +731,33 @@ append event to L4
   -> return foreground result
 ```
 
-The derivative path is:
+The deterministic derivative commit path currently is:
 
 ```text
-tail ledger sequence
+current committed event or startup catch-up
   -> compile logical page mutation
   -> redact/normalize searchable text
-  -> write FTS projection
-  -> embed and write vector projection
-  -> advance index watermark
+  -> transactionally write page + FTS projection + contiguous source watermark
+  -> non-blocking wake of the dense writeback worker
 ```
 
-An index error never rolls back or disguises a successful ledger append. It
-leaves the watermark behind and exposes degraded health.
+The independent dense path is:
+
+```text
+scan active page tuples missing the configured namespace
+  -> supervised self-check and bounded document embedding
+  -> compare-and-swap page version + digest + compiler + namespace
+  -> transactionally upsert vec0/map/residency shadow
+  -> or atomically evict dense residency and record tuple-scoped lexical-only
+     suppression when final payload admission denies the page
+```
+
+The source watermark intentionally does not claim vector completion. A slow
+v1 embedding cannot be stamped onto v2: the tuple CAS rejects it, and the new
+page remains in the missing-vector working set. Transient service faults retry
+with bounded cancelable backoff. Terminal namespace/ABI/vector faults park
+until a new wake or reopen. An L3 error never rolls back or disguises a
+successful ledger append.
 
 ### 14.2 Crash recovery
 
@@ -730,9 +772,11 @@ generation in place.
 ### 14.3 Update and invalidation
 
 New evidence never overwrites the old ledger event. It emits a new logical page
-version or invalidation mutation. Index application is transactional per batch:
-metadata, FTS, and vector projections must expose the same active page version
-after commit.
+version or invalidation mutation. Page/FTS application is transactional per
+batch. Vector map, vec0 row, and ordinary residency shadow are transactional per
+write, but may lag the page watermark. A page update/invalidation removes its
+old dense row and lexical-only suppression; only an exact current-tuple CAS may
+install either state again.
 
 At query time, current invalidation and scope state is checked again outside the
 index. This closes the window where an asynchronous index has not yet processed
@@ -952,17 +996,26 @@ config-gated (`DenseDimensions`, default 0).
 
 ### L3-3 - Local embedding adapter
 
-**Status:** complete on the development path; optional and local-first.
+**Status:** in-repo ABI/client/lifecycle implemented and verified with
+deterministic backends and adversarial local HTTP/Unix test servers. Optional,
+local-first, and shadow-only. An actual Qwen serving process/model-weight run is
+an open operational gate and is not claimed here.
 
 - Namespace/profile types and document/query separation are implemented in
   `internal/embedder`.
 - The reference Qwen3 profile is represented as a complete namespace ABI and
-  runs behind the supervised local sidecar client.
+  is accepted only through the supervised WSMS-owned local protocol. The client
+  disables proxies, rejects redirects, bounds responses, and revalidates a
+  literal loopback target at connection time (or uses an explicit Unix socket).
 - Redaction/admission, batching, deadlines, circuit breaking, self-checks,
   document-cache singleflight, and bounded response handling are covered by
   tests.
+- Dense writes CAS the page tuple and generation namespace. Admission-denied
+  pages become tuple-scoped lexical-only entries; transient failures retry and
+  terminal ABI faults park without starving later safe pages.
 - FTS fallback remains visible and deterministic; dense embedding/backfill is
-  asynchronous and never blocks L4 append or direct page faults.
+  asynchronous and never blocks L4 append or direct page faults. Phase 7E, not
+  this phase, may allow dense ranks to affect candidate selection.
 
 ### L3-4 - Hybrid semantic faults
 
@@ -1031,6 +1084,11 @@ that the design improves WSMS task outcomes:
 - [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) and
   the [Qwen3 embedding paper](https://arxiv.org/abs/2506.05176) document the
   reference local embedding model, dimensions, license, and retrieval scope.
+- Hugging Face's [TEI quick tour](https://huggingface.co/docs/text-embeddings-inference/en/quick_tour)
+  and [supported-model matrix](https://huggingface.co/docs/text-embeddings-inference/supported_models)
+  document local Qwen3-Embedding-0.6B serving and current CPU/GPU platform
+  support. TEI is a candidate engine behind a WSMS protocol bridge, not a
+  bundled dependency or verified runtime in this repo.
 - [LanceDB hybrid search](https://docs.lancedb.com/search/hybrid-search) and its
   [Go package](https://pkg.go.dev/github.com/lancedb/lancedb-go/pkg/lancedb)
   support its status as a viable but non-default future adapter.

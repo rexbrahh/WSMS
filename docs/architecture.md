@@ -528,7 +528,9 @@ Target package boundaries, added only when their phase starts:
 | Package | Owns | Must not own |
 |---|---|---|
 | `internal/pages` | Logical page schema, compiler, versions, source digests | Ledger persistence or vector client |
-| `internal/indexer` | Embedding batches, projections, generations, watermarks, rebuild | Capsule admission or evidence authority |
+| `internal/embedder` | Namespace ABI, role-specific payloads, admission, supervision, local client | Page truth, vector residency, or capsule admission |
+| `internal/indexer` | Page/FTS/vector projections, tuple CAS, generations, watermarks, rebuild | Embedding calls, capsule admission, or evidence authority |
+| `internal/harness` | Best-effort page compilation and asynchronous embedding writeback | Making L3 failure roll back L4 truth |
 | `internal/retrieval` | Query intent, hard filters, hybrid fusion, rerank, diversity, abstention, explanations | L4 bytes or provider-specific clients |
 | `internal/memory` | L2 hot/cold/ghost bodies and access metadata | Search backend policy |
 | `internal/faults` | Current-ref validation and exact materialization | Nearest-neighbor ranking |
@@ -537,7 +539,7 @@ Backend-native types remain behind `WarmIndex`; embedding runtime types remain
 behind `Embedder`. This lets SQLite, the exact oracle, and optional Qdrant share
 one behavior contract.
 
-### Semantic-fault sequence
+### Semantic-fault sequence (Phase 7E target)
 
 ```mermaid
 sequenceDiagram
@@ -577,6 +579,12 @@ If embedding fails, the lexical branch continues and the result records the
 degraded mode. If L3 is entirely unavailable, current L1/L2 state and direct L4
 faults remain operational.
 
+Phase 7D deliberately stops before this fusion point. Its `SemanticSearch`
+result is still selected by the lexical retriever; the dense call is a shadow
+probe that proves query/document role separation, namespace compatibility, and
+backend availability without influencing the returned page. Phase 7E owns RRF,
+policy reranking, diversity, and abstention.
+
 ### Indexing and consistency sequence
 
 ```mermaid
@@ -584,25 +592,44 @@ sequenceDiagram
     participant Foreground
     participant Ledger
     participant Compiler as Page compiler
+    participant Index as Disposable L3
+    participant Worker as Dense writeback worker
     participant Embedder
-    participant Index as New L3 generation
 
     Foreground->>Ledger: append event and commit L4 truth
     Ledger-->>Foreground: durable append sequence
-    Foreground-->>Foreground: continue without waiting for L3
-    Compiler->>Ledger: tail after index watermark
-    Ledger-->>Compiler: ordered durable changes
+    Foreground->>Compiler: best-effort current event or contiguous catch-up
     Compiler->>Compiler: deterministic page mutations + source digests
-    Compiler->>Index: write metadata and FTS projection
-    Compiler->>Embedder: embed changed canonical search text
-    Embedder-->>Compiler: namespaced document vectors
-    Compiler->>Index: transactionally expose active page version + watermark
+    Compiler->>Index: transactionally write pages + FTS + source watermark
+    Compiler-->>Foreground: never overturn committed L4 on L3 error
+    Compiler->>Worker: non-blocking wake
+    Worker->>Index: read missing current page tuples
+    Worker->>Embedder: self-check + bounded document batch
+    Embedder-->>Worker: namespaced document vectors or categorized fault
+    alt admitted current tuple
+        Worker->>Index: CAS(version,digest,compiler,namespace) + upsert vector
+    else permanently denied payload
+        Worker->>Index: CAS tuple + evict vector + mark lexical-only
+    else transient service fault
+        Worker->>Worker: bounded cancelable backoff and retry
+    end
 ```
 
-The index watermark may lag. Startup reconciliation replays from the L4 high
-water. Page mutations are idempotent by page ID/version, source digest, compiler
-version, and embedding namespace. Query-time validation suppresses a page whose
-invalidation has committed to L4 but not yet reached L3.
+The source watermark covers deterministic page and FTS application, not vector
+completion. Dense residency is tracked separately as a page tuple plus
+embedding namespace; missing tuples form the writeback backlog. Startup
+reconciliation replays page/FTS state from the L4 high water, then the worker
+re-derives missing vectors. Page mutations are idempotent by page ID/version,
+source digest, and compiler version. Vector writes compare-and-swap that tuple
+and the generation namespace, so slow inference cannot be relabeled as a newer
+page. Query-time validation still suppresses a page whose invalidation has
+committed to L4 but not yet reached L3.
+
+Admission denial is not a transient service failure. L3 records a disposable,
+tuple-scoped lexical-only suppression, atomically removes any vector for that
+page, and retries only after a new page tuple invalidates the suppression.
+Transient backend/self-check faults use bounded cancelable backoff. Terminal
+ABI, namespace, or malformed-vector faults park until a new wake or reopen.
 
 ### Hybrid policy and residency
 
@@ -625,7 +652,7 @@ page consumes prompt tokens. Similarity alone cannot pin or inject a page.
 |---|---|---|
 | Exact cosine reference | Tiny deterministic fixtures and ANN oracle | Required |
 | SQLite FTS5 | Exact lexical/code/error retrieval | Required first L3 backend |
-| `sqlite-vec` via pinned modernc SQLite | Local dense KNN in separate `warm.db` | Preferred after compatibility spike |
+| `sqlite-vec` via pinned modernc SQLite | Local dense KNN in separate `warm.db` | Verified development backend; config-gated and derivative |
 | Qdrant with official Go client | High-scale/concurrent filtered dense ANN, initially paired with SQLite FTS5 | Optional only after measured SQLite SLO miss |
 | LanceDB | Potential Arrow/offline adapter | Deferred, not default |
 
@@ -633,7 +660,7 @@ The embedded database is stored separately from `ledger.db`. Removing it is a
 supported recovery action. Qdrant, if introduced, remains a derived process;
 its snapshot is never the disaster-recovery source.
 
-### Future async model
+### Future general observer async model
 
 ```mermaid
 flowchart LR
@@ -786,6 +813,10 @@ operation lock before it is supported.
 | Hybrid FTS5 + dense retrieval | Code identifiers and paraphrases need different channels | Fusion/rerank/abstention require evaluation |
 | SQLite first, Qdrant by measurement | Preserve local one-process simplicity until ANN scale is real | A compatibility spike gates pre-1.0 sqlite-vec |
 | Reference local embedding profile | Private, reproducible evaluation without a hosted key | Model/profile remains replaceable and namespaced |
+| WSMS-owned local embedding protocol | Verify the exact namespace, profile, input order, and digests instead of trusting a generic endpoint | A small bridge is required for TEI/other serving stacks; redirects, proxies, and non-loopback dials fail closed |
+| Separate page watermark and vector residency | L4/FTS progress must not wait for inference | Missing tuples form a retryable derivative writeback queue |
+| Vector tuple compare-and-swap | Slow inference must not complete into a newer logical page | Stale results are discarded and re-derived from the current tuple |
+| Tuple-scoped lexical-only suppression | Secret/admission-denied pages must not leak or block later backlog | Suppression evicts dense residency and expires only when the page tuple changes |
 | Reference-first semantic faults | Approximation discovers addresses; resolver proves evidence | Vector results never enter L1 directly |
 
 ## 19. Evolution path

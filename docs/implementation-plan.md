@@ -758,9 +758,12 @@ Stop conditions (not hit on verified platform):
 
 #### Phase 7D - Namespaced local embedder
 
-**Status:** complete on the development path. The embedder remains optional,
-local-first, and non-authoritative; semantic resolution is still FTS-first until
-Phase 7E hybrid ranking is explicitly implemented.
+**Status:** in-repo runtime boundary implemented and verified with deterministic
+backends and an adversarial test sidecar. The embedder remains optional,
+local-first, and non-authoritative; dense retrieval is shadow-only and semantic
+resolution remains FTS-first until Phase 7E. A real Qwen process, downloaded
+weights, and an exact-revision latency/resource run have not been executed in
+this repo and remain an operational gate rather than an implied code result.
 
 **Objective:** add reproducible private query/document embeddings without
 placing inference in the truth path.
@@ -771,8 +774,10 @@ Implementation:
    metric, normalization, tokenizer, query instruction, document template, page
    schema, and redaction version.
 2. [x] Add `Embedder` with distinct `EmbedDocuments` and `EmbedQuery` methods.
-3. [x] Implement the reference Qwen3-Embedding-0.6B profile behind a supervised
-   local sidecar/adapter with bounded Unix-socket or loopback transport.
+3. [x] Implement the namespaced Qwen3-Embedding-0.6B profile and WSMS-owned
+   client protocol behind a supervised adapter with bounded Unix-socket or
+   loopback transport. The official query `Instruct:`/`Query:` serialization is
+   distinct from the unprefixed document path.
 4. [x] Add startup self-check, batch limits, deadlines, cancellation, circuit
    breaker, content-addressed document embedding cache, and health reporting.
 5. [x] Exclude secrets, denied paths, unrestricted artifacts, and raw
@@ -780,6 +785,10 @@ Implementation:
 6. [x] Keep hosted providers disabled unless explicitly configured with
    redaction, payload inspection, cost/error telemetry, and a distinct
    namespace.
+7. [ ] Run a real local serving stack at an explicitly pinned model/tokenizer
+   revision through a small WSMS protocol bridge; record cold start, memory,
+   throughput, cancellation, and normalized-vector parity. This requires model
+   weights/service setup and is not claimed by the deterministic test adapter.
 
 Verification/gates:
 
@@ -794,6 +803,20 @@ Verification/gates:
       and missing-vector pages are retried in-session and after reopen.
 - [x] Embedding inference runs out of the append/direct-fault path; a blocked or
       failed embedder cannot delay ledger writes or exact page faults.
+- [x] HTTP transport ignores ambient proxies, rejects every redirect, and
+      revalidates a literal loopback target at dial time; Unix-socket transport
+      uses the same no-redirect policy.
+- [x] Rendered query/document payloads pass final admission before backend use;
+      denied pages become tuple-scoped lexical-only entries without starving
+      later vector backlog.
+- [x] Vector and suppression writes compare-and-swap the exact page
+      version/source digest/compiler tuple; a configured generation rejects
+      foreign embedding namespaces.
+- [x] Transient service faults retry with bounded backoff; terminal ABI,
+      namespace, and vector faults park until a new wake/reopen instead of
+      polling indefinitely.
+- [ ] Real Qwen sidecar/model execution passes the exact-revision operational
+      gate above. This does not block the vector-free mechanism demo or FTS.
 
 #### Phase 7E - Hybrid semantic faults
 
