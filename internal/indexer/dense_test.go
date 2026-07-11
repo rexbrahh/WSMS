@@ -429,6 +429,235 @@ func TestDenseRebuildPreservesOnlyCompatibleVectors(t *testing.T) {
 	}
 }
 
+func TestMissingVectorPagesDetectsAbsentWrongNamespaceAndStaleTuple(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+	namespace := "ns/current"
+	pagesToApply := []pages.WarmPage{
+		samplePage("s", "wp_"+strings.Repeat("1", 32), pages.KindFailureEpisode, "missing vector", "main"),
+		samplePage("s", "wp_"+strings.Repeat("2", 32), pages.KindFailureEpisode, "covered vector", "main"),
+		samplePage("s", "wp_"+strings.Repeat("3", 32), pages.KindFailureEpisode, "wrong namespace", "main"),
+		samplePage("s", "wp_"+strings.Repeat("4", 32), pages.KindFailureEpisode, "stale digest", "main"),
+	}
+	for i := range pagesToApply {
+		pagesToApply[i].Version = pages.PageVersion(i + 1)
+		pagesToApply[i].SourceDigest = pages.SourceDigest(strings.Repeat(fmt.Sprintf("%x", i+1), 64))
+		pagesToApply[i].SourceSeqMin = int64(i + 1)
+		pagesToApply[i].SourceSeqMax = int64(i + 1)
+	}
+	var muts []pages.PageMutation
+	for _, page := range pagesToApply {
+		muts = append(muts, pages.PageMutation{Op: pages.MutationUpsert, Page: page})
+	}
+	if err := idx.Apply(ctx, muts); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{
+		{PageID: pagesToApply[1].ID, SessionID: "s", EmbeddingNamespace: namespace, Vector: []float64{1, 0}},
+		{PageID: pagesToApply[2].ID, SessionID: "s", EmbeddingNamespace: "ns/old", Vector: []float64{1, 0}},
+		{PageID: pagesToApply[3].ID, SessionID: "s", EmbeddingNamespace: namespace, Vector: []float64{1, 0}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(idx.Dir(), "warm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `UPDATE warm_pages SET source_digest = ? WHERE page_id = ?`, strings.Repeat("f", 64), string(pagesToApply[3].ID)); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := idx.MissingVectorPages(ctx, "s", namespace, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[pages.PageID]bool{}
+	for _, page := range missing {
+		got[page.ID] = true
+	}
+	for _, want := range []pages.PageID{pagesToApply[0].ID, pagesToApply[2].ID, pagesToApply[3].ID} {
+		if !got[want] {
+			t.Fatalf("missing pages did not include %s: %#v", want, missing)
+		}
+	}
+	if got[pagesToApply[1].ID] {
+		t.Fatalf("covered page reported missing: %#v", missing)
+	}
+}
+
+func TestDenseShadowLifecycleConcurrent(t *testing.T) {
+	idx := openDenseIndex(t, 2)
+	ctx := context.Background()
+	namespace := "ns/shadow-race"
+	pagesToApply := make([]pages.WarmPage, 0, 8)
+	mutations := make([]pages.PageMutation, 0, 8)
+	for i := 0; i < 8; i++ {
+		page := samplePage(
+			"s",
+			fmt.Sprintf("wp_%032x", 0x700+i),
+			pages.KindFailureEpisode,
+			fmt.Sprintf("shadow lifecycle page %02d", i),
+			"main",
+		)
+		page.Version = pages.PageVersion(i + 1)
+		page.SourceSeqMin = int64(i + 1)
+		page.SourceSeqMax = int64(i + 1)
+		page.SourceDigest = pages.SourceDigest(fmt.Sprintf("%064x", 0x700+i))
+		pagesToApply = append(pagesToApply, page)
+		mutations = append(mutations, pages.PageMutation{Op: pages.MutationUpsert, Page: page})
+	}
+	if err := idx.Apply(ctx, mutations); err != nil {
+		t.Fatal(err)
+	}
+	vectorFor := func(i int) indexer.VectorRecord {
+		return indexer.VectorRecord{
+			PageID:             pagesToApply[i].ID,
+			SessionID:          "s",
+			EmbeddingNamespace: namespace,
+			Vector:             []float64{float64(i%3) + 1, float64((i+1)%3) + 1},
+		}
+	}
+	initial := make([]indexer.VectorRecord, 0, len(pagesToApply))
+	for i := range pagesToApply {
+		initial = append(initial, vectorFor(i))
+	}
+	if err := idx.UpsertVectors(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 512)
+	for worker := 0; worker < 2; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 48; i++ {
+				pageIndex := (i + worker) % len(pagesToApply)
+				if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{vectorFor(pageIndex)}); err != nil {
+					errs <- err
+					continue
+				}
+				if i%3 == 0 {
+					if err := idx.DeleteVector(ctx, pagesToApply[pageIndex].ID); err != nil {
+						errs <- err
+					}
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 96; i++ {
+			missing, err := idx.MissingVectorPages(ctx, "s", namespace, len(pagesToApply))
+			if err != nil {
+				errs <- err
+				continue
+			}
+			for _, page := range missing {
+				if page.SessionID != "s" {
+					errs <- fmt.Errorf("missing page session=%q", page.SessionID)
+					return
+				}
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 96; i++ {
+			hits, err := idx.SearchDense(ctx, indexer.SearchQuery{
+				SessionID: "s", EmbeddingNamespace: namespace, Limit: 5,
+			}, []float64{1, 1})
+			if err != nil {
+				errs <- err
+				continue
+			}
+			for _, hit := range hits {
+				if hit.Page.SessionID != "s" {
+					errs <- fmt.Errorf("dense hit session=%q", hit.Page.SessionID)
+					return
+				}
+			}
+		}
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	allVectors := make([]indexer.VectorRecord, 0, len(pagesToApply))
+	for i := range pagesToApply {
+		allVectors = append(allVectors, vectorFor(i))
+	}
+	if err := idx.UpsertVectors(ctx, allVectors); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := idx.MissingVectorPages(ctx, "s", namespace, len(pagesToApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("fully covered pages reported missing: %#v", missing)
+	}
+	deleted := pagesToApply[0].ID
+	if err := idx.DeleteVector(ctx, deleted); err != nil {
+		t.Fatal(err)
+	}
+	missing, err = idx.MissingVectorPages(ctx, "s", namespace, len(pagesToApply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotDeleted := false
+	for _, page := range missing {
+		if page.ID == deleted {
+			gotDeleted = true
+		}
+	}
+	if !gotDeleted {
+		t.Fatalf("deleted vector page not reported missing: %#v", missing)
+	}
+	hits, err := idx.SearchDense(ctx, indexer.SearchQuery{
+		SessionID: "s", EmbeddingNamespace: namespace, Limit: len(pagesToApply),
+	}, []float64{1, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, hit := range hits {
+		if hit.Page.ID == deleted {
+			t.Fatalf("deleted vector still returned by dense search: %#v", hits)
+		}
+	}
+}
+
+func TestRebuildPreservesEmbeddingNamespaceMeta(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "index")
+	idx, err := indexer.Open(dir, indexer.Options{DenseDimensions: 2, EmbeddingNamespace: "ns/rebuild"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
+	ctx := context.Background()
+	page := samplePage("s", "wp_"+strings.Repeat("5", 32), pages.KindFailureEpisode, "namespace meta", "main")
+	if err := idx.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Rebuild(ctx, indexer.MutationList{{Op: pages.MutationUpsert, Page: page}}); err != nil {
+		t.Fatal(err)
+	}
+	health, err := idx.Health(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.EmbeddingNamespace != "ns/rebuild" {
+		t.Fatalf("rebuild namespace=%q want ns/rebuild", health.EmbeddingNamespace)
+	}
+}
+
 func openDenseIndex(t *testing.T, dims int) *indexer.Index {
 	t.Helper()
 	idx, err := indexer.Open(filepath.Join(t.TempDir(), "index"), indexer.Options{DenseDimensions: dims})

@@ -62,6 +62,46 @@ var (
 	ErrEmbeddingNamespaceMismatch = errors.New("warm index embedding namespace mismatch")
 )
 
+const (
+	// EmbeddingStatusOK means the optional dense projection is healthy.
+	EmbeddingStatusOK = ""
+	// EmbeddingStatusDenseUnavailable means dense tables are not active.
+	EmbeddingStatusDenseUnavailable = "dense-unavailable"
+	// EmbeddingStatusNamespace means the configured namespace/dimensions do not
+	// match the index generation or returned vectors.
+	EmbeddingStatusNamespace = "namespace"
+	// EmbeddingStatusSelfCheck means the optional embedder readiness probe failed.
+	EmbeddingStatusSelfCheck = "self-check"
+	// EmbeddingStatusEmbedder means document/query inference failed.
+	EmbeddingStatusEmbedder = "embedder"
+	// EmbeddingStatusVector means returned vector shape or role validation failed.
+	EmbeddingStatusVector = "vector"
+	// EmbeddingStatusIndexer means persisting dense rows failed.
+	EmbeddingStatusIndexer = "indexer"
+	// EmbeddingStatusSearch means the non-authoritative dense shadow search failed.
+	EmbeddingStatusSearch = "search"
+	// EmbeddingStatusInternal is a redacted catch-all for unexpected callers.
+	EmbeddingStatusInternal = "internal"
+)
+
+// ValidEmbeddingStatus reports whether category is safe to expose in health.
+func ValidEmbeddingStatus(category string) bool {
+	switch category {
+	case EmbeddingStatusOK,
+		EmbeddingStatusDenseUnavailable,
+		EmbeddingStatusNamespace,
+		EmbeddingStatusSelfCheck,
+		EmbeddingStatusEmbedder,
+		EmbeddingStatusVector,
+		EmbeddingStatusIndexer,
+		EmbeddingStatusSearch,
+		EmbeddingStatusInternal:
+		return true
+	default:
+		return false
+	}
+}
+
 // Options configures optional index capabilities.
 type Options struct {
 	// DenseDimensions enables the sqlite-vec projection when > 0.
@@ -173,23 +213,23 @@ func Open(dir string, opts ...Options) (*Index, error) {
 				return nil, err
 			}
 		} else {
-		if !errors.Is(err, ErrInvalidSchema) && !errors.Is(err, ErrInvalidCompiler) {
+			if !errors.Is(err, ErrInvalidSchema) && !errors.Is(err, ErrInvalidCompiler) {
+				_ = db.Close()
+				return nil, err
+			}
 			_ = db.Close()
-			return nil, err
-		}
-		_ = db.Close()
-		if err := removeDBFiles(path); err != nil {
-			return nil, err
-		}
-		db, err = openDB(path)
-		if err != nil {
-			return nil, err
-		}
-		idx.db = db
-		if err := idx.ensureMeta(ctx); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
+			if err := removeDBFiles(path); err != nil {
+				return nil, err
+			}
+			db, err = openDB(path)
+			if err != nil {
+				return nil, err
+			}
+			idx.db = db
+			if err := idx.ensureMeta(ctx); err != nil {
+				_ = db.Close()
+				return nil, err
+			}
 		}
 	}
 	if err := idx.initDense(ctx, opt.DenseDimensions); err != nil {
@@ -431,6 +471,9 @@ func (idx *Index) Health(ctx context.Context) (Health, error) {
 func (idx *Index) RecordEmbeddingStatus(reason string) {
 	if idx == nil {
 		return
+	}
+	if !ValidEmbeddingStatus(reason) {
+		reason = EmbeddingStatusInternal
 	}
 	idx.mu.Lock()
 	defer idx.mu.Unlock()

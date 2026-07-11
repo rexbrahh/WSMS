@@ -169,6 +169,20 @@ CREATE TABLE IF NOT EXISTS warm_page_vec_map (
 )`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS warm_page_vec_rows (
+  rowid               INTEGER PRIMARY KEY NOT NULL,
+  page_id             TEXT NOT NULL UNIQUE,
+  session_id          TEXT NOT NULL,
+  embedding_namespace TEXT NOT NULL
+)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS warm_page_vec_rows_session_namespace
+  ON warm_page_vec_rows(session_id, embedding_namespace)`); err != nil {
+		return err
+	}
 	// vec0 cannot use IF NOT EXISTS reliably across recreates; check first.
 	var name string
 	err := tx.QueryRowContext(ctx,
@@ -182,8 +196,18 @@ CREATE TABLE IF NOT EXISTS warm_page_vec_map (
 		if _, err := tx.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("create warm_pages_vec: %w", err)
 		}
-		return nil
+	} else if err != nil {
+		return err
 	}
+	// Legacy dense generations predate the shadow residency table. In those
+	// generations warm_page_vec_map was the transactional commit marker: rows
+	// were inserted in the same transaction as the vec0 row and only after vec0
+	// accepted the vector. Bootstrap the ordinary-table projection from that
+	// legacy marker rather than issuing unsupported vec0 point/ordinary scans.
+	_, err = tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO warm_page_vec_rows(rowid, page_id, session_id, embedding_namespace)
+SELECT rowid, page_id, session_id, embedding_namespace
+FROM warm_page_vec_map`)
 	return err
 }
 
@@ -248,6 +272,81 @@ func (idx *Index) DeleteVector(ctx context.Context, pageID pages.PageID) error {
 	return tx.Commit()
 }
 
+// MissingVectorPages returns active pages whose dense projection is absent or
+// stale for the requested namespace. A page is considered covered only when the
+// vector map matches the current page version, source digest, compiler version,
+// session, and namespace and the transactionally maintained vector-row shadow
+// says the vec0 row is present. This intentionally avoids ordinary point scans
+// against vec0; vec0 is queried only through MATCH in SearchDense.
+func (idx *Index) MissingVectorPages(ctx context.Context, sessionID, namespace string, limit int) ([]pages.WarmPage, error) {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if sessionID == "" {
+		return nil, fmt.Errorf("session id is required")
+	}
+	namespace, err = normalizeVectorNamespace(namespace)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+	if limit > 512 {
+		limit = 512
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.db == nil {
+		return nil, ErrClosed
+	}
+	if idx.denseDims <= 0 {
+		return nil, ErrDenseUnavailable
+	}
+	rows, err := idx.db.QueryContext(ctx, `
+SELECT p.page_id, p.page_version, p.session_id, p.repo_id, p.task_id, p.branch, p.commit_id,
+       p.path_scope_json, p.scope, p.kind, p.trust, p.status, p.salience, p.salience_reason,
+       p.search_text, p.summary, p.refs_json, p.source_digest, p.source_seq_min, p.source_seq_max,
+       p.compiler_version, p.scope_epoch, p.created_at, p.last_verified_at
+FROM warm_pages p
+LEFT JOIN warm_page_vec_map m
+  ON m.page_id = p.page_id
+ AND m.session_id = p.session_id
+ AND m.page_version = p.page_version
+ AND m.source_digest = p.source_digest
+ AND m.compiler_version = p.compiler_version
+ AND m.embedding_namespace = ?
+LEFT JOIN warm_page_vec_rows r
+  ON r.rowid = m.rowid
+ AND r.page_id = m.page_id
+ AND r.session_id = p.session_id
+ AND r.embedding_namespace = ?
+WHERE p.session_id = ?
+  AND p.status = 'active'
+  AND p.search_text <> ''
+  AND (m.page_id IS NULL OR r.rowid IS NULL)
+ORDER BY p.source_seq_max ASC, p.page_id ASC
+LIMIT ?`, namespace, namespace, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []pages.WarmPage
+	for rows.Next() {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
+		page, err := scanPageRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page)
+	}
+	return out, rows.Err()
+}
+
 func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorRecord) error {
 	if rec.PageID == "" || rec.SessionID == "" {
 		return fmt.Errorf("page id and session id are required")
@@ -295,6 +394,12 @@ func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorReco
 		); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO warm_page_vec_rows(rowid, page_id, session_id, embedding_namespace) VALUES(?, ?, ?, ?)`,
+			rowID, string(rec.PageID), rec.SessionID, namespace,
+		); err != nil {
+			return err
+		}
 	case err != nil:
 		return err
 	default:
@@ -311,6 +416,17 @@ func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorReco
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO warm_pages_vec(rowid, session_id, embedding_namespace, embedding) VALUES(?, ?, ?, ?)`,
 			rowID, rec.SessionID, namespace, vectorJSON(rec.Vector),
+		); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO warm_page_vec_rows(rowid, page_id, session_id, embedding_namespace)
+VALUES(?, ?, ?, ?)
+ON CONFLICT(rowid) DO UPDATE SET
+  page_id = excluded.page_id,
+  session_id = excluded.session_id,
+  embedding_namespace = excluded.embedding_namespace`,
+			rowID, string(rec.PageID), rec.SessionID, namespace,
 		); err != nil {
 			return err
 		}
@@ -335,6 +451,12 @@ func deleteVectorTx(ctx context.Context, tx *sql.Tx, pageID pages.PageID) error 
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM warm_pages_vec WHERE rowid = ?`, rowID); err != nil {
+		if strings.Contains(err.Error(), "no such table") {
+			return nil
+		}
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM warm_page_vec_rows WHERE rowid = ?`, rowID); err != nil {
 		if strings.Contains(err.Error(), "no such table") {
 			return nil
 		}
@@ -380,6 +502,7 @@ func tableHasColumnTx(ctx context.Context, tx *sql.Tx, table, column string) (bo
 func dropDenseProjectionTx(ctx context.Context, tx *sql.Tx) error {
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS warm_pages_vec`,
+		`DROP TABLE IF EXISTS warm_page_vec_rows`,
 		`DROP TABLE IF EXISTS warm_page_vec_map`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {

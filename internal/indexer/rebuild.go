@@ -92,7 +92,13 @@ func (idx *Index) Rebuild(ctx context.Context, source PageSource) error {
 		return err
 	}
 	// Ensure meta on rebuild DB; preserve dense configuration when enabled.
-	tmp := &Index{dir: idx.dir, path: rebuildPath, db: rebuildDB, denseDims: idx.denseDims}
+	tmp := &Index{
+		dir:                idx.dir,
+		path:               rebuildPath,
+		db:                 rebuildDB,
+		denseDims:          idx.denseDims,
+		embeddingNamespace: idx.embeddingNamespace,
+	}
 	if err := tmp.ensureMeta(ctx); err != nil {
 		_ = rebuildDB.Close()
 		_ = os.Remove(rebuildPath)
@@ -324,12 +330,46 @@ func validateGeneration(ctx context.Context, idx *Index, expectedVectors int) er
 		return fmt.Errorf("fts count %d != active pages %d", ftsCount, pagesCount)
 	}
 	if idx.denseDims > 0 {
-		var vectorCount int
-		if err := idx.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM warm_page_vec_map`).Scan(&vectorCount); err != nil {
+		var mapCount, rowCount, missingRows, orphanRows int
+		if err := idx.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM warm_page_vec_map`).Scan(&mapCount); err != nil {
 			return err
 		}
-		if vectorCount != expectedVectors {
-			return fmt.Errorf("vector count %d != compatible source vectors %d", vectorCount, expectedVectors)
+		if err := idx.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM warm_page_vec_rows`).Scan(&rowCount); err != nil {
+			return err
+		}
+		if mapCount != expectedVectors {
+			return fmt.Errorf("vector map count %d != compatible source vectors %d", mapCount, expectedVectors)
+		}
+		if rowCount != expectedVectors {
+			return fmt.Errorf("vector shadow row count %d != compatible source vectors %d", rowCount, expectedVectors)
+		}
+		if err := idx.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM warm_page_vec_map m
+LEFT JOIN warm_page_vec_rows r
+  ON r.rowid = m.rowid
+ AND r.page_id = m.page_id
+ AND r.session_id = m.session_id
+ AND r.embedding_namespace = m.embedding_namespace
+WHERE r.rowid IS NULL`).Scan(&missingRows); err != nil {
+			return err
+		}
+		if missingRows != 0 {
+			return fmt.Errorf("vector shadow missing %d map rows", missingRows)
+		}
+		if err := idx.db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM warm_page_vec_rows r
+LEFT JOIN warm_page_vec_map m
+  ON m.rowid = r.rowid
+ AND m.page_id = r.page_id
+ AND m.session_id = r.session_id
+ AND m.embedding_namespace = r.embedding_namespace
+WHERE m.rowid IS NULL`).Scan(&orphanRows); err != nil {
+			return err
+		}
+		if orphanRows != 0 {
+			return fmt.Errorf("vector shadow has %d orphan rows", orphanRows)
 		}
 	}
 	return nil
