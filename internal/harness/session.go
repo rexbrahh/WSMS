@@ -412,7 +412,7 @@ func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event
 	return nil
 }
 
-const embeddingWorkerMaxBackoff = 250 * time.Millisecond
+const embeddingWorkerMaxBackoff = 2 * time.Second
 
 func (s *Session) startEmbeddingWorker() {
 	if s.Embedder == nil || s.Index == nil {
@@ -451,6 +451,9 @@ func (s *Session) embeddingWorker(ctx context.Context) {
 					return
 				}
 				s.recordEmbeddingError(category, err)
+				if !embeddingWorkerShouldRetry(category, err) {
+					break
+				}
 				timer := time.NewTimer(backoff)
 				select {
 				case <-ctx.Done():
@@ -491,7 +494,7 @@ func (s *Session) embedMissingVectorBatch(ctx context.Context) (int, string, err
 	}
 	if checker, ok := s.Embedder.(embedder.SelfChecker); ok {
 		if err := checker.SelfCheck(ctx); err != nil {
-			return 0, indexer.EmbeddingStatusSelfCheck, err
+			return 0, embeddingFailureCategory(indexer.EmbeddingStatusSelfCheck, err), err
 		}
 	}
 	batchSize := s.Cfg.EmbeddingBatchSize
@@ -515,24 +518,79 @@ func (s *Session) embedMissingVectorBatch(ctx context.Context) (int, string, err
 	}
 	batch, err := s.Embedder.EmbedDocuments(ctx, texts)
 	if err != nil {
-		return 0, indexer.EmbeddingStatusEmbedder, err
+		if errors.Is(err, embedder.ErrAdmissionDenied) {
+			return s.embedVectorPagesIndividually(ctx, ns, namespace, pagesToEmbed, texts)
+		}
+		return 0, embeddingFailureCategory(indexer.EmbeddingStatusEmbedder, err), err
 	}
 	if err := batch.Validate(ns, len(texts)); err != nil {
 		return 0, indexer.EmbeddingStatusVector, err
 	}
 	records := make([]indexer.VectorRecord, len(pagesToEmbed))
 	for i, page := range pagesToEmbed {
-		records[i] = indexer.VectorRecord{
-			PageID:             page.ID,
-			SessionID:          page.SessionID,
-			EmbeddingNamespace: namespace,
-			Vector:             embeddingVector64(batch.Embeddings[i].Vector),
-		}
+		records[i] = vectorRecordForPage(page, namespace, embeddingVector64(batch.Embeddings[i].Vector))
 	}
 	if err := s.Index.UpsertVectors(ctx, records); err != nil {
 		return 0, indexer.EmbeddingStatusIndexer, err
 	}
 	return len(pagesToEmbed), indexer.EmbeddingStatusOK, nil
+}
+
+func (s *Session) embedVectorPagesIndividually(ctx context.Context, ns embedder.EmbeddingNamespace, namespace string, pagesToEmbed []pages.WarmPage, texts []string) (int, string, error) {
+	processed := 0
+	for i, page := range pagesToEmbed {
+		if err := ctx.Err(); err != nil {
+			return processed, indexer.EmbeddingStatusEmbedder, err
+		}
+		batch, err := s.Embedder.EmbedDocuments(ctx, []string{texts[i]})
+		if err != nil {
+			if errors.Is(err, embedder.ErrAdmissionDenied) {
+				suppression := vectorSuppressionForPage(page, namespace, indexer.EmbeddingStatusAdmissionDenied)
+				if err := s.Index.SuppressVectors(ctx, []indexer.VectorSuppression{suppression}); err != nil {
+					return processed, indexer.EmbeddingStatusIndexer, err
+				}
+				processed++
+				continue
+			}
+			return processed, embeddingFailureCategory(indexer.EmbeddingStatusEmbedder, err), err
+		}
+		if err := batch.Validate(ns, 1); err != nil {
+			return processed, indexer.EmbeddingStatusVector, err
+		}
+		record := vectorRecordForPage(page, namespace, embeddingVector64(batch.Embeddings[0].Vector))
+		if err := s.Index.UpsertVectors(ctx, []indexer.VectorRecord{record}); err != nil {
+			return processed, indexer.EmbeddingStatusIndexer, err
+		}
+		processed++
+	}
+	return processed, indexer.EmbeddingStatusOK, nil
+}
+
+func embeddingFailureCategory(defaultCategory string, err error) string {
+	switch {
+	case errors.Is(err, embedder.ErrInvalidNamespace), errors.Is(err, indexer.ErrEmbeddingNamespaceMismatch):
+		return indexer.EmbeddingStatusNamespace
+	case errors.Is(err, embedder.ErrInvalidEmbedding):
+		return indexer.EmbeddingStatusVector
+	case errors.Is(err, embedder.ErrAdmissionDenied):
+		return indexer.EmbeddingStatusAdmissionDenied
+	case errors.Is(err, indexer.ErrDenseUnavailable):
+		return indexer.EmbeddingStatusDenseUnavailable
+	default:
+		return defaultCategory
+	}
+}
+
+func embeddingWorkerShouldRetry(category string, err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, indexer.ErrStalePageTuple) {
+		return false
+	}
+	switch embeddingFailureCategory(category, err) {
+	case indexer.EmbeddingStatusSelfCheck, indexer.EmbeddingStatusEmbedder:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Session) recordEmbeddingError(category string, err error) {
@@ -581,6 +639,30 @@ func embeddingVector64(vector []float32) []float64 {
 		out[i] = float64(v)
 	}
 	return out
+}
+
+func vectorRecordForPage(page pages.WarmPage, namespace string, vector []float64) indexer.VectorRecord {
+	return indexer.VectorRecord{
+		PageID:             page.ID,
+		SessionID:          page.SessionID,
+		PageVersion:        page.Version,
+		SourceDigest:       page.SourceDigest,
+		CompilerVersion:    page.CompilerVersion,
+		EmbeddingNamespace: namespace,
+		Vector:             vector,
+	}
+}
+
+func vectorSuppressionForPage(page pages.WarmPage, namespace, reason string) indexer.VectorSuppression {
+	return indexer.VectorSuppression{
+		PageID:             page.ID,
+		SessionID:          page.SessionID,
+		PageVersion:        page.Version,
+		SourceDigest:       page.SourceDigest,
+		CompilerVersion:    page.CompilerVersion,
+		EmbeddingNamespace: namespace,
+		Reason:             reason,
+	}
 }
 
 func embeddingTextForPage(page pages.WarmPage) string {
@@ -741,8 +823,9 @@ func (s *Session) denseSemanticProbe(ctx context.Context, text string, snap cohe
 	}
 	query, err := s.Embedder.EmbedQuery(ctx, text)
 	if err != nil {
-		s.recordEmbeddingError(indexer.EmbeddingStatusEmbedder, err)
-		return []string{"dense=embedder"}
+		category := embeddingFailureCategory(indexer.EmbeddingStatusEmbedder, err)
+		s.recordEmbeddingError(category, err)
+		return []string{denseProbeDegradationMarker(category, "dense=embedder")}
 	}
 	if err := query.Validate(ns, embedder.RoleQuery); err != nil {
 		s.recordEmbeddingError(indexer.EmbeddingStatusVector, err)
@@ -761,10 +844,26 @@ func (s *Session) denseSemanticProbe(ctx context.Context, text string, snap cohe
 		Limit:              3,
 		ActiveOnly:         true,
 	}, embeddingVector64(query.Vector)); err != nil {
-		s.recordEmbeddingError(indexer.EmbeddingStatusSearch, err)
-		return []string{"dense=search"}
+		category := embeddingFailureCategory(indexer.EmbeddingStatusSearch, err)
+		s.recordEmbeddingError(category, err)
+		return []string{denseProbeDegradationMarker(category, "dense=search")}
 	}
 	return nil
+}
+
+func denseProbeDegradationMarker(category, fallback string) string {
+	switch category {
+	case indexer.EmbeddingStatusNamespace:
+		return "dense=namespace"
+	case indexer.EmbeddingStatusVector:
+		return "dense=query-vector"
+	case indexer.EmbeddingStatusAdmissionDenied:
+		return "dense=admission-denied"
+	case indexer.EmbeddingStatusDenseUnavailable:
+		return "dense=unavailable"
+	default:
+		return fallback
+	}
 }
 
 func (s *Session) materializeSemanticPage(ctx context.Context, page pages.WarmPage) ([]string, error) {

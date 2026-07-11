@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -491,6 +492,260 @@ func TestFailurePageSecretIsNotSentToEmbeddingBackend(t *testing.T) {
 	}
 }
 
+func TestAdmissionDeniedPageDoesNotStarveSafeEmbeddingBacklog(t *testing.T) {
+	backend := &recordingBackend{docVector: []float32{1, 0}, queryVector: []float32{1, 0}}
+	emb, ns := newSupervisedTestEmbedder(t, backend, embedder.NewDocumentCache(), 0)
+	s := openEmbeddingSession(t, "embedding-admission-denied", emb, 0)
+	ctx := context.Background()
+	if err := s.StartTask(ctx, TaskStart{Goal: "admission denied", Repo: "repo", Branch: "main", Commit: "aaaaaaa"}); err != nil {
+		t.Fatal(err)
+	}
+	deniedText := "path: .env must remain lexical only"
+	if err := s.IngestUser(ctx, deniedText); err != nil {
+		t.Fatal(err)
+	}
+	safeText := "hard constraint: safe dense backlog should still backfill after denied page"
+	if err := s.IngestUser(ctx, safeText); err != nil {
+		t.Fatal(err)
+	}
+	deniedPage := requireWarmPageContaining(t, s, deniedText)
+	safePage := requireWarmPageContaining(t, s, safeText)
+	waitForNoMissingVectorPages(t, s, ns.ID)
+	requireNoDenseTuple(t, s, deniedPage)
+	requireDenseTuple(t, s, safePage, ns.ID)
+	waitForEmbeddingStatus(t, s, false, indexer.EmbeddingStatusOK)
+	if got := countPayloadContaining(backend.documentPayloads(), deniedText); got != 0 {
+		t.Fatalf("admission-denied text reached backend %d times; payloads=%v", got, backend.documentPayloads())
+	}
+	if got := countPayloadContaining(backend.documentPayloads(), safeText); got == 0 {
+		t.Fatalf("safe text never reached backend; payloads=%v", backend.documentPayloads())
+	}
+}
+
+func TestAdmissionFallbackCheckpointsSafeAndSuppressedBeforeLaterTransient(t *testing.T) {
+	ns := testNamespace(t, 2, "fallback-progress")
+	safeText := "kind=constraint safe vector should checkpoint before later transient"
+	deniedText := "kind=constraint path: .env should be suppressed before later transient"
+	transientText := "kind=constraint transient backend page should remain missing"
+	emb := &scriptedEmbedder{namespace: ns}
+	emb.setDocFunc(func(ctx context.Context, texts []string, _ int) (embedder.EmbeddingBatch, error) {
+		if len(texts) > 1 {
+			return embedder.EmbeddingBatch{}, embedder.ErrAdmissionDenied
+		}
+		switch {
+		case strings.Contains(texts[0], safeText):
+			return documentBatchForTexts(ns, texts, []float32{1, 0}), nil
+		case strings.Contains(texts[0], deniedText):
+			return embedder.EmbeddingBatch{}, embedder.ErrAdmissionDenied
+		case strings.Contains(texts[0], transientText):
+			return embedder.EmbeddingBatch{}, errors.New("temporary embedder availability fault")
+		default:
+			return embedder.EmbeddingBatch{}, errors.New("unexpected embedding text")
+		}
+	})
+	s := openEmbeddingSession(t, "embedding-fallback-progress", emb, 2)
+	ctx := context.Background()
+	safe := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("1", 32), safeText, strings.Repeat("1", 64), 1)
+	denied := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("2", 32), deniedText, strings.Repeat("2", 64), 2)
+	transient := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("3", 32), transientText, strings.Repeat("3", 64), 3)
+	if err := s.Index.Apply(ctx, []pages.PageMutation{
+		{Op: pages.MutationUpsert, Page: safe},
+		{Op: pages.MutationUpsert, Page: denied},
+		{Op: pages.MutationUpsert, Page: transient},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.wakeEmbeddingWorker()
+	waitForEmbeddingStatus(t, s, true, indexer.EmbeddingStatusEmbedder)
+
+	requireDenseTuple(t, s, safe, ns.ID)
+	requireNoDenseTuple(t, s, denied)
+	requireNoDenseTuple(t, s, transient)
+	missing, err := s.Index.MissingVectorPages(ctx, s.Cfg.SessionID, ns.ID, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missingPageContains(missing, safeText) {
+		t.Fatalf("checkpointed safe page still appears missing: %v", pageIDs(missing))
+	}
+	if missingPageContains(missing, deniedText) {
+		t.Fatalf("suppressed denied page still appears missing: %v", pageIDs(missing))
+	}
+	if !missingPageContains(missing, transientText) {
+		t.Fatalf("transient page should remain retryable/missing; got %v", pageIDs(missing))
+	}
+}
+
+func TestEmbeddingTerminalFailureParksUntilNewWake(t *testing.T) {
+	ns := testNamespace(t, 2, "terminal-park")
+	emb := &scriptedEmbedder{namespace: ns}
+	emb.setDocFunc(func(ctx context.Context, texts []string, _ int) (embedder.EmbeddingBatch, error) {
+		return documentBatchForTexts(ns, texts, []float32{1}), nil
+	})
+	s := openEmbeddingSession(t, "embedding-terminal-park", emb, 2)
+	ctx := context.Background()
+	page := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("4", 32), "kind=constraint terminal vector waits for new wake", strings.Repeat("4", 64), 1)
+	if err := s.Index.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}); err != nil {
+		t.Fatal(err)
+	}
+	s.wakeEmbeddingWorker()
+	waitForEmbeddingStatus(t, s, true, indexer.EmbeddingStatusVector)
+	callsBeforeRecovery := waitForDocCallsStable(t, emb, 125*time.Millisecond)
+	if callsBeforeRecovery == 0 || callsBeforeRecovery > 2 {
+		t.Fatalf("terminal vector failure should consume only finite coalesced wakes before parking; calls=%d", callsBeforeRecovery)
+	}
+
+	emb.setDocFunc(func(ctx context.Context, texts []string, _ int) (embedder.EmbeddingBatch, error) {
+		return documentBatchForTexts(ns, texts, []float32{1, 0}), nil
+	})
+	s.wakeEmbeddingWorker()
+	waitForNoMissingVectorPages(t, s, ns.ID)
+	requireDenseTuple(t, s, page, ns.ID)
+	waitForEmbeddingStatus(t, s, false, indexer.EmbeddingStatusOK)
+}
+
+func TestEmbeddingStaleResultDoesNotOverwriteNewTuple(t *testing.T) {
+	ns := testNamespace(t, 2, "stale-tuple")
+	firstEntered := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	secondEntered := make(chan struct{}, 1)
+	releaseSecond := make(chan struct{})
+	emb := &scriptedEmbedder{namespace: ns}
+	emb.setDocFunc(func(ctx context.Context, texts []string, call int) (embedder.EmbeddingBatch, error) {
+		switch call {
+		case 1:
+			firstEntered <- struct{}{}
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return embedder.EmbeddingBatch{}, ctx.Err()
+			}
+		case 2:
+			secondEntered <- struct{}{}
+			select {
+			case <-releaseSecond:
+			case <-ctx.Done():
+				return embedder.EmbeddingBatch{}, ctx.Err()
+			}
+		}
+		return documentBatchForTexts(ns, texts, []float32{1, 0}), nil
+	})
+	s := openEmbeddingSession(t, "embedding-stale-tuple", emb, 2)
+	ctx := context.Background()
+	pageV1 := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("5", 32), "kind=constraint stale tuple old text", strings.Repeat("5", 64), 1)
+	if err := s.Index.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: pageV1}}); err != nil {
+		t.Fatal(err)
+	}
+	s.wakeEmbeddingWorker()
+	waitForSignal(t, firstEntered, "first stale embedding call")
+
+	pageV2 := embeddingWarmPage(s.Cfg.SessionID, string(pageV1.ID), "kind=constraint stale tuple new text", strings.Repeat("6", 64), 2)
+	if err := s.Index.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: pageV2}}); err != nil {
+		t.Fatal(err)
+	}
+	s.wakeEmbeddingWorker()
+	close(releaseFirst)
+	waitForSignal(t, secondEntered, "fresh tuple embedding call")
+	requireNoDenseTuple(t, s, pageV2)
+
+	close(releaseSecond)
+	waitForNoMissingVectorPages(t, s, ns.ID)
+	requireDenseTuple(t, s, pageV2, ns.ID)
+	waitForEmbeddingStatus(t, s, false, indexer.EmbeddingStatusOK)
+}
+
+func TestSupervisedInvalidEmbeddingParksUntilWakeAndRedactsHealth(t *testing.T) {
+	backend := &recordingBackend{docVector: []float32{1, 0}, queryVector: []float32{1, 0}}
+	backend.setDocErr(fmt.Errorf("%w: TOP_SECRET malformed local sidecar response", embedder.ErrInvalidEmbedding))
+	emb, ns := newSupervisedTestEmbedder(t, backend, embedder.NewDocumentCache(), 0)
+	s := openEmbeddingSession(t, "embedding-supervised-invalid-parks", emb, 2)
+	ctx := context.Background()
+	page := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("8", 32), "kind=constraint supervised invalid vector parks", strings.Repeat("8", 64), 1)
+	if err := s.Index.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}); err != nil {
+		t.Fatal(err)
+	}
+	s.wakeEmbeddingWorker()
+	waitForEmbeddingStatus(t, s, true, indexer.EmbeddingStatusVector)
+	callsBeforeRecovery := waitForRecordingDocCallsStable(t, backend, 125*time.Millisecond)
+	if callsBeforeRecovery == 0 || callsBeforeRecovery > 2 {
+		t.Fatalf("terminal supervised invalid embedding should consume only finite coalesced wakes before parking; calls=%d", callsBeforeRecovery)
+	}
+	health, err := s.Index.Health(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.EmbeddingDegraded || health.EmbeddingDegradedReason != indexer.EmbeddingStatusVector {
+		t.Fatalf("health=%#v want redacted vector degradation", health)
+	}
+	if strings.Contains(health.EmbeddingDegradedReason, "invalid") || strings.Contains(health.EmbeddingDegradedReason, "TOP_SECRET") {
+		t.Fatalf("health leaked raw vector validation text: %#v", health)
+	}
+
+	backend.setDocErr(nil)
+	s.wakeEmbeddingWorker()
+	waitForNoMissingVectorPages(t, s, ns.ID)
+	requireDenseTuple(t, s, page, ns.ID)
+	waitForEmbeddingStatus(t, s, false, indexer.EmbeddingStatusOK)
+}
+
+func TestSupervisedTransientBackendStillAutoRetries(t *testing.T) {
+	backend := &recordingBackend{docVector: []float32{1, 0}, queryVector: []float32{1, 0}}
+	backend.setDocErr(errors.New("TOP_SECRET transient backend outage"))
+	emb, ns := newSupervisedTestEmbedder(t, backend, embedder.NewDocumentCache(), 0)
+	s := openEmbeddingSession(t, "embedding-supervised-transient-retry", emb, 2)
+	ctx := context.Background()
+	page := embeddingWarmPage(s.Cfg.SessionID, "wp_"+strings.Repeat("9", 32), "kind=constraint supervised transient retries", strings.Repeat("9", 64), 1)
+	if err := s.Index.Apply(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}); err != nil {
+		t.Fatal(err)
+	}
+	s.wakeEmbeddingWorker()
+	waitForEmbeddingStatus(t, s, true, indexer.EmbeddingStatusSelfCheck)
+	health, err := s.Index.Health(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.EmbeddingDegradedReason != indexer.EmbeddingStatusSelfCheck || strings.Contains(health.EmbeddingDegradedReason, "TOP_SECRET") {
+		t.Fatalf("health reason not redacted self-check category: %#v", health)
+	}
+
+	backend.setDocErr(nil)
+	waitForNoMissingVectorPages(t, s, ns.ID)
+	requireDenseTuple(t, s, page, ns.ID)
+	waitForEmbeddingStatus(t, s, false, indexer.EmbeddingStatusOK)
+	if got := backend.docCallCount(); got < 2 {
+		t.Fatalf("transient backend did not auto-retry after outage cleared; calls=%d", got)
+	}
+}
+
+func TestDenseProbeClassifiesSupervisedInvalidQueryVector(t *testing.T) {
+	backend := &recordingBackend{docVector: []float32{1, 0}, queryVector: []float32{1}}
+	emb, _ := newSupervisedTestEmbedder(t, backend, embedder.NewDocumentCache(), 0)
+	s := openEmbeddingSession(t, "embedding-query-vector-classifier", emb, 2)
+	ctx := context.Background()
+	if err := s.StartTask(ctx, TaskStart{Goal: "query vector classifier", Repo: "repo", Branch: "main", Commit: "aaaaaaa"}); err != nil {
+		t.Fatal(err)
+	}
+	text := "do not rely on invalid query vector dense path"
+	if err := s.IngestUser(ctx, text); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.SemanticSearch(ctx, text)
+	if err != nil {
+		t.Fatalf("semantic search should keep FTS fallback after invalid dense query: %v", err)
+	}
+	if !stringSliceContains(result.Degraded, "dense=query-vector") {
+		t.Fatalf("dense degradation markers=%#v want dense=query-vector", result.Degraded)
+	}
+	waitForEmbeddingStatus(t, s, true, indexer.EmbeddingStatusVector)
+	health, err := s.Index.Health(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.EmbeddingDegradedReason != indexer.EmbeddingStatusVector {
+		t.Fatalf("health reason=%q want %q", health.EmbeddingDegradedReason, indexer.EmbeddingStatusVector)
+	}
+}
+
 func openEmbeddingSession(t *testing.T, id string, emb embedder.Embedder, denseDims int) *Session {
 	t.Helper()
 	cfg := embeddingTestConfig(t.TempDir(), id, emb, denseDims)
@@ -557,6 +812,8 @@ type recordingBackend struct {
 	blockUntilContextDone bool
 	docVector             []float32
 	queryVector           []float32
+	docErr                error
+	queryErr              error
 	docCalls              int
 	queryCalls            int
 	docPayloads           []string
@@ -567,14 +824,20 @@ func (b *recordingBackend) EmbedDocuments(ctx context.Context, texts []string) (
 	b.mu.Lock()
 	b.docCalls++
 	b.docPayloads = append(b.docPayloads, texts...)
+	docErr := b.docErr
+	docVector := append([]float32(nil), b.docVector...)
+	blockUntilContextDone := b.blockUntilContextDone
 	b.mu.Unlock()
-	if b.blockUntilContextDone {
+	if blockUntilContextDone {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
+	if docErr != nil {
+		return nil, docErr
+	}
 	vectors := make([][]float32, len(texts))
 	for i := range vectors {
-		vectors[i] = append([]float32(nil), b.docVector...)
+		vectors[i] = append([]float32(nil), docVector...)
 	}
 	return vectors, nil
 }
@@ -583,18 +846,36 @@ func (b *recordingBackend) EmbedQuery(ctx context.Context, text string) ([]float
 	b.mu.Lock()
 	b.queryCalls++
 	b.queryPayloads = append(b.queryPayloads, text)
+	queryErr := b.queryErr
+	queryVector := append([]float32(nil), b.queryVector...)
+	blockUntilContextDone := b.blockUntilContextDone
 	b.mu.Unlock()
-	if b.blockUntilContextDone {
+	if blockUntilContextDone {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	return append([]float32(nil), b.queryVector...), nil
+	if queryErr != nil {
+		return nil, queryErr
+	}
+	return queryVector, nil
 }
 
 func (b *recordingBackend) docCallCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.docCalls
+}
+
+func (b *recordingBackend) setDocVector(vector []float32) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.docVector = append([]float32(nil), vector...)
+}
+
+func (b *recordingBackend) setDocErr(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.docErr = err
 }
 
 func (b *recordingBackend) documentPayloads() []string {
@@ -755,6 +1036,77 @@ func (m *manualEmbedder) EmbedQuery(_ context.Context, text string) (embedder.Em
 
 func (m *manualEmbedder) Namespace() embedder.EmbeddingNamespace {
 	return m.namespace
+}
+
+type scriptedEmbedder struct {
+	mu          sync.Mutex
+	namespace   embedder.EmbeddingNamespace
+	docFunc     func(context.Context, []string, int) (embedder.EmbeddingBatch, error)
+	docCalls    int
+	docPayloads []string
+	query       embedder.Embedding
+}
+
+func (e *scriptedEmbedder) EmbedDocuments(ctx context.Context, texts []string) (embedder.EmbeddingBatch, error) {
+	e.mu.Lock()
+	e.docCalls++
+	call := e.docCalls
+	e.docPayloads = append(e.docPayloads, texts...)
+	fn := e.docFunc
+	ns := e.namespace
+	e.mu.Unlock()
+	copied := append([]string(nil), texts...)
+	if fn != nil {
+		return fn(ctx, copied, call)
+	}
+	return documentBatchForTexts(ns, copied, []float32{1, 0}), nil
+}
+
+func (e *scriptedEmbedder) EmbedQuery(_ context.Context, text string) (embedder.Embedding, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	query := e.query
+	if query.Namespace.ID == "" {
+		query = embedder.Embedding{Namespace: e.namespace, Role: embedder.RoleQuery, Vector: []float32{1, 0}}
+	}
+	query.CanonicalText = text
+	return query, nil
+}
+
+func (e *scriptedEmbedder) Namespace() embedder.EmbeddingNamespace {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.namespace
+}
+
+func (e *scriptedEmbedder) setDocFunc(fn func(context.Context, []string, int) (embedder.EmbeddingBatch, error)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.docFunc = fn
+}
+
+func (e *scriptedEmbedder) docCallCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.docCalls
+}
+
+func documentBatchForTexts(ns embedder.EmbeddingNamespace, texts []string, vector []float32) embedder.EmbeddingBatch {
+	embeddings := make([]embedder.Embedding, len(texts))
+	for i, text := range texts {
+		embeddings[i] = embedder.Embedding{
+			Namespace:     ns,
+			Role:          embedder.RoleDocument,
+			Vector:        append([]float32(nil), vector...),
+			CanonicalText: text,
+		}
+	}
+	return embedder.EmbeddingBatch{
+		Namespace:      ns,
+		Role:           embedder.RoleDocument,
+		Embeddings:     embeddings,
+		CanonicalTexts: append([]string(nil), texts...),
+	}
 }
 
 func embeddingWarmPage(session, id, search, digest string, version int64) pages.WarmPage {
@@ -982,6 +1334,47 @@ WHERE m.page_id = ?`, string(pageID)).Scan(&row.sessionID, &row.pageVersion, &ro
 	return row, true
 }
 
+func requireWarmPageContaining(t *testing.T, s *Session, needle string) pages.WarmPage {
+	t.Helper()
+	health, err := s.Index.Health(context.Background())
+	if err != nil {
+		t.Fatalf("index health: %v", err)
+	}
+	db, err := sql.Open("sqlite", health.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close warm page db: %v", err)
+		}
+	}()
+	rows, err := db.QueryContext(context.Background(), `
+SELECT page_id, page_version, session_id, source_digest, compiler_version, search_text
+FROM warm_pages
+WHERE session_id = ?`, s.Cfg.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var page pages.WarmPage
+		var version int64
+		if err := rows.Scan(&page.ID, &version, &page.SessionID, &page.SourceDigest, &page.CompilerVersion, &page.SearchText); err != nil {
+			t.Fatal(err)
+		}
+		page.Version = pages.PageVersion(version)
+		if strings.Contains(page.SearchText, needle) {
+			return page
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("warm page containing %q not found", needle)
+	return pages.WarmPage{}
+}
+
 func pageIDs(warmPages []pages.WarmPage) []pages.PageID {
 	ids := make([]pages.PageID, len(warmPages))
 	for i, page := range warmPages {
@@ -1019,6 +1412,72 @@ func waitControlledEntered(t *testing.T, emb *controlledEmbedder) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("controlled embedder was not called")
 	}
+}
+
+func waitForSignal(t *testing.T, ch <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
+}
+
+func waitForDocCallsStable(t *testing.T, emb *scriptedEmbedder, stableFor time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last := emb.docCallCount()
+	stableSince := time.Now()
+	for {
+		got := emb.docCallCount()
+		if got != last {
+			last = got
+			stableSince = time.Now()
+		}
+		if got > 2 {
+			return got
+		}
+		if time.Since(stableSince) >= stableFor {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("document calls did not stabilize within deadline; last=%d", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForRecordingDocCallsStable(t *testing.T, backend *recordingBackend, stableFor time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last := backend.docCallCount()
+	stableSince := time.Now()
+	for {
+		got := backend.docCallCount()
+		if got != last {
+			last = got
+			stableSince = time.Now()
+		}
+		if got > 2 {
+			return got
+		}
+		if time.Since(stableSince) >= stableFor {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("recording backend document calls did not stabilize within deadline; last=%d", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func missingPageContains(warmPages []pages.WarmPage, needle string) bool {
+	for _, page := range warmPages {
+		if strings.Contains(page.SearchText, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func countPayloadContaining(payloads []string, needle string) int {

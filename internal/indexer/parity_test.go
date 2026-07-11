@@ -56,7 +56,7 @@ func TestDenseExactOracleParity(t *testing.T) {
 		page.SourceSeqMax = int64(i + 1)
 		page.SourceDigest = pages.SourceDigest(fmt.Sprintf("%064x", i+1))
 		muts = append(muts, pages.PageMutation{Op: pages.MutationUpsert, Page: page})
-		vecs = append(vecs, indexer.VectorRecord{PageID: id, SessionID: "parity", Vector: vec})
+		vecs = append(vecs, denseRecord(page, "", vec))
 		records = append(records, pages.VectorRecord{PageID: id, Vector: vec})
 	}
 	if err := idx.Apply(ctx, muts); err != nil {

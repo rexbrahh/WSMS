@@ -24,8 +24,25 @@ const (
 type VectorRecord struct {
 	PageID             pages.PageID
 	SessionID          string
+	PageVersion        pages.PageVersion
+	SourceDigest       pages.SourceDigest
+	CompilerVersion    pages.CompilerVersion
 	EmbeddingNamespace string
 	Vector             []float64
+}
+
+// VectorSuppression records a current page tuple that should remain lexical-only
+// for one embedding namespace. Suppressions are derivative L3 state: page
+// updates, invalidations, namespace changes, or deleting the index all remove
+// their effect.
+type VectorSuppression struct {
+	PageID             pages.PageID
+	SessionID          string
+	PageVersion        pages.PageVersion
+	SourceDigest       pages.SourceDigest
+	CompilerVersion    pages.CompilerVersion
+	EmbeddingNamespace string
+	Reason             string
 }
 
 const DefaultVectorNamespace = "wsms/manual-vector/v1"
@@ -183,6 +200,23 @@ CREATE INDEX IF NOT EXISTS warm_page_vec_rows_session_namespace
   ON warm_page_vec_rows(session_id, embedding_namespace)`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS warm_page_vec_suppressed (
+  page_id             TEXT PRIMARY KEY NOT NULL,
+  session_id          TEXT NOT NULL,
+  page_version        INTEGER NOT NULL,
+  source_digest       TEXT NOT NULL,
+  compiler_version    TEXT NOT NULL,
+  embedding_namespace TEXT NOT NULL,
+  reason              TEXT NOT NULL
+)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS warm_page_vec_suppressed_session_namespace
+  ON warm_page_vec_suppressed(session_id, embedding_namespace)`); err != nil {
+		return err
+	}
 	// vec0 cannot use IF NOT EXISTS reliably across recreates; check first.
 	var name string
 	err := tx.QueryRowContext(ctx,
@@ -266,8 +300,47 @@ func (idx *Index) DeleteVector(ctx context.Context, pageID pages.PageID) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := deleteVectorTx(ctx, tx, pageID); err != nil {
+	// Explicit vector eviction must not clear a same-tuple admission
+	// suppression. Only an authoritative page Apply/invalidation changes that
+	// policy tuple and removes both derivative states.
+	if err := deleteDenseProjectionTx(ctx, tx, pageID); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// SuppressVectors records active pages that should be skipped by dense
+// projection for the current page tuple and namespace. This is used only for
+// non-retriable local admission failures; transient backend failures should
+// leave pages missing so the worker retries.
+func (idx *Index) SuppressVectors(ctx context.Context, records []VectorSuppression) error {
+	release, err := idx.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	idx.writeMu.Lock()
+	defer idx.writeMu.Unlock()
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.db == nil {
+		return ErrClosed
+	}
+	if idx.denseDims <= 0 {
+		return ErrDenseUnavailable
+	}
+	tx, err := idx.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, rec := range records {
+		if err := contextErr(ctx); err != nil {
+			return err
+		}
+		if err := idx.suppressVectorTx(ctx, tx, rec); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -276,8 +349,9 @@ func (idx *Index) DeleteVector(ctx context.Context, pageID pages.PageID) error {
 // stale for the requested namespace. A page is considered covered only when the
 // vector map matches the current page version, source digest, compiler version,
 // session, and namespace and the transactionally maintained vector-row shadow
-// says the vec0 row is present. This intentionally avoids ordinary point scans
-// against vec0; vec0 is queried only through MATCH in SearchDense.
+// says the vec0 row is present. Current-tuple admission suppressions also count
+// as covered by lexical-only policy. This intentionally avoids ordinary point
+// scans against vec0; vec0 is queried only through MATCH in SearchDense.
 func (idx *Index) MissingVectorPages(ctx context.Context, sessionID, namespace string, limit int) ([]pages.WarmPage, error) {
 	release, err := idx.beginOperation(ctx)
 	if err != nil {
@@ -287,7 +361,7 @@ func (idx *Index) MissingVectorPages(ctx context.Context, sessionID, namespace s
 	if sessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	namespace, err = normalizeVectorNamespace(namespace)
+	namespace, err = idx.vectorNamespace(namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -323,12 +397,20 @@ LEFT JOIN warm_page_vec_rows r
  AND r.page_id = m.page_id
  AND r.session_id = p.session_id
  AND r.embedding_namespace = ?
+LEFT JOIN warm_page_vec_suppressed s
+  ON s.page_id = p.page_id
+ AND s.session_id = p.session_id
+ AND s.page_version = p.page_version
+ AND s.source_digest = p.source_digest
+ AND s.compiler_version = p.compiler_version
+ AND s.embedding_namespace = ?
 WHERE p.session_id = ?
   AND p.status = 'active'
   AND p.search_text <> ''
+  AND s.page_id IS NULL
   AND (m.page_id IS NULL OR r.rowid IS NULL)
 ORDER BY p.source_seq_max ASC, p.page_id ASC
-LIMIT ?`, namespace, namespace, sessionID, limit)
+LIMIT ?`, namespace, namespace, namespace, sessionID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -348,32 +430,31 @@ LIMIT ?`, namespace, namespace, sessionID, limit)
 }
 
 func (idx *Index) upsertVectorTx(ctx context.Context, tx *sql.Tx, rec VectorRecord) error {
-	if rec.PageID == "" || rec.SessionID == "" {
-		return fmt.Errorf("page id and session id are required")
-	}
 	if err := validateVector(rec.Vector, idx.denseDims); err != nil {
 		return err
 	}
-	namespace, err := normalizeVectorNamespace(rec.EmbeddingNamespace)
+	namespace, err := idx.vectorNamespace(rec.EmbeddingNamespace)
 	if err != nil {
 		return err
 	}
-	var pageVersion int64
-	var pageSession, sourceDigest, compilerVersion, status string
-	if err := tx.QueryRowContext(ctx, `SELECT page_version, session_id, source_digest, compiler_version, status FROM warm_pages WHERE page_id = ?`, string(rec.PageID)).Scan(
-		&pageVersion, &pageSession, &sourceDigest, &compilerVersion, &status,
-	); err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("page %s is not in warm_pages", rec.PageID)
-		}
+	if err := requireCurrentPageTuple(ctx, tx, rec.PageID, rec.SessionID, rec.PageVersion, rec.SourceDigest, rec.CompilerVersion); err != nil {
 		return err
 	}
-	if pageSession != rec.SessionID {
-		return fmt.Errorf("page %s session %q does not match vector session %q", rec.PageID, pageSession, rec.SessionID)
+	suppressed, err := matchingSuppressionTx(ctx, tx, rec.PageID, rec.SessionID, rec.PageVersion, rec.SourceDigest, rec.CompilerVersion, namespace)
+	if err != nil {
+		return err
 	}
-	if status != string(pages.StatusActive) {
-		return fmt.Errorf("page %s is not active", rec.PageID)
+	if suppressed {
+		// Admission suppression owns this exact page tuple. Clean up any legacy
+		// coexistence but never let an asynchronous upsert override the policy.
+		return deleteDenseProjectionTx(ctx, tx, rec.PageID)
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM warm_page_vec_suppressed WHERE page_id = ?`, string(rec.PageID)); err != nil {
+		return err
+	}
+	pageVersion := int64(rec.PageVersion)
+	sourceDigest := string(rec.SourceDigest)
+	compilerVersion := string(rec.CompilerVersion)
 
 	var rowID int64
 	err = tx.QueryRowContext(ctx, `SELECT rowid FROM warm_page_vec_map WHERE page_id = ?`, string(rec.PageID)).Scan(&rowID)
@@ -434,7 +515,111 @@ ON CONFLICT(rowid) DO UPDATE SET
 	return nil
 }
 
+func (idx *Index) suppressVectorTx(ctx context.Context, tx *sql.Tx, rec VectorSuppression) error {
+	namespace, err := idx.vectorNamespace(rec.EmbeddingNamespace)
+	if err != nil {
+		return err
+	}
+	reason := rec.Reason
+	if !ValidEmbeddingStatus(reason) || reason == EmbeddingStatusOK {
+		reason = EmbeddingStatusInternal
+	}
+	if err := requireCurrentPageTuple(ctx, tx, rec.PageID, rec.SessionID, rec.PageVersion, rec.SourceDigest, rec.CompilerVersion); err != nil {
+		return err
+	}
+	if err := deleteDenseProjectionTx(ctx, tx, rec.PageID); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO warm_page_vec_suppressed(page_id, session_id, page_version, source_digest, compiler_version, embedding_namespace, reason)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(page_id) DO UPDATE SET
+  session_id = excluded.session_id,
+  page_version = excluded.page_version,
+  source_digest = excluded.source_digest,
+	  compiler_version = excluded.compiler_version,
+	  embedding_namespace = excluded.embedding_namespace,
+	  reason = excluded.reason`,
+		string(rec.PageID), rec.SessionID, int64(rec.PageVersion), string(rec.SourceDigest), string(rec.CompilerVersion), namespace, reason,
+	)
+	return err
+}
+
+func requireCurrentPageTuple(
+	ctx context.Context,
+	tx *sql.Tx,
+	pageID pages.PageID,
+	sessionID string,
+	pageVersion pages.PageVersion,
+	sourceDigest pages.SourceDigest,
+	compilerVersion pages.CompilerVersion,
+) error {
+	if pageID == "" || sessionID == "" || pageVersion == 0 || sourceDigest == "" || compilerVersion == "" {
+		return fmt.Errorf("page id, session id, version, source digest, and compiler version are required")
+	}
+	var currentVersion int64
+	var currentSession, currentDigest, currentCompiler, status string
+	err := tx.QueryRowContext(ctx, `
+SELECT page_version, session_id, source_digest, compiler_version, status
+FROM warm_pages
+WHERE page_id = ?`, string(pageID)).Scan(
+		&currentVersion, &currentSession, &currentDigest, &currentCompiler, &status,
+	)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: page %s is unavailable", ErrStalePageTuple, pageID)
+	}
+	if err != nil {
+		return err
+	}
+	if currentVersion < 0 || pages.PageVersion(currentVersion) != pageVersion ||
+		currentSession != sessionID || currentDigest != string(sourceDigest) ||
+		currentCompiler != string(compilerVersion) || status != string(pages.StatusActive) {
+		return fmt.Errorf("%w: page %s changed before dense writeback", ErrStalePageTuple, pageID)
+	}
+	return nil
+}
+
+func matchingSuppressionTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	pageID pages.PageID,
+	sessionID string,
+	pageVersion pages.PageVersion,
+	sourceDigest pages.SourceDigest,
+	compilerVersion pages.CompilerVersion,
+	namespace string,
+) (bool, error) {
+	var found int
+	err := tx.QueryRowContext(ctx, `
+SELECT 1
+FROM warm_page_vec_suppressed
+WHERE page_id = ?
+  AND session_id = ?
+  AND page_version = ?
+  AND source_digest = ?
+  AND compiler_version = ?
+  AND embedding_namespace = ?`,
+		string(pageID), sessionID, int64(pageVersion), string(sourceDigest), string(compilerVersion), namespace,
+	).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func deleteVectorTx(ctx context.Context, tx *sql.Tx, pageID pages.PageID) error {
+	if pageID == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM warm_page_vec_suppressed WHERE page_id = ?`, string(pageID)); err != nil {
+		if !strings.Contains(err.Error(), "no such table") {
+			return err
+		}
+	}
+	return deleteDenseProjectionTx(ctx, tx, pageID)
+}
+
+func deleteDenseProjectionTx(ctx context.Context, tx *sql.Tx, pageID pages.PageID) error {
 	if pageID == "" {
 		return nil
 	}
@@ -502,6 +687,7 @@ func tableHasColumnTx(ctx context.Context, tx *sql.Tx, table, column string) (bo
 func dropDenseProjectionTx(ctx context.Context, tx *sql.Tx) error {
 	for _, stmt := range []string{
 		`DROP TABLE IF EXISTS warm_pages_vec`,
+		`DROP TABLE IF EXISTS warm_page_vec_suppressed`,
 		`DROP TABLE IF EXISTS warm_page_vec_rows`,
 		`DROP TABLE IF EXISTS warm_page_vec_map`,
 	} {
@@ -524,7 +710,7 @@ func (idx *Index) SearchDense(ctx context.Context, q SearchQuery, vector []float
 	if q.SessionID == "" {
 		return nil, fmt.Errorf("session id is required")
 	}
-	namespace, err := normalizeVectorNamespace(q.EmbeddingNamespace)
+	namespace, err := idx.vectorNamespace(q.EmbeddingNamespace)
 	if err != nil {
 		return nil, err
 	}
@@ -720,6 +906,20 @@ func normalizeVectorNamespace(value string) (string, error) {
 	return value, nil
 }
 
+func (idx *Index) vectorNamespace(value string) (string, error) {
+	if idx == nil {
+		return "", ErrClosed
+	}
+	namespace, err := normalizeVectorNamespace(value)
+	if err != nil {
+		return "", err
+	}
+	if idx.embeddingNamespace != "" && namespace != idx.embeddingNamespace {
+		return "", fmt.Errorf("%w: requested vector namespace does not match configured generation", ErrEmbeddingNamespaceMismatch)
+	}
+	return namespace, nil
+}
+
 func copyCompatibleVectors(ctx context.Context, from *sql.DB, to *Index) (int, error) {
 	rows, err := from.QueryContext(ctx, `
 SELECT m.page_id, m.session_id, m.page_version, m.source_digest,
@@ -741,6 +941,15 @@ ORDER BY m.page_id`)
 		if err := rows.Scan(&pageID, &sessionID, &pageVersion, &sourceDigest, &compilerVersion, &namespace, &encoded); err != nil {
 			return 0, err
 		}
+		if to.embeddingNamespace != "" && namespace != to.embeddingNamespace {
+			// A configured generation has exactly one vector ABI. Foreign rows are
+			// disposable derivative state and must not poison rebuild cutover.
+			continue
+		}
+		namespace, err = to.vectorNamespace(namespace)
+		if err != nil {
+			return 0, err
+		}
 		var currentVersion int64
 		var currentDigest, currentCompiler, status string
 		err := to.db.QueryRowContext(ctx,
@@ -753,7 +962,8 @@ ORDER BY m.page_id`)
 		if err != nil {
 			return 0, err
 		}
-		if currentVersion != pageVersion || currentDigest != sourceDigest || currentCompiler != compilerVersion || status != string(pages.StatusActive) {
+		if pageVersion <= 0 || sourceDigest == "" || compilerVersion == "" ||
+			currentVersion != pageVersion || currentDigest != sourceDigest || currentCompiler != compilerVersion || status != string(pages.StatusActive) {
 			continue
 		}
 		var vector []float64
@@ -762,6 +972,7 @@ ORDER BY m.page_id`)
 		}
 		compatible = append(compatible, VectorRecord{
 			PageID: pages.PageID(pageID), SessionID: sessionID,
+			PageVersion: pages.PageVersion(pageVersion), SourceDigest: pages.SourceDigest(sourceDigest), CompilerVersion: pages.CompilerVersion(compilerVersion),
 			EmbeddingNamespace: namespace, Vector: vector,
 		})
 	}

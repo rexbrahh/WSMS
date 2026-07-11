@@ -60,6 +60,10 @@ var (
 	// vector ABI does not match the configured embedder. The generation is
 	// disposable and must be replaced before it can serve.
 	ErrEmbeddingNamespaceMismatch = errors.New("warm index embedding namespace mismatch")
+	// ErrStalePageTuple reports an asynchronous vector or suppression result
+	// whose expected page tuple no longer matches the current warm page. The
+	// caller should discard the result and rediscover the current backlog.
+	ErrStalePageTuple = errors.New("stale warm page tuple")
 )
 
 const (
@@ -74,6 +78,10 @@ const (
 	EmbeddingStatusSelfCheck = "self-check"
 	// EmbeddingStatusEmbedder means document/query inference failed.
 	EmbeddingStatusEmbedder = "embedder"
+	// EmbeddingStatusAdmissionDenied means a page was permanently excluded from
+	// dense projection by the embedding admission policy. It remains searchable
+	// lexically and becomes eligible again when its page tuple changes.
+	EmbeddingStatusAdmissionDenied = "admission-denied"
 	// EmbeddingStatusVector means returned vector shape or role validation failed.
 	EmbeddingStatusVector = "vector"
 	// EmbeddingStatusIndexer means persisting dense rows failed.
@@ -92,6 +100,7 @@ func ValidEmbeddingStatus(category string) bool {
 		EmbeddingStatusNamespace,
 		EmbeddingStatusSelfCheck,
 		EmbeddingStatusEmbedder,
+		EmbeddingStatusAdmissionDenied,
 		EmbeddingStatusVector,
 		EmbeddingStatusIndexer,
 		EmbeddingStatusSearch,

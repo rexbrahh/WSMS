@@ -528,9 +528,7 @@ func TestCloseRacesWithHealthWatermarkAndDenseSearch(t *testing.T) {
 	if err := idx.ApplyWithWatermark(ctx, []pages.PageMutation{{Op: pages.MutationUpsert, Page: page}}, "s", 1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{{
-		PageID: page.ID, SessionID: "s", Vector: []float64{1, 0},
-	}}); err != nil {
+	if err := idx.UpsertVectors(ctx, []indexer.VectorRecord{denseRecord(page, "", []float64{1, 0})}); err != nil {
 		t.Fatal(err)
 	}
 
