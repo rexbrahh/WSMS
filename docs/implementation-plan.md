@@ -1155,22 +1155,27 @@ Verification/gates:
   interactions. Streaming is verified against live pi (incremental
   `assistantMessageEvent.delta`, `text_delta`-gated; authoritative content
   adopted at `message_end`); timeout/cancellation ride the RPC client context.
-  The `wsms_read_page`/`wsms_recall` tool round-trip seam exists but is not yet
-  exercised end to end through a tool-emitting model; provider-compaction is
-  unspecified.
+  The `wsms_read_page`/`wsms_recall` tool round-trip is verified live end to end,
+  keyless: the offline mock emits a `toolUse` turn, pi dispatches to the bridge,
+  the bridge reads `wsms serve /page`, and the fetched body returns as a
+  `toolResult` that the model echoes — ingested durably while the page read
+  itself writes no ledger event. Remaining: a written provider-compaction
+  contract and explicit timeout/cancellation semantics.
 - [x] Add session/event/state/page inspection and explicit export/delete
   commands. `internal/operator` + `wsms inspect|export|delete|purge`: seven
   read-only views, replay-complete JSONL export, logical delete via
   `memory_invalidated` (L4-retained, cache-honored), and an offline
   confirmation-gated purge that never touches the data dir or shared artifacts.
 
-**Implementation status:** Provider adapters (local + hosted + offline mock) and
-the operator UX are complete and committed; the operator commands ship with an
-end-to-end test suite that asserts the invariants (e.g. deleting a failure
-record drops it from the L1 capsule while the raw L4 state keeps its
-`@invalidated` tombstone). The remaining Phase 9 work is the tool-call
-round-trip verification and a written timeout/cancellation/provider-compaction
-contract.
+**Implementation status:** Provider adapters (local + hosted + offline mock),
+the streamed-text contract, the tool-call round-trip, and the operator UX are
+complete and committed. The operator commands ship with an end-to-end test
+suite that asserts the invariants (e.g. deleting a failure record drops it from
+the L1 capsule while the raw L4 state keeps its `@invalidated` tombstone), and
+the `wsms_read_page` tool round-trip is verified live keyless (mock `toolUse` →
+pi dispatch → bridge → `serve /page` → `toolResult` → durable echo). The only
+remaining Phase 9 work is a written provider-compaction contract plus explicit
+timeout/cancellation semantics — after which Phase 9 is closeable.
 
 ### Phase 10 - Forced-reset benchmark
 
