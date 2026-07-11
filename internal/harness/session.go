@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"wsms/internal/artifacts"
 	"wsms/internal/coherence"
@@ -121,12 +122,18 @@ type MemoryRevalidation struct {
 
 // Session is the composition root for a WSMS session.
 type Session struct {
-	appendMu    sync.Mutex
-	closeOnce   sync.Once
-	closeErr    error
-	closed      bool
-	failStopErr error
-	lastEvent   ledger.Event
+	appendMu          sync.Mutex
+	closeOnce         sync.Once
+	closeErr          error
+	closed            bool
+	failStopErr       error
+	lastEvent         ledger.Event
+	embeddingMu       sync.Mutex
+	embeddingCategory string
+	embeddingErr      error
+	embeddingCancel   context.CancelFunc
+	embeddingDone     chan struct{}
+	embeddingWake     chan struct{}
 	// IndexErr is the last non-fatal warm-index error (indexing never fails L4).
 	IndexErr   error
 	Cfg        config.Config
@@ -143,9 +150,13 @@ type Session struct {
 	// Embedder is the optional Phase 7D dense projection source. It is never
 	// authoritative and never gates L4 appends or direct page faults.
 	Embedder embedder.Embedder
-	// EmbeddingErr is the last non-fatal dense embedding/vector projection
-	// error. Indexing can still be current while dense search is degraded.
-	EmbeddingErr error
+}
+
+// EmbeddingStatus is the synchronized, redacted status for the optional dense
+// projection. Category is one of indexer's EmbeddingStatus* constants.
+type EmbeddingStatus struct {
+	Degraded bool
+	Category string
 }
 
 // OpenSession creates a session under cfg.DataDir.
@@ -200,8 +211,13 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	}
 	// Warm index is disposable and optional. Open failures leave Index nil.
 	// Dense projection is off by default (cfg.DenseDimensions == 0).
+	embeddingNamespace := ""
+	if cfg.Embedder != nil {
+		embeddingNamespace = cfg.Embedder.Namespace().ID
+	}
 	if warm, err := indexer.Open(filepath.Join(cfg.DataDir, "index"), indexer.Options{
-		DenseDimensions: cfg.DenseDimensions,
+		DenseDimensions:    cfg.DenseDimensions,
+		EmbeddingNamespace: embeddingNamespace,
 	}); err == nil {
 		s.Index = warm
 	} else {
@@ -210,6 +226,8 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	if err := s.replay(context.Background()); err != nil {
 		return nil, errors.Join(err, s.Close())
 	}
+	s.startEmbeddingWorker()
+	s.wakeEmbeddingWorker()
 	return s, nil
 }
 
@@ -257,12 +275,21 @@ func (s *Session) replay(ctx context.Context) error {
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.appendMu.Lock()
-		defer s.appendMu.Unlock()
 		s.closed = true
+		cancel := s.embeddingCancel
+		done := s.embeddingDone
+		s.appendMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if done != nil {
+			<-done
+		}
+		s.appendMu.Lock()
+		defer s.appendMu.Unlock()
 		var indexErr error
 		if s.Index != nil {
 			indexErr = s.Index.Close()
-			s.Index = nil
 		}
 		s.closeErr = errors.Join(s.Ledger.Close(), s.Artifacts.Close(), indexErr)
 	})
@@ -381,102 +408,167 @@ func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event
 	if err := s.Index.ApplyWithWatermark(ctx, muts, s.Cfg.SessionID, ev.Seq, maxVersion); err != nil {
 		return err
 	}
-	s.embedIndexMutations(ctx, muts)
+	s.wakeEmbeddingWorker()
 	return nil
 }
 
-func (s *Session) embedIndexMutations(ctx context.Context, muts []pages.PageMutation) {
+const embeddingWorkerMaxBackoff = 250 * time.Millisecond
+
+func (s *Session) startEmbeddingWorker() {
 	if s.Embedder == nil || s.Index == nil {
 		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.embeddingCancel = cancel
+	s.embeddingDone = make(chan struct{})
+	s.embeddingWake = make(chan struct{}, 1)
+	go s.embeddingWorker(ctx)
+}
+
+func (s *Session) wakeEmbeddingWorker() {
+	if s.embeddingWake == nil {
+		return
+	}
+	select {
+	case s.embeddingWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) embeddingWorker(ctx context.Context) {
+	defer close(s.embeddingDone)
+	backoff := 25 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.embeddingWake:
+		}
+		for {
+			processed, category, err := s.embedMissingVectorBatch(ctx)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				s.recordEmbeddingError(category, err)
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				backoff *= 2
+				if backoff > embeddingWorkerMaxBackoff {
+					backoff = embeddingWorkerMaxBackoff
+				}
+				continue
+			}
+			backoff = 25 * time.Millisecond
+			if processed == 0 {
+				s.recordEmbeddingOK()
+				break
+			}
+		}
+	}
+}
+
+func (s *Session) embedMissingVectorBatch(ctx context.Context) (int, string, error) {
+	if s.Embedder == nil || s.Index == nil {
+		return 0, indexer.EmbeddingStatusOK, nil
 	}
 	ns := s.Embedder.Namespace()
 	namespace := ns.ID
 	if err := ns.Validate(); err != nil {
-		s.recordEmbeddingError(namespace, err)
-		return
+		return 0, indexer.EmbeddingStatusNamespace, err
 	}
 	if !s.Index.DenseEnabled() {
-		s.recordEmbeddingError(namespace, indexer.ErrDenseUnavailable)
-		return
+		return 0, indexer.EmbeddingStatusDenseUnavailable, indexer.ErrDenseUnavailable
 	}
 	if dims := s.Index.DenseDimensions(); dims != ns.Profile.Dimensions {
-		s.recordEmbeddingError(namespace, fmt.Errorf("%w: index dimensions %d do not match namespace dimensions %d",
-			embedder.ErrInvalidNamespace, dims, ns.Profile.Dimensions))
-		return
+		return 0, indexer.EmbeddingStatusNamespace, fmt.Errorf("%w: index dimensions %d do not match namespace dimensions %d",
+			embedder.ErrInvalidNamespace, dims, ns.Profile.Dimensions)
 	}
-	type documentPage struct {
-		page pages.WarmPage
-		text string
-	}
-	var docs []documentPage
-	for _, mut := range muts {
-		if mut.Op != pages.MutationUpsert {
-			continue
+	if checker, ok := s.Embedder.(embedder.SelfChecker); ok {
+		if err := checker.SelfCheck(ctx); err != nil {
+			return 0, indexer.EmbeddingStatusSelfCheck, err
 		}
-		page := mut.Page
-		if page.SessionID != s.Cfg.SessionID || page.Status != pages.StatusActive || page.SearchText == "" {
-			continue
-		}
-		docs = append(docs, documentPage{page: page, text: page.SearchText})
-	}
-	if len(docs) == 0 {
-		s.recordEmbeddingOK(namespace)
-		return
 	}
 	batchSize := s.Cfg.EmbeddingBatchSize
 	if batchSize <= 0 {
 		batchSize = embedder.DefaultMaxBatchSize
 	}
-	for start := 0; start < len(docs); start += batchSize {
-		end := start + batchSize
-		if end > len(docs) {
-			end = len(docs)
+	pagesToEmbed, err := s.Index.MissingVectorPages(ctx, s.Cfg.SessionID, namespace, batchSize)
+	if err != nil {
+		category := indexer.EmbeddingStatusIndexer
+		if errors.Is(err, indexer.ErrDenseUnavailable) {
+			category = indexer.EmbeddingStatusDenseUnavailable
 		}
-		chunk := docs[start:end]
-		texts := make([]string, len(chunk))
-		for i, doc := range chunk {
-			texts[i] = doc.text
-		}
-		batch, err := s.Embedder.EmbedDocuments(ctx, texts)
-		if err != nil {
-			s.recordEmbeddingError(namespace, err)
-			return
-		}
-		if err := batch.Validate(ns, len(texts)); err != nil {
-			s.recordEmbeddingError(namespace, err)
-			return
-		}
-		records := make([]indexer.VectorRecord, len(chunk))
-		for i, doc := range chunk {
-			records[i] = indexer.VectorRecord{
-				PageID:             doc.page.ID,
-				SessionID:          doc.page.SessionID,
-				EmbeddingNamespace: namespace,
-				Vector:             embeddingVector64(batch.Embeddings[i].Vector),
-			}
-		}
-		if err := s.Index.UpsertVectors(ctx, records); err != nil {
-			s.recordEmbeddingError(namespace, err)
-			return
+		return 0, category, err
+	}
+	if len(pagesToEmbed) == 0 {
+		return 0, indexer.EmbeddingStatusOK, nil
+	}
+	texts := make([]string, len(pagesToEmbed))
+	for i, page := range pagesToEmbed {
+		texts[i] = embeddingTextForPage(page)
+	}
+	batch, err := s.Embedder.EmbedDocuments(ctx, texts)
+	if err != nil {
+		return 0, indexer.EmbeddingStatusEmbedder, err
+	}
+	if err := batch.Validate(ns, len(texts)); err != nil {
+		return 0, indexer.EmbeddingStatusVector, err
+	}
+	records := make([]indexer.VectorRecord, len(pagesToEmbed))
+	for i, page := range pagesToEmbed {
+		records[i] = indexer.VectorRecord{
+			PageID:             page.ID,
+			SessionID:          page.SessionID,
+			EmbeddingNamespace: namespace,
+			Vector:             embeddingVector64(batch.Embeddings[i].Vector),
 		}
 	}
-	s.recordEmbeddingOK(namespace)
+	if err := s.Index.UpsertVectors(ctx, records); err != nil {
+		return 0, indexer.EmbeddingStatusIndexer, err
+	}
+	return len(pagesToEmbed), indexer.EmbeddingStatusOK, nil
 }
 
-func (s *Session) recordEmbeddingError(namespace string, err error) {
+func (s *Session) recordEmbeddingError(category string, err error) {
 	if err == nil {
 		return
 	}
-	s.EmbeddingErr = err
+	if !indexer.ValidEmbeddingStatus(category) || category == indexer.EmbeddingStatusOK {
+		category = indexer.EmbeddingStatusInternal
+	}
+	s.embeddingMu.Lock()
+	s.embeddingErr = err
+	s.embeddingCategory = category
+	s.embeddingMu.Unlock()
 	if s.Index != nil {
-		s.Index.RecordEmbeddingStatus(compactEmbeddingReason(err))
+		s.Index.RecordEmbeddingStatus(category)
 	}
 }
 
-func (s *Session) recordEmbeddingOK(namespace string) {
-	s.EmbeddingErr = nil
+func (s *Session) recordEmbeddingOK() {
+	s.embeddingMu.Lock()
+	s.embeddingErr = nil
+	s.embeddingCategory = indexer.EmbeddingStatusOK
+	s.embeddingMu.Unlock()
 	if s.Index != nil {
-		s.Index.RecordEmbeddingStatus("")
+		s.Index.RecordEmbeddingStatus(indexer.EmbeddingStatusOK)
+	}
+}
+
+// EmbeddingStatus returns the synchronized non-authoritative dense worker
+// status without exposing raw error text.
+func (s *Session) EmbeddingStatus() EmbeddingStatus {
+	s.embeddingMu.Lock()
+	defer s.embeddingMu.Unlock()
+	return EmbeddingStatus{
+		Degraded: s.embeddingErr != nil,
+		Category: s.embeddingCategory,
 	}
 }
 
@@ -491,26 +583,21 @@ func embeddingVector64(vector []float32) []float64 {
 	return out
 }
 
-func compactEmbeddingReason(err error) string {
-	if err == nil {
-		return ""
+func embeddingTextForPage(page pages.WarmPage) string {
+	if page.Kind != pages.KindFailureEpisode {
+		return page.SearchText
 	}
-	reason := strings.Map(func(r rune) rune {
-		switch r {
-		case '\n', '\r', '\t':
-			return ' '
-		default:
-			if r < 0x20 || r == 0x7f {
-				return -1
-			}
-			return r
-		}
-	}, err.Error())
-	reason = strings.Join(strings.Fields(reason), " ")
-	if len(reason) > 200 {
-		reason = reason[:200]
+	text := page.SearchText
+	start := strings.Index(text, " error=")
+	if start < 0 {
+		return text
 	}
-	return reason
+	suffix := ""
+	rest := text[start+len(" error="):]
+	if next := strings.Index(rest, " file="); next >= 0 {
+		suffix = rest[next:]
+	}
+	return strings.TrimSpace(text[:start] + " error=[redacted]" + suffix)
 }
 
 func (s *Session) repairIndexFromLedger(ctx context.Context) error {
@@ -566,6 +653,24 @@ func (s *Session) repairIndexFromLedger(ctx context.Context) error {
 // Known-ID page faults must continue to use PageFault instead.
 func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Result, error) {
 	s.appendMu.Lock()
+	if err := s.operationErrorLocked(); err != nil {
+		s.appendMu.Unlock()
+		return retrieval.Result{}, err
+	}
+	if s.Index == nil {
+		s.appendMu.Unlock()
+		return retrieval.Result{}, retrieval.ErrIndexUnavailable
+	}
+	if s.lastEvent.ID == "" {
+		s.appendMu.Unlock()
+		return retrieval.Result{}, retrieval.ErrSemanticPageMiss
+	}
+	probeSnap := s.Coherence.Snapshot()
+	s.appendMu.Unlock()
+
+	degraded := s.denseSemanticProbe(ctx, text, probeSnap)
+
+	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 	if err := s.operationErrorLocked(); err != nil {
 		return retrieval.Result{}, err
@@ -577,7 +682,6 @@ func (s *Session) SemanticSearch(ctx context.Context, text string) (retrieval.Re
 		return retrieval.Result{}, retrieval.ErrSemanticPageMiss
 	}
 	snap := s.Coherence.Snapshot()
-	degraded := s.denseSemanticProbe(ctx, text, snap)
 	change := pages.LedgerChange{
 		Event: s.lastEvent, State: s.State.Clone(), Events: s.Ledger, Artifacts: s.Artifacts,
 		Coherence: s.Coherence, RepoID: snap.Current.Repo, TaskID: snap.Current.TaskID,
@@ -626,22 +730,22 @@ func (s *Session) denseSemanticProbe(ctx context.Context, text string, snap cohe
 	ns := s.Embedder.Namespace()
 	namespace := ns.ID
 	if err := ns.Validate(); err != nil {
-		s.recordEmbeddingError(namespace, err)
+		s.recordEmbeddingError(indexer.EmbeddingStatusNamespace, err)
 		return []string{"dense=namespace"}
 	}
 	if dims := s.Index.DenseDimensions(); dims != ns.Profile.Dimensions {
 		err := fmt.Errorf("%w: index dimensions %d do not match namespace dimensions %d",
 			embedder.ErrInvalidNamespace, dims, ns.Profile.Dimensions)
-		s.recordEmbeddingError(namespace, err)
+		s.recordEmbeddingError(indexer.EmbeddingStatusNamespace, err)
 		return []string{"dense=namespace"}
 	}
 	query, err := s.Embedder.EmbedQuery(ctx, text)
 	if err != nil {
-		s.recordEmbeddingError(namespace, err)
+		s.recordEmbeddingError(indexer.EmbeddingStatusEmbedder, err)
 		return []string{"dense=embedder"}
 	}
 	if err := query.Validate(ns, embedder.RoleQuery); err != nil {
-		s.recordEmbeddingError(namespace, err)
+		s.recordEmbeddingError(indexer.EmbeddingStatusVector, err)
 		return []string{"dense=query-vector"}
 	}
 	// Phase 7D keeps semantic resolution FTS-first. The dense probe verifies the
@@ -657,7 +761,7 @@ func (s *Session) denseSemanticProbe(ctx context.Context, text string, snap cohe
 		Limit:              3,
 		ActiveOnly:         true,
 	}, embeddingVector64(query.Vector)); err != nil {
-		s.recordEmbeddingError(namespace, err)
+		s.recordEmbeddingError(indexer.EmbeddingStatusSearch, err)
 		return []string{"dense=search"}
 	}
 	return nil
