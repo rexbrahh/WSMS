@@ -387,24 +387,59 @@ Acceptance:
 
 The runtime must support semantic faults when a caller knows the information
 need but not a stable address. Candidate generation combines FTS5 lexical/BM25
-search with dense cosine search inside one embedding namespace, followed by
-deterministic fusion, policy reranking, diversity control, and abstention.
+search with dense cosine search inside one embedding namespace. The channels
+run concurrently over the same bounded, pre-limit eligibility filters, followed
+by deterministic fusion, policy reranking, diversity control, and abstention.
 
 Acceptance:
 
 - Requests containing stable IDs bypass vector/lexical search and use the
   direct resolver.
-- Session/ACL, repo, task/branch compatibility, validity, trust, page kind, and
-  scope epoch are applied as hard gates before scoring and rechecked before
-  materialization.
+- Each semantic attempt captures every active page's descriptor without search
+  text or summary. Current coherence checks its scope/branch/commit/path and
+  transitive WSL/event references before admitting an exact tuple to the
+  complete allowlist.
+- Active scope/authority/path/ref/kind/trust metadata must pass the shared page
+  authority-descriptor validator before coherence filtering. Refs and paths use
+  strict JSON decoding that rejects unknown fields and trailing values. Any
+  malformed covered field is typed operational index corruption, not an
+  ineligible-page suppression or semantic miss.
+- The allowlist tuple is `(session, page ID, page version, source digest,
+  compiler version, scope epoch)`. Both FTS5 and sqlite-vec join the complete
+  tuple before their respective `LIMIT`/KNN selection; they never rely on
+  post-limit over-fetch for authority.
+- Session/ACL, repo, task/branch compatibility, validity, trust, page kind,
+  path hints, exclusions, and the bounded set of current scope epochs remain
+  hard filters. The flat epoch set is only a coarse defense: exact descriptor
+  eligibility closes path-epoch aliasing and transitively invalidated-ref
+  starvation.
+- Each channel result carries that exact tuple, serving generation, and source
+  plus page watermark. A mixed tuple or projection snapshot is suppressed or
+  treated as an operational degradation, never fused as one logical page.
 - Search returns bounded page references and explanations, not authoritative
   prose.
 - Selected candidates are materialized from current L4 refs through the normal
-  validation and budget path.
+  validation path under cumulative page/ref/attempt/byte/token budgets. Search
+  text, summaries, and derivative refs do not escape as evidence.
 - No qualifying result returns `SEMANTIC_PAGE_MISS`; operational index failure
-  is distinguishable from a semantic miss.
+  is distinguishable from a semantic miss. `IndexErr`, coherence revision,
+  source sequence, serving generation, and source/page watermark are checked
+  around both authority-snapshot construction and resolution.
+- A complete empty allowlist is a valid empty universe and may produce
+  `SEMANTIC_PAGE_MISS`. An unavailable/incomplete snapshot, more than
+  `indexer.MaxAuthoritySnapshotPages` (4,096) active descriptors, or more than
+  4 MiB of descriptor or encoded-eligibility payload fails operationally. The
+  runtime must not truncate, paginate, or fall back to unfiltered search.
 - Embedder failure visibly degrades to lexical search without blocking event
-  persistence or known-ID faults.
+  persistence or known-ID faults. If a healthy channel still yields a selected
+  page, the hit may be returned with a categorical degradation; if an
+  operationally failed requested channel leaves no surviving page, the result
+  is an operational error rather than a semantic miss. A deliberately
+  dense-disabled, otherwise healthy lexical-only search may return a normal
+  miss.
+- The checked-in RRF/rerank/diversity/threshold profile is named, bounded, and
+  inspectable but explicitly provisional until real-model and held-out
+  calibration gates pass.
 
 ### FR-017 - Rebuildable L3 backend (MUST after the demo)
 
@@ -429,6 +464,14 @@ Acceptance:
 - A vector is either absent or bound by compare-and-swap to the exact active
   page version, source digest, compiler version, session, and configured
   embedding namespace. A stale inference result never acquires a newer tuple.
+- Stored and query vectors share one canonical ABI: finite, correct-dimension,
+  unit-length directions whose components are exactly float32-representable.
+  Dense shadow writes and sqlite-vec MATCH queries use that same
+  canonicalization; oracle parity fixtures compare the equivalent direction.
+- The sqlite-vec adapter computes its rowid-IN set only from rows whose complete
+  exact tuple appears in the current allowlist, in addition to the ordinary
+  status/scope/trust/repo/task/branch/commit/path/exclusion filters. FTS5 uses
+  the same exact tuple join before its limit.
 - A rebuild is validated before atomic generation cutover and can be
   interrupted without corrupting the serving generation.
 - Within the single-process MVP, all handles for one physical index directory
@@ -436,6 +479,10 @@ Acceptance:
   multi-process writers requires a filesystem-wide operation lock.
 - The optional ANN backend passes the same filter, explanation, abstention, and
   materialization contract as the embedded backend.
+- PageID orders equal-distance rows deterministically only within the bounded
+  set returned by sqlite-vec. If more than `k` eligible rows tie at the KNN
+  boundary, set membership is backend-defined; WSMS must not claim a stable
+  boundary member without an additional bounded tie-completion mechanism.
 
 ### FR-018 - Embedding profile and privacy (MUST after the demo)
 
@@ -463,6 +510,10 @@ Acceptance:
   component.
 - A hosted provider requires explicit configuration, bounded/redacted payloads,
   deadlines, cost/error telemetry, and a separate namespace.
+- The in-repo profile and protocol do not prove a real Qwen deployment. Exact
+  model/tokenizer revision, normalized-vector parity, latency, cancellation,
+  throughput, and memory must be verified with downloaded weights before that
+  profile is operationally enabled.
 
 ### FR-019 - Working-set admission and readahead (SHOULD after hybrid faults)
 
@@ -481,6 +532,14 @@ Acceptance:
   benefit without material negative transfer.
 - All policy weights, thresholds, and caps are named, versioned, and included
   in retrieval explanations.
+
+Implementation status at the Phase 7E boundary: explicit semantic faults,
+complete descriptor-derived exact tuple authority before both channel limits,
+parallel filtered candidate generation, canonical dense search, RRF,
+provisional deterministic reranking/diversity/abstention, exact L4
+materialization, and operational-versus-miss handling are implemented. L2
+hot/cold/ghost residency, prefetch, real-Qwen execution, held-out calibration,
+and automatic L1 admission are not implemented or claimed.
 
 ## 9. Non-functional requirements
 
@@ -538,6 +597,10 @@ deterministic state application.
 - Page-fault output must respect its approximate token budget.
 - L3 search must bound lexical/dense candidates, materialized pages, bytes, and
   tokens independently.
+- A local semantic authority snapshot supports at most
+  `indexer.MaxAuthoritySnapshotPages` (4,096) active pages and 4 MiB for the
+  descriptor/encoded-eligibility payload. Exceeding either is a visible local
+  capability/SLO failure, never permission to truncate or weaken filters.
 - The initial post-embedding retrieval target is p95 below 75 ms on supported
   local machines; the complete local semantic-fault target is p95 below 350 ms.
   These are acceptance targets to measure, not current performance claims.
@@ -621,9 +684,11 @@ Fault kinds are `page`, `raw_log`, and `file_slice`. A successful response is
 bounded plain text. A miss is exactly `PAGE_MISS`.
 
 The post-demo semantic fault ABI accepts a typed query intent and returns either
-bounded ranked page references with explanations, `SEMANTIC_PAGE_MISS`, or an
-operational error. It then uses the existing direct fault/materialization path;
-it does not define a second evidence ABI.
+bounded ranked page references plus exact materialized evidence and safe
+explanations, `SEMANTIC_PAGE_MISS`, or an operational error. It uses the
+existing direct fault/materialization path and cumulative budgets; it does not
+define a second evidence ABI or mutate L1. Stable IDs continue to use the
+direct fault ABI without lexical or vector search.
 
 ### 10.6 L3 index ABI
 

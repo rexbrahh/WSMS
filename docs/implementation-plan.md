@@ -2,7 +2,7 @@
 
 **Status:** Active plan  
 **Date:** 2026-07-10  
-**Target:** Verified local vertical-slice demo, followed by staged productization
+**Target:** Verified local vertical-slice demo plus independently gated productization through Phase 7E
 
 ## 1. Definition of done for this plan slice
 
@@ -29,9 +29,21 @@ This immediate plan slice is done when the repository contains:
 11. Focused tests plus repository-wide test, race, vet, build, and live demo
    verification.
 12. README/demo instructions that match the verified command.
+13. A disposable Phase 7E semantic-fault mechanism that can combine bounded
+    lexical and dense candidate ranks without making either channel evidence.
+14. A complete per-attempt exact page-tuple allowlist—derived from active page
+    descriptors plus current path/transitive-ref coherence—runs before both
+    channel limits and is rechecked against exact L4 before return.
+15. Operational index/query failures remain distinct from a valid semantic
+    miss, including freshness races around resolution.
+16. Every selected semantic candidate is exact-materialized under cumulative
+    budgets without changing L1 or claiming Phase 7F residency.
 
-It does **not** require a production chat UI, real provider credentials, async
-workers, an L3 index, or comparative benchmark results.
+The original demo milestone did **not** require an L3 index. This extended plan
+slice now includes the Phase 7A-7E in-repo mechanisms, while still not requiring
+a production chat UI, real provider credentials, a real Qwen weight/process
+run, comparative benchmark results, calibrated retrieval quality, or automatic
+prefetch/L1 admission.
 
 It also does not claim the entire product specification is implemented. In
 particular, authorized model-facing file slices, branch/file coherence, ranked
@@ -110,25 +122,32 @@ parallel abstractions.
 | Existing end-to-end test | event -> capsule -> page fault | `internal/harness/session_test.go:13` |
 | Artifact offload | threshold, `Store.Put`, preview, raw ref | `internal/harness/session.go:84-93` |
 | WSL fixture | T42/C7/F18/A4/next | `testdata/sample_session.wsl` and `docs/wsl/v0.md:54-81` |
+| Explicit semantic fault | `(*Session).SemanticSearch(ctx, text)` | `internal/harness/session.go` |
+| Hybrid retrieval | `(*retrieval.HybridRetriever).ResolveSemantic(ctx, intent)` | `internal/retrieval/hybrid.go` |
+| Filtered lexical/dense search | `(*indexer.Index).SearchLexical/SearchDense` | `internal/indexer/search.go`, `dense.go` |
 
 ### APIs that do not exist and must not be assumed
 
-- No async queue runner exists; `scheduler/queues.go` only names queues.
+- No general async observer queue runner exists; the Phase 7D dense writeback
+  worker is a narrower supervised lifecycle owned by the harness.
 - No production provider adapter exists; only `harness.Client` and
   `NoopClient` exist.
-- No L3 index or retrieval engine exists.
+- No Qdrant adapter or production ANN service exists.
+- No Phase 7F hot/cold/ghost residency controller or semantic prefetch worker
+  exists.
+- No bundled real-Qwen serving process or model weights exist.
 - No durable WSL snapshot loader exists.
-- No branch/file invalidation observer behavior exists.
 - No forced-reset benchmark API exists.
 - No WSL override syntax exists.
 
-### Target APIs that intentionally do not exist yet
+### Implemented L3 boundaries and remaining target APIs
 
-The post-demo L3 phases introduce, in order, `PageCompiler`, `WarmIndex`,
-`Embedder`, `Retriever`, and `PageMaterializer` boundaries from
-`docs/l3-warm-memory.md`. Do not add backend-specific vector clients to
-`scheduler`, `faults`, `harness`, or `wsl`, and do not implement these APIs as
-part of the first demo.
+Phases 7A-7E now provide the page compiler, disposable index, embedding,
+retrieval, and exact materialization boundaries described in
+`docs/l3-warm-memory.md`. Backend-specific vector clients remain isolated from
+`scheduler`, `faults`, and `wsl`. Phase 7F may add L2 residency/prefetch policy
+behind `internal/memory`; Phase 7G may add Qdrant behind the existing index
+boundary only after its measurement gate.
 
 ## 4. Phase 1 - Durable identity and replay
 
@@ -715,7 +734,8 @@ advisory operation lock; `rebuild.lock` alone serializes only rebuild owners.
 **Status:** implemented and verified on the development platform (darwin,
 pure-Go `modernc.org/sqlite` + `modernc.org/sqlite/vec`). Dense remains
 **opt-in** (`DenseDimensions > 0`); default open keeps `SearchDense`
-unavailable. No real embedder yet (7D).
+unavailable. Phase 7D supplies the optional embedding boundary and Phase 7E
+consumes dense ranks.
 
 **Objective:** prove the preferred embedded dense backend against the pinned Go
 and platform matrix before product code depends on it.
@@ -727,16 +747,20 @@ Implementation:
 2. Optional dense projection on disposable `warm.db`: `warm_pages_vec` (cosine
    `vec0` with `session_id` and `embedding_namespace` partition keys) and a
    version-bound `warm_page_vec_map` rowid map.
-3. `UpsertVectors` / `DeleteVector` / invalidate hook; `SearchDense` with
-   namespace-constrained KNN plus status/repo/task/branch/commit/kind/trust
-   filters. Each vector is bound to page version, source digest, compiler
-   version, session, and embedding namespace.
+3. `UpsertVectors` / `DeleteVector` / invalidate hook; `SearchDense` builds a
+   namespace-constrained eligible rowid set with status/repo/task/branch/commit,
+   kind/trust, current scope epoch, path, and page/ref-exclusion filters before
+   sqlite-vec KNN. Each vector is bound to page version, source digest,
+   compiler version, session, and embedding namespace.
 4. Exact-oracle parity tests against `pages.ExactCosineSearchContext` on
    well-separated unit vectors (top-k ID order + distance ≈ 1 − similarity).
 5. Config `DenseDimensions` (default 0); harness passes option through.
 6. Restart restores dense dims from `index_meta`; legacy session-only vec0
    layouts are discarded/rebuilt, and rebuild copies only tuple-compatible
    vectors into the new generation.
+7. Stored/query vectors are canonical finite unit directions with exactly
+   float32-representable components. The shadow, write path, and sqlite-vec
+   MATCH path share this ABI; oracle fixtures compare equivalent directions.
 
 Verification/gates:
 
@@ -747,7 +771,17 @@ Verification/gates:
       starve a valid namespace hit.
 - [x] Page updates drop stale vectors; rebuild preserves only compatible vectors.
 - [x] Oracle parity on synthetic fixtures.
+- [x] Pre-limit scope/path/exclusion filtering prevents ineligible chaff from
+      consuming bounded KNN slots.
+- [x] Extreme finite inputs canonicalize without overflow/underflow and use the
+      same float32-safe direction across backends.
 - [x] Pre-1.0 churn isolated to indexer; no ledger/WSL format changes.
+
+Known limitation: vec0 selects at most `k` rows before Go applies PageID tie
+ordering. Equal-distance order is stable inside the returned set, but when more
+than `k` eligible rows tie at the boundary, boundary membership is
+backend-defined. sqlite-vec v0.1.9 also uses a brute-force KNN path; target-scale
+CPU, memory, latency, and concurrency measurements remain open.
 
 Stop conditions (not hit on verified platform):
 
@@ -760,10 +794,10 @@ Stop conditions (not hit on verified platform):
 
 **Status:** in-repo runtime boundary implemented and verified with deterministic
 backends and an adversarial test sidecar. The embedder remains optional,
-local-first, and non-authoritative; dense retrieval is shadow-only and semantic
-resolution remains FTS-first until Phase 7E. A real Qwen process, downloaded
-weights, and an exact-revision latency/resource run have not been executed in
-this repo and remain an operational gate rather than an implied code result.
+local-first, and non-authoritative. Phase 7E can consume its dense query ranks,
+but a real Qwen process, downloaded weights, and an exact-revision
+latency/resource run have not been executed in this repo and remain an
+operational gate rather than an implied code result.
 
 **Objective:** add reproducible private query/document embeddings without
 placing inference in the truth path.
@@ -820,31 +854,115 @@ Verification/gates:
 
 #### Phase 7E - Hybrid semantic faults
 
+**Status:** mechanism implemented and verified with deterministic vectors,
+synthetic/local test embedders, adversarial index fixtures, and exact L4
+materialization. The checked-in policy is provisional; real-Qwen execution,
+held-out quality calibration, production resource measurement, and automatic
+residency/admission remain open gates.
+
 **Objective:** combine exact lexical and conceptual retrieval while keeping
 approximation outside the evidence boundary.
 
 Implementation:
 
-1. Run bounded FTS and dense candidate generation over the same authoritative
-   eligibility universe.
-2. Fuse ranks with versioned reciprocal rank fusion, then apply named policy
-   features for task/branch/path affinity, trust, verification, salience,
-   recency/frequency, invalidation risk, and negative-transfer history.
-3. Apply deterministic diversity/per-kind caps and a calibrated abstention
-   threshold; normally materialize only 1-3 refs.
-4. Expose an explicit semantic-fault tool first. Known identifiers bypass L3.
-5. Log an inspectable explanation: filters, per-channel ranks, fusion/policy
-   features, suppression reasons, selected refs, index generation, and timing.
+1. [x] Prepare the optional query embedding outside the append lock, then run
+   bounded FTS and dense candidate generation concurrently over one
+   `SearchQuery` eligibility universe.
+2. [x] Capture every active page's descriptor for the session in one index read
+   snapshot without search text/summary. The descriptor contains its exact
+   tuple, logical WSL/event ref IDs, scope, branch, commit, and path scope. Use
+   strict JSON for refs/paths and the shared `pages.ValidateAuthorityDescriptor`
+   contract for scope, repo/task authority, branch/commit, paths, refs, and
+   kind/trust compatibility; malformed covered metadata is typed corruption.
+3. [x] Evaluate every descriptor with current path-associated coherence and
+   transitive-ref eligibility. Seal the survivors as a complete allowlist of
+   `(session, page ID, version, source digest, compiler, scope epoch)` tuples.
+4. [x] Join that allowlist before FTS `LIMIT` and inside sqlite-vec's rowid-IN
+   eligibility subquery before KNN. Session/status/trust/repo/task/branch/
+   commit/kind/coarse-epoch/path/exclusion filters remain additional gates.
+5. [x] Treat the coarse flat epoch set only as defense in depth; exact tuple
+   authority prevents cross-path epoch aliases and transitively invalidated
+   active rows from starving bounded search.
+6. [x] Require the exact page tuple, serving generation, and source/page
+   watermark metadata from each channel; suppress cross-channel tuple
+   disagreement and degrade/fail on projection snapshot disagreement.
+7. [x] Bound authority snapshots at `indexer.MaxAuthoritySnapshotPages` (4,096)
+   active pages and 4 MiB of descriptor/encoded-eligibility payload. A complete
+   empty allowlist is valid; unavailable or over-bound state is operational and
+   never truncates or falls back to unfiltered search.
+8. [x] Fuse ranks with `rrf/v1` (`k = 60`) and stable PageID order within each
+   returned channel set. Do not compare raw BM25 and cosine values.
+9. [x] Apply the named `working-set/v1-provisional` policy: repo/task/branch/
+   commit/path affinity, trust, salience, verification, last-failure overlap,
+   per-kind/per-source caps, token-Jaccard near-duplicate suppression, maximum
+   dense distance, and minimum final score.
+10. [x] Recheck current coherence and exact refs serially, continue after
+   suppressible candidates, and enforce cumulative attempt/page/ref/byte/token
+   budgets while selecting no more than three pages (and only bounded refs from
+   each page).
+11. [x] Return a bounded, text-free trace containing filters, channel positions,
+   RRF/policy contributions, categorical degradation/suppression/abstention,
+   selected page IDs, and token use. Candidate metadata retains generation and
+   watermark for freshness validation; latency telemetry remains future work.
+12. [x] Keep `Session.SemanticSearch` explicit and reference-first. Known IDs
+   continue through `PageFault`; semantic results do not mutate L1 or establish
+   Phase 7F L2 residency.
 
 Verification/gates:
 
-- Compare no-L3, FTS-only, dense-only, and hybrid variants on a held-out corpus.
-- Hybrid must improve exact-reference retrieval over FTS-only without material
-  wrong-scope/stale revival or negative transfer.
-- Search results never reach the model until current L4 materialization passes.
-- Operational index errors remain distinct from `SEMANTIC_PAGE_MISS`.
+- [x] Fake and real-index tests prove the complete exact tuple allowlist reaches
+      both channels before FTS top-k and dense KNN.
+- [x] Descriptor snapshots omit derivative prose, expose only logical WSL/event
+      refs for coherence, and reject cancellation, malformed tuples, concurrent
+      tuple updates, and over-4,096 page tables without returning a partial
+      allowlist. Both descriptor capture and eligibility encoding also enforce
+      the documented 4-MiB bound in their implementation paths.
+- [x] Strict-JSON and shared descriptor-validation fixtures cover malformed
+      scope/authority/path/ref metadata, unknown/trailing JSON, and invalid
+      kind/trust pairings. High-ranked malformed chaff that fills the legacy
+      top-k produces typed operational corruption and no partial authority or
+      exact evidence, never `SEMANTIC_PAGE_MISS`.
+- [x] A complete-empty allowlist produces a genuine semantic miss; incomplete,
+      unavailable, or over-bound authority produces `ErrIndexUnavailable`.
+- [x] Security-revoked transitive refs and stale pages with a colliding current
+      path epoch are removed before either channel can spend its candidate
+      budget; the still-current page remains discoverable.
+- [x] Tuple/snapshot races, stale/ineligible chaff, exclusions, cancellation,
+      and cross-session/scope cases fail closed.
+- [x] RRF, provisional policy contributions, deterministic diversity, dense
+      distance, minimum-score abstention, and within-result PageID ties have
+      exhaustive deterministic tests.
+- [x] Search results expose no derivative prose/refs and are returned only
+      after current L4 validation and exact cumulative-budget materialization.
+- [x] Dense/query failure with a lexical survivor returns a categorical
+      degraded hit; operational channel failure with no survivor returns
+      `ErrIndexUnavailable`, not `SEMANTIC_PAGE_MISS`.
+- [x] `IndexErr`, coherence revision, source sequence, health/generation, and
+      source/page watermark are checked around snapshot construction and again
+      after resolution, including otherwise valid hits. Coherence change
+      receives one bounded retry and then a typed scope abstention.
+- [x] Query inference does not hold the append lock; cancellation and concurrent
+      close are bounded. The vector-free demo and direct-ID path remain
+      unchanged.
+- [ ] Run the real pinned Qwen model/tokenizer through the WSMS bridge and
+      measure normalized-vector parity, cold start, CPU/GPU memory, throughput,
+      cancellation, and query latency.
+- [ ] Compare no-L3, FTS-only, dense-only, and hybrid variants on a held-out
+      corpus; calibrate thresholds/weights on training data only.
+- [ ] Hybrid must improve exact-reference retrieval over FTS-only without
+      material wrong-scope/stale revival or negative transfer before any
+      quality or enablement claim.
+- [ ] Measure vec0 v0.1.9 brute-force CPU/memory/latency/concurrency at the
+      target corpus and document the equal-distance top-k boundary limitation.
 
 #### Phase 7F - Unix-style L2 residency and shadow prefetch
+
+**Entry gate:** Phase 7E remains explicit-fault-only with a frozen provisional
+profile and clean correctness/race/demo verification. Phase 7F may first add
+bounded hot/cold/ghost mechanics and shadow accounting without claiming useful
+prefetch. Promotion from shadow observation to L2-only prefetch requires a real
+embedding run plus held-out usefulness/negative-transfer evidence; automatic
+L1 admission remains blocked until Phase 10.
 
 **Objective:** turn retrieval into measured working-set estimation without
 making similarity an eviction or pinning policy.
@@ -937,6 +1055,7 @@ Verification/gates:
 | Replay IDs drift | Observer changes alter refs | Version observers; persist stable derivation identity before evolving algorithms |
 | Poisoned memory | Tool text becomes authority | Trusted-source rules, quoting, provenance, deterministic validation |
 | Cross-scope leakage | Wrong branch/session state appears | Composite IDs, scoped lookups, scope gate before ranking |
+| Incomplete authority starves valid pages | Invalid active rows consume every top-k slot | Complete descriptor-derived exact tuple allowlist before FTS/KNN; over-bound snapshots fail operationally |
 | Async nondeterminism | Live and replay state differ | Ordered commit, watermarks, equivalence tests before enabling workers |
 | Evidence corruption hidden as miss | `PAGE_MISS` on I/O failure | Separate absence from operational error |
 | Demo overclaims research | “outperforms” without benchmark | Mechanism-proof wording and acceptance contract |

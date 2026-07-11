@@ -29,20 +29,52 @@ Python must never own ledger truth, WSL authority, or capsule rendering.
 
 The L3 design uses vector retrieval as a disposable working-set estimator, not
 as the source of truth: known IDs always page directly from exact evidence;
-the Phase 7E target uses lexical and dense channels only to discover candidate
-page refs, then rejoins the same validated L4-to-L2 page-in path. The first demo
-remains a deterministic vector-free proof of the paging mechanism. Phase 7A
-adds an offline deterministic page compiler and exact cosine oracle. Phase 7B
-adds a disposable FTS5 warm index under `<data-dir>/index/` (safe to delete).
-Phase 7C adds an optional sqlite-vec dense projection (config
-`DenseDimensions`; off by default), with session + embedding namespace as
-pre-KNN partition keys. Phase 7D adds the supervised private embedder ABI,
-Qwen3-compatible local profile, fail-closed loopback/Unix-socket sidecar client,
-and asynchronous tuple-validated vector backfill. Dense search is still a
-shadow probe in Phase 7D: lexical retrieval selects candidates, and every
-returned page is revalidated and faulted through current L4 evidence. The repo
-does not bundle or claim a running Qwen service; the model-serving integration
-gate remains explicit. The demo path requires neither an index nor embeddings.
+Phase 7E uses lexical and dense channels only to discover candidate page refs,
+then rejoins the validated L4 materialization path. The first demo remains a
+deterministic vector-free proof of the paging mechanism. Phase 7A adds the
+deterministic page compiler and exact cosine oracle; Phase 7B adds a disposable
+FTS5 warm index under `<data-dir>/index/`; Phase 7C adds the optional
+sqlite-vec dense projection (`DenseDimensions`, off by default); and Phase 7D
+adds the supervised private embedder ABI plus asynchronous tuple-validated
+vector backfill.
+
+The implemented Phase 7E semantic-fault path prepares a query vector outside
+the append lock and builds a complete per-attempt authority snapshot before
+ranking. The index exposes descriptor-only active pages; current coherence then
+checks each page's path-associated scope and transitive WSL/event refs. The
+resulting allowlist contains exact `(session, page ID, version, source digest,
+compiler, scope epoch)` tuples and is joined before both the FTS5 limit and
+sqlite-vec KNN. The flat current-epoch set remains a coarse filter; the tuple
+allowlist prevents a colliding path epoch or invalidated dependency from
+starving the bounded candidate set.
+
+Active descriptor metadata is validated with the same
+`pages.ValidateAuthorityDescriptor` contract used at page admission, including
+scope/authority/path/ref structure and kind/trust compatibility. Refs and paths
+use strict JSON decoding. Malformed covered metadata is typed operational index
+corruption before allowlisting—never suppression or a semantic miss; regression
+tests include malformed high-ranked chaff that would otherwise fill top-k.
+
+Snapshot capture is complete or it fails operationally. A complete empty
+allowlist is a genuine semantic miss, while an unavailable snapshot, more than
+`indexer.MaxAuthoritySnapshotPages` (4,096) active pages, or more than 4 MiB of
+descriptor/eligibility payload returns an operational error—never truncation or
+an unfiltered fallback. Generation, source/page watermark, coherence revision,
+source sequence, and `IndexErr` checks surround snapshot construction and
+resolution. Within that exact universe, FTS5 and dense search run in parallel;
+canonical unit-float32 vectors feed sqlite-vec's rowid-IN KNN, and versioned RRF
+plus a named **provisional** policy applies deterministic affinity, trust,
+salience, verification, failure-overlap, diversity, distance, and minimum-score
+rules. Selected refs are materialized from exact L4 under cumulative budgets
+without injecting L1. Dense-disabled lexical-only mode may return a normal miss;
+a requested operational channel failure with no survivor remains an error.
+
+The mechanism is covered with deterministic synthetic embedders and local test
+sidecars. The repo still does not bundle or claim execution of real Qwen model
+weights, calibrated retrieval quality, measured sqlite-vec production resource
+limits, L2 prefetch, or automatic L1 admission. Those gates remain open for the
+real-model/evaluation work and Phase 7F. The demo path requires neither an index
+nor embeddings.
 
 ## Layout
 
