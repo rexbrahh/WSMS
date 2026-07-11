@@ -13,10 +13,29 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// unixSocketDir returns a base directory short enough to hold a Unix domain
+// socket. macOS caps sockaddr_un.sun_path at 104 bytes, and t.TempDir() lives
+// under a long $TMPDIR (/var/folders/...) that overflows it, so fall back to a
+// short /tmp-rooted directory there. Linux's shorter t.TempDir() is fine.
+func unixSocketDir(t *testing.T) string {
+	t.Helper()
+	base := ""
+	if runtime.GOOS == "darwin" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "wsms-sock")
+	if err != nil {
+		t.Fatalf("socket dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
 func TestLocalClientHTTPBatchQueryAndHealth(t *testing.T) {
 	ns := MustNamespace(testProfile())
@@ -67,7 +86,7 @@ func TestLocalClientUnixSocketQuery(t *testing.T) {
 	ns := MustNamespace(testProfile())
 	var seen []localEmbedRequest
 	handler := newLocalSidecarHandler(t, ns, &seen, nil, nil)
-	socket := filepath.Join(t.TempDir(), "embedder.sock")
+	socket := filepath.Join(unixSocketDir(t), "embedder.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)
@@ -122,7 +141,7 @@ func TestLocalClientUnixSocketRejectsRedirect(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	socket := filepath.Join(t.TempDir(), "redirect.sock")
+	socket := filepath.Join(unixSocketDir(t), "redirect.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)
