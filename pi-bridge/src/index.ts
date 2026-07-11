@@ -78,8 +78,8 @@ export default function (pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			id: Type.String({ description: "The WSMS page ID to fetch" }),
 		}),
-		async execute(_toolCallId, params) {
-			const res = await client.readPage(params.id);
+		async execute(_toolCallId, params, signal) {
+			const res = await client.readPage(params.id, signal);
 			const text = res.found ? (res.body ?? "") : `No page found for ${params.id}: ${res.detail ?? "unknown"}`;
 			return { content: [{ type: "text", text }], details: res };
 		},
@@ -94,8 +94,8 @@ export default function (pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			query: Type.String({ description: "What to recall from durable memory" }),
 		}),
-		async execute(_toolCallId, params) {
-			const res = await client.semantic(params.query);
+		async execute(_toolCallId, params, signal) {
+			const res = await client.semantic(params.query, signal);
 			if (res.abstained) {
 				return {
 					content: [{ type: "text", text: `No durable memory found (${res.reason ?? "abstained"}).` }],

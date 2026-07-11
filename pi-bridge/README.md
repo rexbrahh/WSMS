@@ -61,6 +61,52 @@ real model's, which is how the TUI's event extraction was verified against live
 pi output (`internal/tui`: incremental text is read from
 `assistantMessageEvent.delta`, gated on `type == "text_delta"`).
 
+## Interaction contract
+
+How the bridge behaves under pi's runtime seams. Grounded in pi's actual
+implementation (packages `agent`, `ai`, `coding-agent`), not assumed.
+
+**Streaming.** Incremental assistant text is the provider's
+`assistantMessageEvent.delta`, gated on `type == "text_delta"`; the authoritative
+final text is adopted at `message_end`. Tool calls stream as
+`toolcall_start → toolcall_delta* → toolcall_end` with a terminal `stopReason`
+of `toolUse`. The bridge ingests only finalized `message_end` user/assistant
+text (skipping empty, i.e. tool-call-only, turns) — never partial deltas — so a
+retried or aborted stream never writes partial evidence to L4.
+
+**Cancellation.** pi threads the run's `AbortSignal` into both the provider
+stream and each tool's `execute(id, params, signal)`. The `wsms_read_page` /
+`wsms_recall` tools forward that signal into the core HTTP request, so a user
+abort cancels an in-flight page/recall fetch. An aborted turn ends with
+`stopReason: "aborted"` and is treated as no durable evidence. Every core call
+is wrapped in `safe()`: a cancelled or failed call degrades the handler to a
+no-op and never propagates into pi's failure path.
+
+**Timeout.** pi imposes no wall-clock deadline on a model call or a tool
+execution — only cancellation. The bridge adds its own bound: each core request
+aborts on whichever fires first, the run signal or a 5 s per-request timeout, so
+a hung or missing core can never stall the agent loop. Ingestion timing out is
+silently dropped (best-effort); a page/recall timing out surfaces to the model
+as a normal tool error, and the model may retry or proceed.
+
+**Provider-compaction.** pi compacts its own conversation history
+(summarize-then-drop) between runs when it nears the context window. This never
+threatens WSMS memory, by construction:
+
+- The capsule is injected through the ephemeral `context` hook — recomputed
+  fresh every turn from the live ledger, never written back into pi's transcript,
+  so it is never itself compacted or summarized away.
+- The durable L4 ledger is the real memory and is built incrementally from
+  `message_end` / `tool_result` as the turn happens — *before* any compaction —
+  so whatever compaction later drops is already recorded exactly.
+- Any verbatim detail compaction discards remains page-faultable via
+  `wsms_read_page` / `wsms_recall`.
+
+Net: pi's compaction summary is a pi-internal context-management artifact with no
+authority here; WSMS treats only real user/assistant/tool events as evidence, and
+the capsule plus page-fault recover anything compaction removes. WSMS makes pi's
+lossy compaction non-destructive.
+
 ## Configuration (env only)
 
 | Var | Purpose | Default |

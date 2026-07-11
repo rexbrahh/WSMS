@@ -55,26 +55,29 @@ export class WsmsClient {
 		return this.postVoid("/ingest/command", { command, exit, output });
 	}
 
-	readPage(id: string): Promise<PageResult> {
-		return this.post<PageResult>("/page", { id });
+	readPage(id: string, signal?: AbortSignal): Promise<PageResult> {
+		return this.post<PageResult>("/page", { id }, signal);
 	}
 
-	semantic(query: string): Promise<SemanticResult> {
-		return this.post<SemanticResult>("/semantic", { query });
+	semantic(query: string, signal?: AbortSignal): Promise<SemanticResult> {
+		return this.post<SemanticResult>("/semantic", { query }, signal);
 	}
 
 	private async postVoid(path: string, body?: unknown): Promise<void> {
 		await this.post<unknown>(path, body);
 	}
 
-	private async post<T>(path: string, body?: unknown): Promise<T> {
+	private async post<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
 		const headers: Record<string, string> = { "Content-Type": "application/json" };
 		if (this.token) headers.Authorization = `Bearer ${this.token}`;
+		// The request aborts on whichever comes first: the caller's run signal
+		// (user hit abort) or the per-request timeout (a hung core).
+		const timeout = AbortSignal.timeout(this.timeoutMs);
 		const resp = await fetch(this.baseUrl + path, {
 			method: "POST",
 			headers,
 			body: JSON.stringify(body ?? {}),
-			signal: AbortSignal.timeout(this.timeoutMs),
+			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 		});
 		if (!resp.ok) {
 			const detail = await resp.text().catch(() => "");
