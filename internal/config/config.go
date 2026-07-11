@@ -43,6 +43,23 @@ type Config struct {
 	// EmbeddingBatchSize bounds document vectors written after a page-table
 	// commit. Zero uses the embedder package default.
 	EmbeddingBatchSize int
+
+	// AsyncMaintenance moves best-effort L3 index application off the durable
+	// append path onto a bounded per-session maintenance queue. Default false
+	// keeps index application synchronous inside the append boundary. Page
+	// compilation stays synchronous either way because it reads live WSL and
+	// coherence state that cannot be reconstructed as-of-event off-thread; only
+	// the SQLite apply is deferred. Enable to bake the async path before it can
+	// become the default. Async lag never returns stale semantic results: the
+	// existing watermark-freshness gate abstains until the index catches up, and
+	// exact page faults read L4 directly.
+	AsyncMaintenance bool
+
+	// MaintenanceQueueDepth bounds the async index-apply queue when
+	// AsyncMaintenance is set. Zero uses the package default. On overflow the
+	// durable append never blocks: the queue records lag and the worker
+	// reconciles the index from the ledger watermark.
+	MaintenanceQueueDepth int
 }
 
 // Default returns scaffold defaults.

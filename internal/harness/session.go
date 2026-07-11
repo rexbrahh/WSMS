@@ -179,9 +179,27 @@ type Session struct {
 	embeddingCancel   context.CancelFunc
 	embeddingDone     chan struct{}
 	embeddingWake     chan struct{}
-	semanticContext   context.Context
-	semanticCancel    context.CancelFunc
-	semanticWG        sync.WaitGroup
+	// Async L3 maintenance. When Cfg.AsyncMaintenance is set, Append compiles
+	// page mutations synchronously (as-of-event, so replay stays equivalent) but
+	// hands the SQLite apply to this bounded per-session worker. maintenanceMu
+	// guards the queue and the redacted status; the worker never blocks the
+	// durable append and reconciles overflow/gaps from the ledger watermark.
+	asyncMaintenance       bool
+	maintenanceMu          sync.Mutex
+	maintenanceQueue       []indexMaintenanceUnit
+	maintenanceQueueDepth  int
+	maintenanceNeedsRepair bool
+	maintenanceReconciling bool
+	maintenanceDropped     int
+	maintenanceErr         error
+	maintenanceCategory    string
+	maintenanceParked      bool
+	maintenanceWake        chan struct{}
+	maintenanceCancel      context.CancelFunc
+	maintenanceDone        chan struct{}
+	semanticContext        context.Context
+	semanticCancel         context.CancelFunc
+	semanticWG             sync.WaitGroup
 	// IndexErr is the last non-fatal warm-index error (indexing never fails L4).
 	IndexErr   error
 	Cfg        config.Config
@@ -271,19 +289,25 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	}
 	sched := scheduler.New(cfg, st, h, disp, res, coherent)
 	semanticContext, semanticCancel := context.WithCancel(context.Background())
+	maintenanceQueueDepth := cfg.MaintenanceQueueDepth
+	if maintenanceQueueDepth <= 0 {
+		maintenanceQueueDepth = maintenanceQueueDepthDefault
+	}
 	s := &Session{
-		Cfg:             cfg,
-		Ledger:          led,
-		Artifacts:       arts,
-		State:           st,
-		Coherence:       coherent,
-		Hierarchy:       h,
-		Dispatcher:      disp,
-		Scheduler:       sched,
-		Tools:           faults.NewTools(res, sched.PageFault),
-		Embedder:        cfg.Embedder,
-		semanticContext: semanticContext,
-		semanticCancel:  semanticCancel,
+		Cfg:                   cfg,
+		Ledger:                led,
+		Artifacts:             arts,
+		State:                 st,
+		Coherence:             coherent,
+		Hierarchy:             h,
+		Dispatcher:            disp,
+		Scheduler:             sched,
+		Tools:                 faults.NewTools(res, sched.PageFault),
+		Embedder:              cfg.Embedder,
+		asyncMaintenance:      cfg.AsyncMaintenance,
+		maintenanceQueueDepth: maintenanceQueueDepth,
+		semanticContext:       semanticContext,
+		semanticCancel:        semanticCancel,
 	}
 	// Warm index is disposable and optional. Open failures leave Index nil.
 	// Dense projection is off by default (cfg.DenseDimensions == 0).
@@ -302,6 +326,9 @@ func OpenSession(cfg config.Config) (*Session, error) {
 	if err := s.replay(context.Background()); err != nil {
 		return nil, errors.Join(err, s.Close())
 	}
+	// Replay applies the index synchronously, so the worker only ever handles
+	// live appends; there is nothing to drain at open.
+	s.startIndexMaintenanceWorker()
 	s.startEmbeddingWorker()
 	s.wakeEmbeddingWorker()
 	return s, nil
@@ -358,14 +385,27 @@ func (s *Session) Close() error {
 		}
 		s.appendMu.Lock()
 		s.closed = true
-		cancel := s.embeddingCancel
-		done := s.embeddingDone
+		embCancel := s.embeddingCancel
+		embDone := s.embeddingDone
+		maintCancel := s.maintenanceCancel
+		maintDone := s.maintenanceDone
 		s.appendMu.Unlock()
-		if cancel != nil {
-			cancel()
+		// Cancel-and-discard: pending index applies are dropped, not drained; the
+		// next OpenSession replays them from the ledger watermark. Join the
+		// maintenance worker before the embedding worker and before closing the
+		// index so no worker touches a closed store. appendMu is released so the
+		// worker can record its final IndexErr without deadlocking Close.
+		if maintCancel != nil {
+			maintCancel()
 		}
-		if done != nil {
-			<-done
+		if embCancel != nil {
+			embCancel()
+		}
+		if maintDone != nil {
+			<-maintDone
+		}
+		if embDone != nil {
+			<-embDone
 		}
 		s.semanticWG.Wait()
 		s.appendMu.Lock()
@@ -453,8 +493,14 @@ func (s *Session) Append(ctx context.Context, ev ledger.Event) (ledger.Event, er
 		return stored, s.failStopErr
 	}
 	s.lastEvent = stored
-	// Best-effort L3 indexing: never fail the durable append path.
-	s.indexAfterEvent(ctx, stored)
+	// Best-effort L3 indexing never fails the durable append path. Async mode
+	// compiles synchronously (as-of-event, keeping replay equivalent) but defers
+	// the SQLite apply so the durable write does not wait on index I/O.
+	if s.asyncMaintenance {
+		s.enqueueIndexMaintenance(ctx, stored)
+	} else {
+		s.indexAfterEvent(ctx, stored)
+	}
 	return stored, nil
 }
 
@@ -485,7 +531,10 @@ func (s *Session) indexAfterEvent(ctx context.Context, ev ledger.Event) {
 	s.IndexErr = nil
 }
 
-func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event, state *wsl.WorkingState, coherent *coherence.State) error {
+// compileIndexEvent resolves one event's page mutations against the supplied
+// as-of-event derived state. It performs no I/O against the index, so its
+// caller may apply the result synchronously or hand it to the async worker.
+func (s *Session) compileIndexEvent(ctx context.Context, ev ledger.Event, state *wsl.WorkingState, coherent *coherence.State) ([]pages.PageMutation, int64, error) {
 	snap := coherent.Snapshot()
 	change := pages.LedgerChange{
 		Event:     ev,
@@ -500,7 +549,7 @@ func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event
 	}
 	muts, err := pages.NewDeterministicCompiler().Compile(ctx, change)
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
 	var maxVersion int64
 	for _, mut := range muts {
@@ -511,7 +560,15 @@ func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event
 	if maxVersion == 0 {
 		maxVersion = ev.Seq
 	}
-	if err := s.Index.ApplyWithWatermark(ctx, muts, s.Cfg.SessionID, ev.Seq, maxVersion); err != nil {
+	return muts, maxVersion, nil
+}
+
+func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event, state *wsl.WorkingState, coherent *coherence.State) error {
+	muts, pageVersion, err := s.compileIndexEvent(ctx, ev, state, coherent)
+	if err != nil {
+		return err
+	}
+	if err := s.Index.ApplyWithWatermark(ctx, muts, s.Cfg.SessionID, ev.Seq, pageVersion); err != nil {
 		return err
 	}
 	s.wakeEmbeddingWorker()
@@ -519,6 +576,41 @@ func (s *Session) compileAndApplyIndexEvent(ctx context.Context, ev ledger.Event
 }
 
 const embeddingWorkerMaxBackoff = 2 * time.Second
+
+// maintenanceQueueDepthDefault bounds pending compiled index-apply units when
+// async maintenance is on. Overflow never blocks the durable append; it flags a
+// ledger-watermark reconciliation instead.
+const maintenanceQueueDepthDefault = 256
+
+// Redacted maintenance status categories; they never carry raw error text.
+const (
+	maintenanceStatusOK     = "ok"
+	maintenanceStatusApply  = "apply"
+	maintenanceStatusRepair = "repair"
+)
+
+// indexMaintenanceUnit is one durable event's compiled page mutations awaiting
+// asynchronous SQLite application in append-sequence order. Compilation already
+// ran on the append thread against consistent as-of-event state, so the
+// mutations are self-contained immutable data safe to apply later.
+type indexMaintenanceUnit struct {
+	seq         int64
+	pageVersion int64
+	mutations   []pages.PageMutation
+}
+
+// MaintenanceStatus is the synchronized, redacted view of the async L3
+// maintenance worker for operator inspection. It is never authoritative and
+// never gates L4 appends or exact page faults.
+type MaintenanceStatus struct {
+	Async       bool
+	Degraded    bool
+	Parked      bool
+	Reconciling bool
+	Category    string
+	Pending     int
+	Dropped     int
+}
 
 func (s *Session) startEmbeddingWorker() {
 	if s.Embedder == nil || s.Index == nil {
@@ -835,6 +927,276 @@ func (s *Session) repairIndexFromLedger(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Session) startIndexMaintenanceWorker() {
+	if !s.asyncMaintenance || s.Index == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.maintenanceCancel = cancel
+	s.maintenanceDone = make(chan struct{})
+	s.maintenanceWake = make(chan struct{}, 1)
+	go s.indexMaintenanceWorker(ctx)
+}
+
+func (s *Session) wakeIndexMaintenance() {
+	if s.maintenanceWake == nil {
+		return
+	}
+	select {
+	case s.maintenanceWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Session) markMaintenanceRepair() {
+	s.maintenanceMu.Lock()
+	s.maintenanceNeedsRepair = true
+	s.maintenanceMu.Unlock()
+}
+
+// enqueueIndexMaintenance compiles one event's page mutations on the append
+// thread (against consistent as-of-event state, so replay stays equivalent) and
+// hands the resolved mutations to the async worker. Callers hold appendMu. It
+// never blocks the durable append: on a full queue or a compile failure it
+// flags a ledger-watermark reconciliation instead of waiting.
+func (s *Session) enqueueIndexMaintenance(ctx context.Context, ev ledger.Event) {
+	if s.Index == nil {
+		return
+	}
+	muts, pageVersion, err := s.compileIndexEvent(ctx, ev, s.State, s.Coherence)
+	if err != nil {
+		// Record like the synchronous path and let the worker reconcile from the
+		// ledger; the durable append still succeeds. appendMu is already held, so
+		// IndexErr is written directly rather than via setIndexErr.
+		s.IndexErr = err
+		s.markMaintenanceRepair()
+		s.wakeIndexMaintenance()
+		return
+	}
+	s.maintenanceMu.Lock()
+	if len(s.maintenanceQueue) >= s.maintenanceQueueDepth {
+		s.maintenanceNeedsRepair = true
+		s.maintenanceDropped++
+	} else {
+		s.maintenanceQueue = append(s.maintenanceQueue, indexMaintenanceUnit{
+			seq: ev.Seq, pageVersion: pageVersion, mutations: muts,
+		})
+	}
+	s.maintenanceMu.Unlock()
+	s.wakeIndexMaintenance()
+}
+
+// indexMaintenanceWorker drains the bounded index-apply queue off the append
+// path. It mirrors the embedding worker's supervision: a coalescing wake,
+// transient retry with bounded backoff, and terminal park until the next wake.
+func (s *Session) indexMaintenanceWorker(ctx context.Context) {
+	defer close(s.maintenanceDone)
+	backoff := 25 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.maintenanceWake:
+		}
+		for {
+			applied, err := s.drainIndexMaintenance(ctx)
+			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return
+				}
+				park := !maintenanceShouldRetry(err)
+				s.recordMaintenanceError(err, park)
+				if park {
+					break
+				}
+				timer := time.NewTimer(backoff)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				backoff *= 2
+				if backoff > embeddingWorkerMaxBackoff {
+					backoff = embeddingWorkerMaxBackoff
+				}
+				continue
+			}
+			backoff = 25 * time.Millisecond
+			if applied == 0 {
+				s.recordMaintenanceOK()
+				break
+			}
+			// Newly applied warm pages may need dense vectors.
+			s.wakeEmbeddingWorker()
+		}
+	}
+}
+
+// drainIndexMaintenance performs one unit of work: a full ledger reconciliation
+// when overflow or a compile failure flagged one, otherwise applying the next
+// queued unit in append-sequence order. It returns the number of units advanced
+// (0 when idle) so the worker knows when to sleep.
+func (s *Session) drainIndexMaintenance(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if s.Index == nil {
+		return 0, nil
+	}
+	s.maintenanceMu.Lock()
+	needsRepair := s.maintenanceNeedsRepair
+	hasUnit := len(s.maintenanceQueue) > 0
+	var unit indexMaintenanceUnit
+	if hasUnit {
+		unit = s.maintenanceQueue[0]
+	}
+	s.maintenanceMu.Unlock()
+
+	if needsRepair {
+		// Clear the pending flag before reconciling (so an append that overflows
+		// during the repair re-flags a follow-up pass instead of being clobbered
+		// by a post-repair clear that would strand the newest event below head),
+		// but mark the reconciliation in flight so the status surface keeps
+		// reporting the index as behind throughout a rebuild-from-behind.
+		s.maintenanceMu.Lock()
+		s.maintenanceNeedsRepair = false
+		s.maintenanceReconciling = true
+		s.maintenanceMu.Unlock()
+		if err := s.repairIndexFromLedger(ctx); err != nil {
+			s.clearReconciling()
+			s.markMaintenanceRepair()
+			return 0, err
+		}
+		watermark, _, err := s.Index.Watermark(ctx, s.Cfg.SessionID)
+		if err != nil {
+			s.clearReconciling()
+			s.markMaintenanceRepair()
+			return 0, err
+		}
+		// Repair caught the index up to the ledger head at repair time. Drop
+		// queued units it already covered; keep any that arrived afterwards so
+		// they still apply contiguously.
+		s.maintenanceMu.Lock()
+		kept := make([]indexMaintenanceUnit, 0, len(s.maintenanceQueue))
+		for _, u := range s.maintenanceQueue {
+			if u.seq > watermark {
+				kept = append(kept, u)
+			}
+		}
+		s.maintenanceQueue = kept
+		s.maintenanceReconciling = false
+		s.maintenanceMu.Unlock()
+		s.setIndexErr(nil)
+		return 1, nil
+	}
+
+	if !hasUnit {
+		return 0, nil
+	}
+
+	// Only this worker pops the queue, so the captured head unit is stable.
+	if err := s.Index.ApplyWithWatermark(ctx, unit.mutations, s.Cfg.SessionID, unit.seq, unit.pageVersion); err != nil {
+		if errors.Is(err, indexer.ErrWatermarkGap) {
+			// A hole opened (e.g. after a partial overflow); reconcile from the
+			// ledger rather than applying out of order.
+			s.markMaintenanceRepair()
+			return 1, nil
+		}
+		if !errors.Is(err, indexer.ErrClosed) {
+			// Any other store error recovers the way the synchronous path does:
+			// reconcile from the ledger instead of re-applying the identical head
+			// unit forever. Returning the error records it and applies backoff
+			// before the next pass runs the repair.
+			s.markMaintenanceRepair()
+		}
+		return 0, err
+	}
+	s.maintenanceMu.Lock()
+	if len(s.maintenanceQueue) > 0 && s.maintenanceQueue[0].seq == unit.seq {
+		s.maintenanceQueue = s.maintenanceQueue[1:]
+	}
+	s.maintenanceMu.Unlock()
+	s.setIndexErr(nil)
+	return 1, nil
+}
+
+func maintenanceShouldRetry(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	// A closed index cannot recover without a reopen; park instead of spinning.
+	return !errors.Is(err, indexer.ErrClosed)
+}
+
+func (s *Session) recordMaintenanceError(err error, parked bool) {
+	if err == nil {
+		return
+	}
+	s.maintenanceMu.Lock()
+	s.maintenanceErr = err
+	s.maintenanceCategory = maintenanceStatusApply
+	s.maintenanceParked = parked
+	s.maintenanceMu.Unlock()
+	// A recorded maintenance error means the index failed to advance, whether it
+	// parked or will retry. Document it so the semantic path treats the index as
+	// unavailable rather than merely lagging; a later successful apply or repair
+	// clears it via setIndexErr(nil).
+	s.setIndexErr(err)
+}
+
+// clearReconciling drops the in-flight rebuild flag after repairIndexFromLedger
+// returns. A failed repair re-flags needsRepair, which keeps the status degraded.
+func (s *Session) clearReconciling() {
+	s.maintenanceMu.Lock()
+	s.maintenanceReconciling = false
+	s.maintenanceMu.Unlock()
+}
+
+func (s *Session) recordMaintenanceOK() {
+	s.maintenanceMu.Lock()
+	s.maintenanceErr = nil
+	s.maintenanceCategory = maintenanceStatusOK
+	s.maintenanceParked = false
+	s.maintenanceMu.Unlock()
+}
+
+// setIndexErr updates the non-authoritative warm-index error from off the append
+// thread. Close never holds appendMu while joining the worker, so this cannot
+// deadlock shutdown.
+func (s *Session) setIndexErr(err error) {
+	s.appendMu.Lock()
+	s.IndexErr = err
+	s.appendMu.Unlock()
+}
+
+// MaintenanceStatus returns the synchronized, redacted async-maintenance status
+// for operator inspection. It never exposes raw error text.
+func (s *Session) MaintenanceStatus() MaintenanceStatus {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	// A pending (needsRepair) or in-flight (reconciling) rebuild means the index
+	// is provably behind the ledger even when the queue is empty and no apply
+	// error is recorded, so it must read as degraded rather than caught up.
+	reconciling := s.maintenanceNeedsRepair || s.maintenanceReconciling
+	category := s.maintenanceCategory
+	if reconciling && (category == "" || category == maintenanceStatusOK) {
+		category = maintenanceStatusRepair
+	}
+	if category == "" && s.asyncMaintenance {
+		category = maintenanceStatusOK
+	}
+	return MaintenanceStatus{
+		Async:       s.asyncMaintenance,
+		Degraded:    s.maintenanceErr != nil || reconciling,
+		Parked:      s.maintenanceParked,
+		Reconciling: reconciling,
+		Category:    category,
+		Pending:     len(s.maintenanceQueue),
+		Dropped:     s.maintenanceDropped,
+	}
 }
 
 // SemanticSearch resolves an unknown semantic address through the disposable
