@@ -128,6 +128,22 @@ func TestSemanticAbstainsCleanly(t *testing.T) {
 	}
 }
 
+// A page miss is a bounded "not found", not an error and not a body echoing the
+// PAGE_MISS sentinel — the same absence-is-a-valid-answer rule as semantic.
+func TestPageMissIsNotFound(t *testing.T) {
+	ts := newTestServer(t, "")
+	code, body := do(t, ts, http.MethodPost, "/page", "", map[string]any{"id": "no-such-page"})
+	if code != 200 {
+		t.Fatalf("page = %d %v", code, body)
+	}
+	if body["found"] != false {
+		t.Fatalf("unknown page should report found:false, got %v", body)
+	}
+	if _, hasBody := body["body"]; hasBody {
+		t.Fatalf("miss must not carry a body, got %v", body)
+	}
+}
+
 func TestVizStateShape(t *testing.T) {
 	ts := newTestServer(t, "")
 	code, body := do(t, ts, http.MethodGet, "/viz/state", "", nil)

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"wsms/internal/config"
+	"wsms/internal/faults"
 	"wsms/internal/harness"
 	"wsms/internal/ledger"
 	"wsms/internal/retrieval"
@@ -311,9 +312,16 @@ func (s *server) handlePage(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := s.session.Tools.ReadPage(r.Context(), req.ID, budget)
 	if err != nil {
-		// A miss is not an operational failure; report it as a bounded, typed
-		// absence so the agent tool can say "no such page" rather than crash.
+		// Operational or policy denial (revoked/unauthorized/store down). WSMS
+		// keeps these bounded and redacted, so surface the reason as a non-fatal
+		// absence rather than a crash — the agent learns the page is unavailable.
 		writeJSON(w, http.StatusOK, map[string]any{"found": false, "detail": err.Error()})
+		return
+	}
+	// A plain miss returns the sentinel with a nil error: absence is a normal
+	// answer in WSMS, not a failure. Do not echo the sentinel back as a body.
+	if body == faults.PageMiss {
+		writeJSON(w, http.StatusOK, map[string]any{"found": false})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"found": true, "body": body})
