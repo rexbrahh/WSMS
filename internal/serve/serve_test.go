@@ -2,6 +2,7 @@ package serve
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -41,6 +42,9 @@ func do(t *testing.T, ts *httptest.Server, method, path, token string, body any)
 	req, err := http.NewRequest(method, ts.URL+path, &buf)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -134,6 +138,66 @@ func TestVizStateShape(t *testing.T) {
 		if _, ok := body[key]; !ok {
 			t.Fatalf("viz/state missing %q: %v", key, body)
 		}
+	}
+}
+
+// A rebound DNS name resolving to 127.0.0.1 still carries the attacker's Host,
+// so a non-loopback Host must be refused even though the socket is loopback.
+func TestRejectsNonLoopbackHost(t *testing.T) {
+	ts := newTestServer(t, "")
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/ingest/user", strings.NewReader(`{"text":"x"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = "evil.example.com"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-loopback Host should be 403, got %d", resp.StatusCode)
+	}
+}
+
+// A form-encoded POST is a "simple request" that skips CORS preflight; refusing
+// non-JSON forces the preflight this server never answers.
+func TestRequiresJSONContentType(t *testing.T) {
+	ts := newTestServer(t, "")
+	resp, err := http.Post(ts.URL+"/ingest/user", "text/plain", strings.NewReader(`{"text":"x"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("non-JSON content-type should be 415, got %d", resp.StatusCode)
+	}
+}
+
+// A cross-site page always sends an Origin; our local clients never do.
+func TestRejectsBrowserOrigin(t *testing.T) {
+	ts := newTestServer(t, "")
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/ingest/user", strings.NewReader(`{"text":"x"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin request should be 403, got %d", resp.StatusCode)
+	}
+}
+
+func TestRefusesNonLoopbackBind(t *testing.T) {
+	err := Run(context.Background(), Options{Addr: "0.0.0.0:0", DataDir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "non-loopback") {
+		t.Fatalf("expected non-loopback bind refusal, got %v", err)
 	}
 }
 

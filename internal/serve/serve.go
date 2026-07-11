@@ -10,11 +10,14 @@ package serve
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"wsms/internal/config"
@@ -23,6 +26,11 @@ import (
 	"wsms/internal/retrieval"
 	"wsms/internal/types"
 )
+
+// maxBodyBytes bounds a single request body. Command output and page bodies can
+// be sizable, so the cap is generous, but it still refuses an unbounded stream
+// that would otherwise let one request exhaust memory.
+const maxBodyBytes = 16 << 20 // 16 MiB
 
 // Options configures a serve run. The zero value is not valid; use Run with an
 // explicitly populated Options (cmd/wsms wires the flags).
@@ -67,6 +75,11 @@ func Run(ctx context.Context, opts Options) error {
 	if addr == "" {
 		addr = "127.0.0.1:0"
 	}
+	// The API has no per-request authorization beyond the optional token, so a
+	// non-loopback bind must fail closed unless a token gates it.
+	if opts.Token == "" && !hostIsLoopback(addr) {
+		return fmt.Errorf("refusing to bind non-loopback address %q without WSMS_SERVE_TOKEN", addr)
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
@@ -78,6 +91,7 @@ func Run(ctx context.Context, opts Options) error {
 	httpSrv := &http.Server{
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	serveErr := make(chan error, 1)
@@ -113,16 +127,50 @@ func (s *server) routes() http.Handler {
 	return mux
 }
 
-// guard enforces POST + the optional bearer token. /health stays open so a
-// client can probe readiness before authenticating.
+// guard fronts every mutating endpoint with defense-in-depth. The service
+// mutates the durable ledger, so a drive-by browser page or another local
+// process reaching the port could otherwise forge memory. /health stays open
+// so a client can probe readiness before authenticating.
 func (s *server) guard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.token != "" && r.Header.Get("Authorization") != "Bearer "+s.token {
-			writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
+		// Defeat DNS rebinding: a rebound request resolves the attacker's
+		// hostname to 127.0.0.1 but still carries that hostname in Host.
+		if !hostIsLoopback(r.Host) {
+			writeErr(w, http.StatusForbidden, errors.New("non-loopback Host header rejected"))
 			return
+		}
+		// Defeat browser CSRF: our legitimate clients (the Go TUI and pi's Node
+		// fetch) send no Origin; a cross-site page always does.
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if u, err := url.Parse(origin); err != nil || !hostIsLoopback(u.Host) {
+				writeErr(w, http.StatusForbidden, errors.New("cross-origin request rejected"))
+				return
+			}
+		}
+		if s.token != "" {
+			got := []byte(r.Header.Get("Authorization"))
+			want := []byte("Bearer " + s.token)
+			if subtle.ConstantTimeCompare(got, want) != 1 {
+				writeErr(w, http.StatusUnauthorized, errors.New("unauthorized"))
+				return
+			}
 		}
 		next(w, r)
 	}
+}
+
+// hostIsLoopback reports whether a Host/Origin authority names the loopback
+// interface. An empty or wildcard host (":7673" → "0.0.0.0") is not loopback.
+func hostIsLoopback(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -329,6 +377,13 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		writeErr(w, http.StatusMethodNotAllowed, errors.New("POST required"))
 		return false
 	}
+	// Requiring application/json forces a browser fetch into a CORS preflight,
+	// which this server never answers — the second half of the CSRF defense.
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		writeErr(w, http.StatusUnsupportedMediaType, errors.New("Content-Type must be application/json"))
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("decode body: %w", err))
 		return false
