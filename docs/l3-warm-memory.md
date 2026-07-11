@@ -327,17 +327,33 @@ claims Phase 7F L2 residency.
 
 ### 6.3 Working-set prefetch
 
-Before a turn, the scheduler may search from the active task, last failure,
-next action, touched paths, and current user intent. Results are admitted only
-as prefetched L2 references. They are not injected into L1 solely because they
-are similar.
+Phase 7F first runs semantic readahead in metadata-only shadow mode. After a
+successful semantic fault and final freshness check, bounded non-selected,
+non-suppressed candidates with exact current tuples may be observed without
+materializing or retaining their bodies. A selected page whose exact evidence
+was actually returned may be admitted separately as demand; observing it as
+speculative would make usefulness tautological and is forbidden.
 
-This is a Phase 7F target. Phase 7E does not run prefetch or update L2 residency
-metadata.
+Each pending shadow episode records the exact authoritative page tuple,
+embedding namespace, deterministic final fused position, and first
+observation-use sequence. It contains no page body, summary, refs, query text,
+or vector.
+Embedding namespace attributes the estimator that made the prediction; it is
+not part of authoritative page identity. A same-tuple/same-namespace duplicate
+does not extend the original 64-real-use horizon. Different namespaces retain
+separate bounded estimator-attribution episodes while aggregate page
+usefulness is counted once.
 
-An explicit use or fault sets a reference bit and counts as useful prefetch.
-Unused prefetched pages decay quickly. The scheduler records precision so that
-over-eager readahead is observable.
+Only a later real use or exact demand that actually serves the same current
+tuple may resolve an episode as useful. Pinning, replay, cold admission,
+compatibility cache maintenance, and reconciliation cannot do so. Capacity or
+horizon expiry records unused shadow estimation; invalidation is censored and
+shoots the observation down rather than scoring it.
+
+Actual speculative L2 body admission is **disabled**. It requires a pinned real
+Qwen run plus held-out usefulness and negative-transfer evidence. Similarity
+alone never injects L1, and automatic L1 admission remains disabled through
+Phase 10.
 
 ## 7. Query construction
 
@@ -534,22 +550,43 @@ separate Phase 7F/scheduler policy.
 
 Retrieval and residency are different policies.
 
-The initial L2 policy should use a CLOCK-Pro/2Q-inspired approximation:
+The implemented Phase 7F L2 mechanism uses a CLOCK-Pro/2Q-inspired
+approximation:
 
-- **Hot:** pages explicitly faulted or repeatedly used in the active task.
-- **Cold:** newly materialized or prefetched pages with one access.
-- **Test/ghost:** recently evicted identities retained without bodies to detect
-  recurring demand and tune the hot/cold target.
+- **Cold:** a first exact demand starts cold with reference bit 1; derived
+  future-only material may start cold/ref0.
+- **Hot:** a later actual demand/use promotes a cold page; an exact-authority
+  ghost refault may promote directly. Hot pages demote before eviction.
+- **Test/ghost:** recently evicted exact identities are retained without bodies,
+  summaries, refs, query text, or vectors to detect recurring demand.
 - **Pinned:** hard constraints and active task anchors; these are scheduled by
-  explicit policy, not similarity.
+  explicit policy, not similarity, and count within the resident budget.
 
-Each access sets a reference bit. The eviction hand skips pinned pages, clears
-referenced pages once, demotes cold unused prefetch, and retains a bounded ghost
-identity. Bodies can be reconstructed from L4. This captures recency and
-frequency without letting an embedding score masquerade as a page lifetime.
+Default bounds are 64 resident pages/512 KiB logical retained bytes, including
+a 16-page/128-KiB pinned subset, with at most 64 KiB per page. Ghost metadata is
+bounded to 64 entries/32 KiB; semantic-shadow episodes to 256 entries/64 KiB
+over 64 later real uses; categorical residency trace to 512 entries. Logical
+size counts every retained page string/list value. These are provisional safety
+bounds rather than calibrated working-set sizes.
+
+Each real access sets a reference bit. The deterministic hand never selects by
+map order, wall time, retrieval score, or similarity. It skips pinned pages,
+grants referenced pages one chance, demotes hot pages before eviction, and
+retains only a bounded bodyless ghost. Pin overflow is transactional: it cannot
+silently evict an existing pin. Direct page hits copy and record use atomically.
+Bodies remain reconstructible from L4.
+
+Ghost hits require the exact `(session, page ID, version, source digest,
+compiler, scope epoch)` tuple. Reuse distance/thrash telemetry is derived from
+deterministic reclaim/reference progression, never timestamps. A tuple change
+purges the matching resident/estimator identity. Because ghosts and shadows
+omit dependency refs, a broader residency-changing coherence event
+conservatively purges every ghost and censors every pending shadow rather than
+letting unverifiable metadata guide promotion or usefulness.
 
 The L1 scheduler then chooses from pinned records plus validated L2 pages under
-the capsule budget. A page's admission to L2 does not guarantee L1 residency.
+the capsule budget. A page's admission to L2 does not guarantee L1 residency,
+and the Phase 7F mechanism itself never performs automatic L1 admission.
 
 ## 10. Go interfaces and ownership
 
@@ -663,9 +700,12 @@ access_stats
   prefetched_count, useful_prefetch_count
 ```
 
-`access_stats` remains a Phase 7F target. The vector map, rowid mirror,
-canonical-vector shadow, and suppression table are implemented Phase 7C/7D
-state. They are all disposable; none belongs in `ledger.db`.
+The SQL `access_stats` sketch remains unimplemented and is not required for the
+first Phase 7F slice. Phase 7F keeps deterministic reference/use, ghost, pin,
+and semantic-shadow counters in bounded in-memory residency state; losing them
+does not affect truth. The vector map, rowid mirror, canonical-vector shadow,
+and suppression table are implemented Phase 7C/7D state. They are all
+disposable; none belongs in `ledger.db`.
 
 The Phase 7E exact eligibility allowlist is per-attempt query state, not a new
 durable table. Its JSON tuple set is passed to SQLite as data and joined on all
@@ -993,9 +1033,12 @@ snapshot construction and after resolution. Exact refs remain inside the
 materializer, and derivative page prose is stripped before result return.
 
 Future observability work adds per-channel and total latency, explicit
-generation/watermark-lag reporting, exact-ref debug views under policy, and
-Phase 7F L2/L1 residency transitions. Those are not claimed by the current
-trace.
+generation/watermark-lag reporting, and exact-ref debug views under policy.
+Phase 7F now adds a separate bounded, body-free residency snapshot/trace with
+admission/use, cold/hot/pinned transitions, ghost/refault/thrash, invalidation,
+rejection, and semantic-shadow useful/unused counters. This mechanism status is
+subject to the root final verification matrix; it is not evidence that actual
+prefetch improves outcomes.
 
 Aggregate metrics include:
 
@@ -1005,7 +1048,8 @@ Aggregate metrics include:
 - Recall@k, MRR, nDCG, and exact-reference precision on labeled queries;
 - stale-page suppression and wrong-scope candidate rates;
 - negative-transfer and repeated-failure rate after retrieval;
-- useful-prefetch ratio and pages evicted unused;
+- metadata-only shadow useful/unused ratio now; actual useful-prefetch ratio
+  and pages evicted unused only after speculative L2 admission is enabled;
 - L2 hit ratio, ghost hit ratio, promotion/demotion rate, and thrash;
 - p50/p95/p99 embedding, retrieval, and page-in latency;
 - tokens introduced per useful retrieved page.
@@ -1172,8 +1216,13 @@ remain open.
 - Operational channel/materializer faults stay distinct from valid misses.
   Dense/query failure may return a degraded lexical hit but cannot convert an
   empty operational failure into `SEMANTIC_PAGE_MISS`.
-- Known IDs still bypass L3. Semantic retrieval does not inject L1 or implement
-  L2 residency/prefetch.
+- Known WSL/event IDs still bypass L3. Compiler-derived `wp_*` IDs require the
+  descriptor tuple and transitive refs, so `ReadPage(wp_*)` remains disabled on
+  the ID-only resolver; repeated semantic selection revalidates/rematerializes
+  L4 before authoritative resident replacement. Phase 7E retrieval itself does
+  not inject L1 or own residency; the Phase 7F layer consumes only finally
+  fresh exact demand results and bodyless candidate observations. Actual
+  speculative prefetch is still disabled.
 - Open gates: run pinned real Qwen weights, measure vec0 brute-force resources,
   compare held-out no-L3/FTS/dense/hybrid variants, and calibrate the provisional
   weights/thresholds before promotion.
@@ -1185,10 +1234,25 @@ profile while adding hot/cold/ghost mechanics. Shadow accounting may proceed;
 L2-only prefetch requires real-model held-out usefulness and negative-transfer
 evidence, and automatic L1 admission remains blocked through L3-6/Phase 10.
 
-- Add hot/cold/ghost residency metadata and bounded CLOCK-Pro/2Q behavior.
-- Add reference bits, useful-prefetch accounting, thrash telemetry, and L1
-  admission separation.
-- Run prefetch in shadow mode before it affects L2/L1.
+**Status:** bounded hot/cold/pinned bodies, bodyless exact ghosts, deterministic
+reference/use accounting, selected-page demand admission, metadata-only
+semantic-shadow accounting, invalidation shootdown, and bounded trace/metrics
+are implemented in the current worktree subject to the root final
+correctness/race/demo verification matrix.
+
+- Default policy: 64 resident/512 KiB logical, including 16 pinned/128 KiB;
+  64 KiB/page; 64 ghosts/32 KiB; 256 shadow episodes/64 KiB over 64 real uses;
+  512 trace entries.
+- First demand is cold/ref1; later actual demand/use or exact ghost refault may
+  promote. Pinned active-task/hard-constraint anchors are explicit and bounded.
+- Selected semantic evidence is demand-admitted only after exact L4
+  materialization and final freshness. Non-selected, non-suppressed exact
+  tuples remain body-free observations.
+- Embedding namespace is estimator attribution, not authoritative page
+  identity. Invalidation shoots down body, ghost, and matching observations.
+- Actual speculative L2 body admission remains disabled pending pinned real
+  Qwen plus held-out usefulness/negative-transfer evidence. Automatic L1
+  admission remains disabled through Phase 10.
 
 ### L3-6 - Forced-reset evaluation
 
@@ -1222,6 +1286,19 @@ evidence, and automatic L1 admission remains blocked through L3-6/Phase 10.
 
 These sources describe current implementation capabilities; they do not prove
 that the design improves WSMS task outcomes:
+
+- The [CLOCK-Pro USENIX
+  paper](https://www.usenix.org/conference/2005-usenix-annual-technical-conference/clock-pro-effective-improvement-clock-replacement)
+  supplies the cold/hot clock, reference-bit, bounded nonresident-test, and
+  adaptive-allocation precedent.
+- The [2Q VLDB paper](https://www.vldb.org/conf/1994/P439.PDF) supplies the
+  probationary resident, tag-only history, and recurrent/hot queue precedent.
+- Linux [`mm/workingset.c`](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/mm/workingset.c)
+  documents bodyless shadow entries, refault distance, and bounded shadow-node
+  reclamation. WSMS's exact tuples and semantic shadows are a local adaptation.
+- Linux [cgroup v2 `memory.stat`](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+  documents refault, activation, restore, scan, steal, promotion, and demotion
+  counters that motivate the categorical Phase 7F telemetry.
 
 - [SQLite FTS5](https://www.sqlite.org/fts5.html) documents phrase, prefix,
   boolean, NEAR, BM25/rank, and external-content search behavior.

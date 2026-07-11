@@ -517,29 +517,75 @@ Acceptance:
 
 ### FR-019 - Working-set admission and readahead (SHOULD after hybrid faults)
 
-Semantic relevance may nominate page references for L2 prefetch, but L2
-residency and L1 admission use separate Unix-inspired hot/cold/pinned policy.
-Prefetched pages do not enter L1 solely because they are vector neighbors.
+L2 residency uses a separate Unix-inspired hot/cold/pinned policy; retrieval
+similarity is never an eviction or pinning score. The implemented default
+mechanism is bounded as follows:
+
+- 64 resident pages and 512 KiB of logical retained bytes;
+- a 16-page/128-KiB pinned subset included in those resident limits;
+- 64 KiB of logical retained bytes per page;
+- 64 bodyless exact-tuple ghosts using at most 32 KiB;
+- 256 bodyless semantic-shadow episodes using at most 64 KiB and expiring
+  after 64 later real uses; and
+- 512 categorical residency-trace entries.
+
+Logical retained bytes include all retained page strings and list values, not
+only the served body. These defaults are safety bounds, not calibrated working-
+set targets.
+
+The first exact demand enters cold with its reference bit set. A later actual
+demand/use promotes the page; an exact-authority ghost refault may promote it
+directly. Pinned active-task and hard-constraint anchors are admitted by
+explicit scheduler policy, count inside the global resident budget, and are
+never inferred from similarity. Pin-capacity failure is visible and
+transactional rather than silently evicting an existing pin.
+
+After the final Phase 7E freshness check, a selected page whose exact evidence
+was actually returned may be demand-admitted. Only bounded non-selected,
+non-suppressed candidates with exact current tuples may be recorded as semantic
+shadow episodes. A shadow episode contains no body, summary, refs, query text,
+or vector and cannot affect reference state, pinning, L1, or admission.
+Embedding namespace is estimator provenance for per-profile usefulness; it is
+not part of the authoritative six-field page identity. Tuple replacement
+shoots down the matching resident and estimator identity. Because bodyless
+ghosts/shadows retain no dependency refs, broader residency-changing coherence
+events conservatively purge all ghosts and censor all pending shadows.
+
+Known WSL/event IDs retain their exact direct-fault path. Compiler-derived
+`wp_*` IDs are not served by the ID-only resolver: direct use requires the same
+descriptor tuple and transitive-ref authority as semantic materialization.
+Repeated semantic selection therefore revalidates/rematerializes L4 before an
+authority-only resident tuple replacement.
 
 Acceptance:
 
 - Hard constraints and active task anchors are pinned explicitly, not by
   similarity score.
-- L2 tracks reference/use state and distinguishes explicit faults from
-  speculative prefetch.
-- Useful-prefetch ratio, unused eviction, ghost hits, and thrash are observable.
-- Automatic prefetch runs in shadow mode until forced-reset evaluation shows
-  benefit without material negative transfer.
-- All policy weights, thresholds, and caps are named, versioned, and included
-  in retrieval explanations.
+- L2 tracks deterministic reference/use state and distinguishes actual demand,
+  derived cold admission, pin maintenance, ghost refault, and semantic shadow
+  observation.
+- Resident/byte limits, useful/unused shadow episodes, ghost hits/refault
+  distance, actionable thrash, promotions/demotions, rejection reasons, and
+  invalidation shootdowns are exposed in bounded body-free snapshots/traces.
+- Pinning, replay, legacy cache maintenance, and reconciliation never count a
+  semantic shadow episode as useful. Only exact evidence actually served by a
+  demand or real resident use can do so.
+- Actual speculative L2 body admission remains disabled until a pinned real
+  Qwen run and held-out usefulness/negative-transfer evaluation pass.
+- Automatic L1 admission remains disabled through Phase 10; L1 construction
+  remains an independent scheduler decision.
 
-Implementation status at the Phase 7E boundary: explicit semantic faults,
-complete descriptor-derived exact tuple authority before both channel limits,
-parallel filtered candidate generation, canonical dense search, RRF,
+Implementation status at the Phase 7F mechanism boundary: explicit semantic
+faults, complete descriptor-derived exact tuple authority before both channel
+limits, parallel filtered candidate generation, canonical dense search, RRF,
 provisional deterministic reranking/diversity/abstention, exact L4
-materialization, and operational-versus-miss handling are implemented. L2
-hot/cold/ghost residency, prefetch, real-Qwen execution, held-out calibration,
-and automatic L1 admission are not implemented or claimed.
+materialization, and operational-versus-miss handling are implemented. Bounded
+hot/cold/pinned L2 bodies, bodyless ghosts, deterministic reference/use
+accounting, direct-fault atomicity, selected-page demand admission, bodyless
+semantic-shadow accounting, invalidation shootdown, and bounded metrics/traces
+are implemented subject to the root final correctness/race/demo verification
+matrix. Actual speculative L2 prefetch, real-Qwen execution, held-out
+calibration, and automatic L1 admission are not implemented or claimed.
 
 ## 9. Non-functional requirements
 
@@ -595,6 +641,10 @@ deterministic state application.
 - Capsule construction should be linear in resident record count for MVP.
 - Large output must not be copied into WSL or the capsule.
 - Page-fault output must respect its approximate token budget.
+- L2 residency must satisfy the configured entry and logical-retained-byte
+  bounds after every successful mutation; pinned pages count inside the global
+  resident limits, and ghosts/shadow observations have independent entry/byte
+  bounds.
 - L3 search must bound lexical/dense candidates, materialized pages, bytes, and
   tokens independently.
 - A local semantic authority snapshot supports at most
@@ -820,7 +870,8 @@ later product policy before multi-user deployment.
 - Calibrated L3 fusion/reranking weights, thresholds, and automatic-prefetch
   enablement. The mechanism and rollout gates are decided in
   `docs/l3-warm-memory.md`.
-- Exact L2 hot/cold/ghost target tuning and branch/file revalidation algorithms.
+- Calibration of the bounded L2 hot/cold/ghost targets and branch/file
+  revalidation algorithms; the default safety mechanism and caps are decided.
 - Branch/file staleness algorithms.
 - Artifact retention, compression, corruption repair, and garbage collection.
 - Provider adapter ownership and cancellation/timeout semantics.

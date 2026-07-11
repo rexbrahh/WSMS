@@ -38,15 +38,22 @@ This immediate plan slice is done when the repository contains:
     miss, including freshness races around resolution.
 16. Every selected semantic candidate is exact-materialized under cumulative
     budgets without changing L1 or claiming Phase 7F residency.
+17. A bounded Phase 7F L2 mechanism adds cold/hot/pinned bodies, bodyless exact
+    ghosts, deterministic real-use accounting, transactional pin quotas,
+    invalidation shootdown, and bounded residency snapshots/traces.
+18. Semantic readahead remains metadata-only: selected exact evidence may be
+    demand-admitted after final freshness, while non-selected/non-suppressed
+    exact tuples can only create bodyless usefulness episodes.
 
 The original demo milestone did **not** require an L3 index. This extended plan
-slice now includes the Phase 7A-7E in-repo mechanisms, while still not requiring
-a production chat UI, real provider credentials, a real Qwen weight/process
-run, comparative benchmark results, calibrated retrieval quality, or automatic
-prefetch/L1 admission.
+slice now includes the Phase 7A-7F in-repo mechanisms through metadata-only
+shadow accounting, while still not requiring a production chat UI, real
+provider credentials, a real Qwen weight/process run, comparative benchmark
+results, calibrated retrieval quality, actual speculative prefetch, or
+automatic L1 admission.
 
 It also does not claim the entire product specification is implemented. In
-particular, authorized model-facing file slices, branch/file coherence, ranked
+particular, authorized model-facing file slices, calibrated automatic
 residency, async maintenance, provider adapters, and comparative evaluation are
 post-demo phases.
 
@@ -133,8 +140,9 @@ parallel abstractions.
 - No production provider adapter exists; only `harness.Client` and
   `NoopClient` exist.
 - No Qdrant adapter or production ANN service exists.
-- No Phase 7F hot/cold/ghost residency controller or semantic prefetch worker
-  exists.
+- No speculative L2 prefetch worker exists. Phase 7F provides bounded
+  cold/hot/pinned residency, bodyless ghosts, and metadata-only semantic-shadow
+  accounting, but candidate observation cannot admit a speculative body.
 - No bundled real-Qwen serving process or model weights exist.
 - No durable WSL snapshot loader exists.
 - No forced-reset benchmark API exists.
@@ -142,12 +150,14 @@ parallel abstractions.
 
 ### Implemented L3 boundaries and remaining target APIs
 
-Phases 7A-7E now provide the page compiler, disposable index, embedding,
-retrieval, and exact materialization boundaries described in
-`docs/l3-warm-memory.md`. Backend-specific vector clients remain isolated from
-`scheduler`, `faults`, and `wsl`. Phase 7F may add L2 residency/prefetch policy
-behind `internal/memory`; Phase 7G may add Qdrant behind the existing index
-boundary only after its measurement gate.
+Phases 7A-7E provide the page compiler, disposable index, embedding, retrieval,
+and exact materialization boundaries described in `docs/l3-warm-memory.md`.
+Phase 7F adds bounded L2 mechanism policy behind `internal/memory` plus explicit
+scheduler/fault/harness integration, subject to the root final verification
+matrix. Backend-specific vector clients remain isolated from `scheduler`,
+`faults`, `wsl`, and residency policy. Actual speculative prefetch remains
+disabled; Phase 7G may add Qdrant behind the existing index boundary only after
+its measurement gate.
 
 ## 4. Phase 1 - Durable identity and replay
 
@@ -904,9 +914,10 @@ Implementation:
    RRF/policy contributions, categorical degradation/suppression/abstention,
    selected page IDs, and token use. Candidate metadata retains generation and
    watermark for freshness validation; latency telemetry remains future work.
-12. [x] Keep `Session.SemanticSearch` explicit and reference-first. Known IDs
-   continue through `PageFault`; semantic results do not mutate L1 or establish
-   Phase 7F L2 residency.
+12. [x] Keep `Session.SemanticSearch` explicit and reference-first. Known
+    WSL/event IDs continue through direct faults; compiler `wp_*` IDs remain
+    behind descriptor/refs validation rather than an ID-only cache shortcut.
+    Semantic results do not mutate L1.
 
 Verification/gates:
 
@@ -967,25 +978,61 @@ L1 admission remains blocked until Phase 10.
 **Objective:** turn retrieval into measured working-set estimation without
 making similarity an eviction or pinning policy.
 
+**Status:** implemented and verified on the development platform (darwin). The
+bounded residency and metadata-only shadow mechanism below is complete, and the
+root final verification matrix — `go test ./...`, `go test -race ./...`,
+repeated/stress (`-count`) runs of the memory and residency paths, `go vet`,
+build, live `wsms demo`, and `git diff --check` — passes. Independent
+adversarial review found one commit-time semantic-retry recall regression (a
+single materialization budget shared across coherence-retry attempts made the
+retry abstain with a spurious `SEMANTIC_PAGE_MISS`); it is fixed and
+regression-tested. The remaining confirmed findings were dead-code cleanups.
+This is not an enablement claim for speculative prefetch: the real-model,
+held-out usefulness, and negative-transfer gates below remain open.
+
 Implementation:
 
-1. Add bounded hot/cold/ghost page state inspired by CLOCK-Pro/2Q, reference
-   bits, explicit-fault/use counters, and a pinned class for hard constraints
-   and active task anchors.
-2. Treat semantic neighbors as speculative prefetch. Do not insert them into L1
-   solely because they are similar.
-3. Track useful-prefetch ratio, unused eviction, ghost hits, hot/cold target,
-   promotions/demotions, and thrash.
-4. Run prefetch in shadow mode, then L2-only mode, before any L1 admission.
-5. Keep the L1 capsule scheduler as the final independent budget decision.
+1. [x] Add CLOCK-Pro/2Q-inspired cold/hot/pinned state. First exact demand is
+   cold/ref1; later actual demand/use promotes it, while hot pages demote before
+   eviction and pinned pages are not reclaim victims.
+2. [x] Enforce default logical bounds: 64 resident pages/512 KiB total, a
+   16-page/128-KiB pinned subset included in the total, 64 KiB per page, 64
+   bodyless ghosts/32 KiB, 256 bodyless semantic-shadow episodes/64 KiB over a
+   64-real-use horizon, and 512 categorical trace entries.
+3. [x] Make direct resident hits atomic and admit a selected semantic page as
+   demand only after exact L4 materialization and final attempt freshness.
+4. [x] Record only non-selected, non-suppressed exact candidate tuples as
+   bodyless semantic-shadow observations. Namespace attributes the estimator;
+   it does not change authoritative page identity or extend duplicate horizons.
+5. [x] Pin active-task and hard-constraint anchors explicitly with
+   transactional overflow behavior; similarity cannot pin.
+6. [x] Treat invalidation as a shootdown, not an eviction hint: matching
+   resident identity is removed, while broad residency-changing transitions
+   conservatively purge dependency-free ghosts and censor pending shadows.
+7. [x] Expose bounded body-free residency snapshots/traces and deterministic
+   fault/use, ghost/refault/thrash, promotion/demotion, pin rejection, and
+   shadow useful/unused metrics.
+8. [ ] Enable actual speculative L2 body admission only after a pinned real
+   Qwen run plus held-out usefulness and negative-transfer evidence.
+9. [ ] Consider automatic L1 admission only in Phase 10 after outcome gates.
 
 Verification/gates:
 
-- Pinned critical state remains resident under churn.
-- Unused prefetched pages decay before proven-hot pages.
-- A synthetic alternating working set does not cause unbounded index/page-in
-  work or prompt churn.
-- Automatic L1 admission stays disabled until Phase 10 outcome gates pass.
+- [x] Root final matrix passes normal, race, repeated/stress, build, demo, and
+      diff checks for the integrated Phase 7F worktree.
+- [x] Focused mechanism tests cover bounded residency/metadata, deterministic
+      second chance and promotion, transactional pin overflow, bodyless exact
+      ghosts, shadow useful/unused accounting, invalidation, copy isolation, and
+      the commit-time freshness-retry recall path; final integrated verification
+      passes.
+- [x] Pinned critical state remains resident under ordinary churn within its
+      explicit quota.
+- [x] Semantic observations cannot admit a body or mutate L1; unused shadow
+      episodes expire without masquerading as actual unused prefetch bodies.
+- [x] Deterministic capacity and concurrent-churn fixtures keep resident,
+      ghost, shadow, and trace work bounded.
+- [x] Actual speculative L2 admission is disabled pending the real-model and
+      held-out gates; automatic L1 admission stays disabled until Phase 10.
 
 #### Phase 7G - Optional Qdrant scale-out
 
