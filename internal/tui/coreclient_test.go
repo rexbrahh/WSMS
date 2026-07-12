@@ -11,6 +11,7 @@ import (
 // The body mirrors serve's /viz/state: lowercase top-level keys, PascalCase
 // nested fields (the domain structs carry no json tags).
 const vizBody = `{
+	"session": "demo-primary",
 	"capsule": "<working_state>\nTASK T1: demo.\n</working_state>",
 	"residency": {"ResidentPages": 12, "HotPages": 8, "ColdPages": 4, "PinnedPages": 1, "GhostPages": 2, "Policy": {"MaxResidentPages": 64}},
 	"maintenance": {"Category": "repair", "Degraded": true, "Pending": 3},
@@ -34,6 +35,9 @@ func TestFetchVizDecodes(t *testing.T) {
 	}
 	if !st.reachable {
 		t.Fatal("reachable should be true")
+	}
+	if st.session != "demo-primary" {
+		t.Fatalf("session decode wrong: %q", st.session)
 	}
 	if st.residentPages != 12 || st.maxPages != 64 || st.hotPages != 8 || st.pinnedPages != 1 {
 		t.Fatalf("residency decode wrong: %+v", st)
@@ -62,7 +66,9 @@ func TestViewRendersPanels(t *testing.T) {
 	m.viz = vizState{reachable: true, capsule: "TASK T1: demo", residentPages: 12, maxPages: 64}
 
 	out := m.View()
-	for _, want := range []string{"WSMS", "memory", "CAPSULE", "RESIDENCY", "STATUS", "resident 12/64"} {
+	// Residency is collapsed by default, so its summary ("12/64") shows, not the
+	// expanded "resident 12/64" breakdown.
+	for _, want := range []string{"WSMS", "memory", "CAPSULE", "RESIDENCY", "STATUS", "12/64"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("view missing %q\n%s", want, out)
 		}

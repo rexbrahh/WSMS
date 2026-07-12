@@ -373,6 +373,7 @@ func (s *server) handleVizState(w http.ResponseWriter, r *http.Request) {
 	maint := s.session.MaintenanceStatus()
 	embed := s.session.EmbeddingStatus()
 	writeJSON(w, http.StatusOK, map[string]any{
+		"session":     s.cfg.SessionID,
 		"capsule":     capsule,
 		"residency":   s.session.ResidencySnapshot(),
 		"maintenance": maint,

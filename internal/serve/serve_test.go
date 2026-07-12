@@ -150,10 +150,13 @@ func TestVizStateShape(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("viz/state = %d %v", code, body)
 	}
-	for _, key := range []string{"capsule", "residency", "maintenance", "embedding"} {
+	for _, key := range []string{"session", "capsule", "residency", "maintenance", "embedding"} {
 		if _, ok := body[key]; !ok {
 			t.Fatalf("viz/state missing %q: %v", key, body)
 		}
+	}
+	if body["session"] != "serve-test" {
+		t.Fatalf("viz/state session = %v, want the configured session id", body["session"])
 	}
 }
 

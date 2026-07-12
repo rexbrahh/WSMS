@@ -31,6 +31,7 @@ func newCoreClient(baseURL, token string) *coreClient {
 type vizState struct {
 	reachable bool
 
+	session string
 	capsule string
 
 	residentPages int
@@ -66,6 +67,7 @@ func (c *coreClient) fetchViz(ctx context.Context) (vizState, error) {
 	}
 
 	var body struct {
+		Session   string `json:"session"`
 		Capsule   string `json:"capsule"`
 		Residency struct {
 			ResidentPages int `json:"ResidentPages"`
@@ -93,6 +95,7 @@ func (c *coreClient) fetchViz(ctx context.Context) (vizState, error) {
 
 	return vizState{
 		reachable:     true,
+		session:       body.Session,
 		capsule:       body.Capsule,
 		residentPages: body.Residency.ResidentPages,
 		maxPages:      body.Residency.Policy.MaxResidentPages,

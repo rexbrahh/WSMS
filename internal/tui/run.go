@@ -47,7 +47,9 @@ func Run(opts Options) error {
 		a = client
 	}
 
-	program := tea.NewProgram(newModel(a, core), tea.WithAltScreen())
+	model := newModel(a, core)
+	model.modelName = opts.Model
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := program.Run()
 	if a != nil {
 		_ = a.Close()

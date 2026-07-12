@@ -103,6 +103,149 @@ func TestApplyEventStreamsAndFlushes(t *testing.T) {
 	}
 }
 
+// A tool-call turn carries no assistant text — only a toolCall block in the
+// finalized content. It must surface as a distinct "tool" line, not vanish.
+func TestToolCallAffordance(t *testing.T) {
+	m := newModel(newFakeAgent(), newCoreClient("http://127.0.0.1:1", ""))
+	end := json.RawMessage(`{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"wsms_read_page","arguments":{"id":"F1"}}]}}`)
+	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_end", Raw: end}})
+	if len(m.lines) != 1 || m.lines[0].who != "tool" || m.lines[0].text != "wsms_read_page(F1)" {
+		t.Fatalf("expected a tool-call line, got %+v", m.lines)
+	}
+}
+
+// A tool result is verbose evidence: it renders as its own "↳ toolName" block,
+// showing the first few body lines and eliding the rest behind a "+N more" marker
+// until inspected with ^O.
+func TestToolResultCollapsesUntilInspected(t *testing.T) {
+	m := newModel(nil, newCoreClient("http://127.0.0.1:1", ""))
+	m.width, m.height = 100, 24
+	// Five body lines, so the PREVIEW=3 policy shows the head and hides two.
+	end := json.RawMessage(`{"type":"message_end","message":{"role":"toolResult","toolName":"wsms_read_page","content":[{"type":"text","text":"LAST FAILURE F1:\nCommand: go test ./runtime\nExit: 1\nError: stream goroutine still blocked\nLikely area: stream.go:118"}]}}`)
+	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_end", Raw: end}})
+	if len(m.lines) != 1 || m.lines[0].who != "toolresult" || m.lines[0].head != "wsms_read_page" {
+		t.Fatalf("expected a toolresult line, got %+v", m.lines)
+	}
+
+	out := plain(m.View())
+	if !strings.Contains(out, "LAST FAILURE F1") || !strings.Contains(out, "+2 more") {
+		t.Fatalf("collapsed result should preview the head with a +N marker:\n%s", out)
+	}
+	if strings.Contains(out, "stream.go:118") {
+		t.Fatalf("collapsed result must hide its tail until inspected:\n%s", out)
+	}
+
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !m.expandOutput {
+		t.Fatal("ctrl+o should toggle output expansion on")
+	}
+	if out := plain(m.View()); !strings.Contains(out, "stream.go:118") {
+		t.Fatalf("inspected result should show the full body:\n%s", out)
+	}
+}
+
+func TestFocusToggleAndExpand(t *testing.T) {
+	m := newModel(nil, newCoreClient("http://127.0.0.1:1", ""))
+	m.width, m.height = 100, 24
+	m.viz = vizState{reachable: true, capsule: "TASK T1", residentPages: 3, maxPages: 64, coldPages: 1, pinnedPages: 2}
+
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeyTab})
+	if m.focus != focusMemory {
+		t.Fatal("tab should move focus to the memory pane")
+	}
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.memSel != secResidency {
+		t.Fatalf("down should select residency, got section %d", m.memSel)
+	}
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeySpace})
+	if !m.memOpen[secResidency] {
+		t.Fatal("space should expand the selected section")
+	}
+	if out := plain(m.View()); !strings.Contains(out, "hot 0") {
+		t.Fatalf("expanded residency should show its breakdown:\n%s", out)
+	}
+	m, _ = step(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.focus != focusChat {
+		t.Fatal("esc should return focus to the chat input")
+	}
+}
+
+// A left-click on a collapsed tool-result block expands just that block, without
+// flipping the global expand-all toggle. The click geometry comes from regions,
+// which View populates on each render.
+func TestMouseTogglesToolBlock(t *testing.T) {
+	m := newModel(nil, newCoreClient("http://127.0.0.1:1", ""))
+	m.width, m.height = 100, 24
+	end := json.RawMessage(`{"type":"message_end","message":{"role":"toolResult","toolName":"wsms_read_page","content":[{"type":"text","text":"L1\nL2\nL3\nL4\nsentinel:stream.go:118"}]}}`)
+	m, _ = step(m, agentEventMsg{ev: pirpc.Event{Type: "message_end", Raw: end}})
+
+	_ = m.View() // populate m.regions
+	if len(m.regions.toolBlocks) == 0 {
+		t.Fatal("expected the tool-result block to register a click target")
+	}
+	tb := m.regions.toolBlocks[0]
+	if tb.idx != 0 {
+		t.Fatalf("tool block should own line 0, got %d", tb.idx)
+	}
+
+	m, _ = step(m, tea.MouseMsg{X: 1, Y: tb.y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if !m.lines[0].expanded {
+		t.Fatal("clicking the block should expand it")
+	}
+	if m.expandOutput {
+		t.Fatal("a per-block click must not flip the global expand-all toggle")
+	}
+	if out := plain(m.View()); !strings.Contains(out, "stream.go:118") {
+		t.Fatalf("expanded block should show its full body:\n%s", out)
+	}
+
+	// Clicking again collapses it back.
+	m, _ = step(m, tea.MouseMsg{X: 1, Y: tb.y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if m.lines[0].expanded {
+		t.Fatal("a second click should collapse the block")
+	}
+}
+
+// A left-click in the memory pane switches focus there; landing on a section
+// header also toggles it open.
+func TestMouseSwitchesPaneAndTogglesSection(t *testing.T) {
+	m := newModel(nil, newCoreClient("http://127.0.0.1:1", ""))
+	m.width, m.height = 100, 24
+	m.viz = vizState{reachable: true, capsule: "TASK T1", residentPages: 3, maxPages: 64, coldPages: 1, pinnedPages: 2}
+
+	_ = m.View() // populate m.regions
+	y := m.regions.memHeaders[secResidency]
+	if y < 0 {
+		t.Fatal("residency header should have a click target when the core is reachable")
+	}
+
+	m, _ = step(m, tea.MouseMsg{X: m.regions.leftWidth + 1, Y: y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if m.focus != focusMemory {
+		t.Fatal("clicking the memory pane should move focus there")
+	}
+	if m.memSel != secResidency || !m.memOpen[secResidency] {
+		t.Fatalf("clicking the residency header should select and open it, got sel=%d open=%v", m.memSel, m.memOpen)
+	}
+
+	// A click back in the chat pane returns focus to the input.
+	m, _ = step(m, tea.MouseMsg{X: 1, Y: 3, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if m.focus != focusChat {
+		t.Fatal("clicking the chat pane should return focus to chat")
+	}
+}
+
+// In chat focus, esc still quits (unchanged behaviour); ctrl+c always quits.
+func TestChatEscQuits(t *testing.T) {
+	m := newModel(newFakeAgent(), newCoreClient("http://127.0.0.1:1", ""))
+	_, cmd := step(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd == nil {
+		t.Fatal("esc in chat focus should return a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("esc in chat focus should quit")
+	}
+}
+
 func TestDeltaText(t *testing.T) {
 	cases := map[string]string{
 		`{"assistantMessageEvent":{"type":"text_delta","delta":"hi"}}`:      "hi",
