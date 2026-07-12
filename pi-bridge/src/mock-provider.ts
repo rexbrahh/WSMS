@@ -16,8 +16,10 @@
  * `wsms_recall` seam is exercisable keyless: a user prompt of `read_page:<id>`
  * or `recall:<query>` makes it emit that tool call (start → toolcall_start →
  * toolcall_delta* → toolcall_end → done, stopReason "toolUse"); on the resume
- * turn it detects the returned `toolResult` in context and echoes its content,
- * so the fetched page body flows all the way back into the assistant turn.
+ * turn it detects the returned `toolResult` in context and acknowledges it
+ * tersely (citing the result's head), the way a real model would — the exact
+ * fetched body is surfaced by the frontend as its own tool-result block, not
+ * parroted back verbatim in the assistant text.
  */
 
 import {
@@ -153,7 +155,12 @@ function streamEcho(model: Model<Api>, context: Context, options?: SimpleStreamO
 			if (directive) {
 				emitToolCall(stream, base, directive, options);
 			} else if (toolResult) {
-				emitText(stream, base, `echo:[tool ${toolResult.toolName}] ${textParts(toolResult.content)}`, options);
+				// Acknowledge the fetched evidence tersely — cite its head, not its
+				// whole body. The frontend renders the exact result as its own
+				// collapsible block, so echoing it in full here would duplicate it
+				// (and a real model wouldn't parrot a page back verbatim either).
+				const head = textParts(toolResult.content).split("\n")[0]?.trim() ?? "";
+				emitText(stream, base, `echo: applied ${toolResult.toolName} → ${head || "(no content)"}`, options);
 			} else {
 				const capsuleNote = sawCapsule(context.messages) ? " [capsule seen]" : "";
 				const user = lastUserText(context.messages).trim();

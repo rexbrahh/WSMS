@@ -61,6 +61,29 @@ real model's, which is how the TUI's event extraction was verified against live
 pi output (`internal/tui`: incremental text is read from
 `assistantMessageEvent.delta`, gated on `type == "text_delta"`).
 
+## TUI keys
+
+The frontend is keyboard-first, with a few mouse affordances layered on. The
+resting view stays scannable — verbose detail is one keystroke or one click away,
+never crammed in by default.
+
+| Input | Effect |
+|---|---|
+| type + `enter` | send a message to pi |
+| `tab` | switch focus between the chat and memory panes |
+| `^O` | expand/collapse every verbose tool-result block at once |
+| `↑`/`↓` (or `k`/`j`) | move the selection in the memory pane |
+| `space` | expand/collapse the selected memory section |
+| **click** a `↳` tool-result block | expand/collapse just that block |
+| **click** a memory section header | focus the pane and toggle that section |
+| `esc` | back out of the memory pane / quit from chat |
+| `^C` | quit |
+
+Tool results render as their own `↳ toolName` block holding the exact evidence pi
+returned — collapsed to a short preview (the head lines plus a `+N more` marker)
+until expanded, so the model's prose and the raw tool output stay visually
+distinct.
+
 ## Interaction contract
 
 How the bridge behaves under pi's runtime seams. Grounded in pi's actual
