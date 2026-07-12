@@ -200,10 +200,10 @@ func (c *Client) readLoop(stdout io.Reader) {
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		var head struct {
-			Type    string `json:"type"`
-			ID      string `json:"id"`
-			Success bool   `json:"success"`
-			Error   string `json:"error"`
+			Type    string          `json:"type"`
+			ID      string          `json:"id"`
+			Success bool            `json:"success"`
+			Error   string          `json:"error"`
 			Data    json.RawMessage `json:"data"`
 		}
 		if err := json.Unmarshal(line, &head); err != nil {
