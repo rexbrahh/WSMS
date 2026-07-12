@@ -1185,6 +1185,14 @@ pure-function tested (`View()`) since no TTY is available here.
 
 ### Phase 10 - Forced-reset benchmark
 
+The full benchmark-system design is `docs/forced-reset-benchmark.md`: matched
+conditions over byte-identical frozen pre-reset state, nonce-bearing synthetic
+scenarios with programmatic oracles, cluster-aware paired statistics,
+pre-registered decision gates (WSL keep/simplify/reject, the semantic ladder,
+instrument validity), and a hard offline-keyless vs real-model-gated split.
+The items below are the original scope; the design doc is normative where
+they differ.
+
 - Build matched baselines and a task/event injection protocol.
 - Freeze event streams, capsules, and outcomes as reproducible artifacts.
 - Measure continuation success, repeated failures, constraints, exact recall,
